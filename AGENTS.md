@@ -14,6 +14,7 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 |---|---|
 | 040074A01BF12000 | Donkey Kong Bananza |
 | 040077201BE50000 | Kirby Air Riders |
+| 04004D300C5AE001 | Kirby and the Forgotten Land – Nintendo Switch 2 Edition + Star-Crossed World |
 | 04007C6028AA8000 | Yoshi and the Mysterious Book (demo) |
 | 0400245021D2C000 | Yoshi and the Mysterious Book |
 | 0400D4201C6EA000 | Mario Tennis Fever |
