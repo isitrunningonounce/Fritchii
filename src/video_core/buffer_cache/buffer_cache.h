@@ -3471,7 +3471,12 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
             // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                u64 pool_size = memory_layout_size;
+                // Adjacent native pools can share one memory layout; the pointer stays in its own.
+                if (const auto mapping = gpu_memory->GetNativeMappingSizeFrom(gpu_addr)) {
+                    pool_size = (std::min<u64>)(pool_size, *mapping);
+                }
+                return static_cast<u32>((std::min<u64>)(pool_size, 8_MiB));
             }
             const u32 packed_size = static_cast<u32>(next_qword);
             const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
