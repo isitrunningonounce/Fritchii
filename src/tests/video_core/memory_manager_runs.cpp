@@ -192,3 +192,38 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
         check(address_space_end - back, back + 1);
     }
 }
+
+TEST_CASE("Native mapping size stops at the end of its own pool", "[memory_manager]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31, 16};
+    memory.BindRasterizer(&rasterizer);
+
+    constexpr u64 page = 0x10000;
+    constexpr GPUVAddr first = 0x4000'0000;
+    constexpr GPUVAddr second = first + 4 * page;
+    // Star Fox: an image pool directly followed by another of the same kind.
+    memory.Map(first, 0x1000'0000, 4 * page, Tegra::PTEKind::PITCH, true);
+    memory.Map(second, 0x2000'0000, 8 * page, Tegra::PTEKind::PITCH, true);
+    REQUIRE(memory.GetMemoryLayoutSize(first + page) >= 11 * page);
+    REQUIRE(memory.GetNativeMappingSizeFrom(first + page + 0x10) == 3 * page - 0x10);
+    REQUIRE(memory.GetNativeMappingSizeFrom(second) == 8 * page);
+    REQUIRE(!memory.GetNativeMappingSizeFrom(first - 1));
+    REQUIRE(!memory.GetNativeMappingSizeFrom(second + 8 * page));
+
+    // A remap inside a pool splits it; unmapping and sparse ranges end it.
+    memory.Map(second + 2 * page, 0x3000'0000, page, Tegra::PTEKind::PITCH, true);
+    REQUIRE(memory.GetNativeMappingSizeFrom(second) == 2 * page);
+    REQUIRE(memory.GetNativeMappingSizeFrom(second + 2 * page) == page);
+    REQUIRE(memory.GetNativeMappingSizeFrom(second + 3 * page) == 5 * page);
+    memory.Unmap(second + 4 * page, page);
+    REQUIRE(memory.GetNativeMappingSizeFrom(second + 3 * page) == page);
+    REQUIRE(!memory.GetNativeMappingSizeFrom(second + 4 * page));
+    REQUIRE(memory.GetNativeMappingSizeFrom(second + 5 * page) == 3 * page);
+    memory.MapSparse(first, 2 * page, true);
+    REQUIRE(!memory.GetNativeMappingSizeFrom(first));
+    REQUIRE(memory.GetNativeMappingSizeFrom(first + 2 * page) == 2 * page);
+}

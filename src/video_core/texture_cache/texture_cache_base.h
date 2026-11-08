@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -284,7 +285,8 @@ public:
     void WriteMemory(DAddr cpu_addr, size_t size);
 
     /// Download contents of host images to guest memory in a region
-    void DownloadMemory(DAddr cpu_addr, size_t size);
+    void DownloadMemory(DAddr cpu_addr, size_t size,
+                        const std::function<void(DAddr, u64)>& before_write = {});
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 

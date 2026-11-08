@@ -90,8 +90,6 @@ IR::Opcode Replace(IR::Opcode op) {
         return IR::Opcode::PackHalf2x16;
     case IR::Opcode::UnpackFloat2x16:
         return IR::Opcode::UnpackHalf2x16;
-    case IR::Opcode::ConvertF32F16:
-        return IR::Opcode::Identity;
     case IR::Opcode::ConvertF16F32:
         return IR::Opcode::Identity;
     case IR::Opcode::ConvertF16S8:
@@ -126,11 +124,61 @@ IR::Opcode Replace(IR::Opcode op) {
         return op;
     }
 }
+
+// Halves read from a packed register are already representable; results computed in single
+// precision are not rounded until they are packed again.
+bool IsRoundedHalf(const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return true;
+    }
+    const IR::Inst* const inst{value.InstRecursive()};
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::FPAbs16:
+    case IR::Opcode::FPAbs32:
+    case IR::Opcode::FPNeg16:
+    case IR::Opcode::FPNeg32:
+        return IsRoundedHalf(inst->Arg(0));
+    case IR::Opcode::BitCastF16U16:
+        return true;
+    case IR::Opcode::CompositeExtractF16x2:
+    case IR::Opcode::CompositeExtractF32x2: {
+        const IR::Value vector{inst->Arg(0)};
+        if (vector.IsImmediate()) {
+            return false;
+        }
+        const IR::Opcode source{vector.InstRecursive()->GetOpcode()};
+        return source == IR::Opcode::UnpackFloat2x16 || source == IR::Opcode::UnpackHalf2x16;
+    }
+    default:
+        return false;
+    }
+}
+
+// Widening a half to single precision has to round it the way half hardware would have.
+void LowerHalfToSingle(IR::Block& block, IR::Inst& inst) {
+    const IR::Value value{inst.Arg(0)};
+    if (IsRoundedHalf(value)) {
+        inst.ReplaceOpcode(IR::Opcode::Identity);
+        return;
+    }
+    const auto it{IR::Block::InstructionList::s_iterator_to(inst)};
+    const IR::Value vector{
+        &*block.PrependNewInst(it, IR::Opcode::CompositeConstructF32x2, {value, value})};
+    const IR::Value packed{&*block.PrependNewInst(it, IR::Opcode::PackHalf2x16, {vector})};
+    const IR::Value unpacked{&*block.PrependNewInst(it, IR::Opcode::UnpackHalf2x16, {packed})};
+    const IR::Value rounded{&*block.PrependNewInst(it, IR::Opcode::CompositeExtractF32x2,
+                                                   {unpacked, IR::Value{0u}})};
+    inst.ReplaceUsesWith(rounded);
+}
 } // Anonymous namespace
 
 void LowerFp16ToFp32(IR::Program& program) {
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::ConvertF32F16) {
+                LowerHalfToSingle(*block, inst);
+                continue;
+            }
             inst.ReplaceOpcode(Replace(inst.GetOpcode()));
         }
     }

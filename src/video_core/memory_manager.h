@@ -199,6 +199,9 @@ public:
     /// GetMemoryLayoutSize from the kind map under its lock (the answer with Nx2Perf off).
     size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
+    /// Bytes remaining in this pool; adjacent native pools can share one memory layout.
+    [[nodiscard]] std::optional<size_t> GetNativeMappingSizeFrom(GPUVAddr gpu_addr) const;
+
     void FlushCaching();
 
     /// Leaves the caches' invalidation of a range already written for the next FlushCaching
@@ -296,6 +299,9 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    std::map<GPUVAddr, GPUVAddr> native_mappings;
+    mutable std::mutex native_mapping_guard;
+    void TrackNativeMapping(GPUVAddr gpu_addr, std::size_t size, bool mapped);
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
 
