@@ -1058,10 +1058,9 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
         return FoldBitCast<IR::Opcode::BitCastU32F32, u32, f32>(inst, IR::Opcode::BitCastF32U32);
     case IR::Opcode::IAdd64:
         return FoldAdd<u64>(block, inst);
+    // UnpackHalf2x16(PackHalf2x16(x)) is not x: the pack rounds to half precision.
     case IR::Opcode::PackHalf2x16:
         return FoldInverseFunc(inst, IR::Opcode::UnpackHalf2x16);
-    case IR::Opcode::UnpackHalf2x16:
-        return FoldInverseFunc(inst, IR::Opcode::PackHalf2x16);
     case IR::Opcode::PackFloat2x16:
         return FoldInverseFunc(inst, IR::Opcode::UnpackFloat2x16);
     case IR::Opcode::UnpackFloat2x16:

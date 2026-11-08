@@ -94,6 +94,7 @@ void ComputePipeline::Configure() {
                                               desc.write_extent);
         ++ssbo_index;
     }
+    buffer_cache.SynchronizeComputeStorageImages(texture_cache);
     texture_cache.SynchronizeDescriptors(true);
 
     boost::container::static_vector<VideoCommon::ImageViewInOut, MAX_TEXTURES + MAX_IMAGES> views;

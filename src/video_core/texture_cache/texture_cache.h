@@ -1152,7 +1152,8 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 }
 
 template <class P>
-void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size,
+                                    const std::function<void(DAddr, u64)>& before_write) {
     boost::container::small_vector<ImageId, 16> images;
     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
         if (!IsDownloadable(image)) {
@@ -1163,6 +1164,18 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     });
     if (images.empty()) {
         return;
+    }
+    if (before_write) {
+        // Nested transfers may reuse completed staging buffers, so run them before any readback.
+        for (const ImageId image_id : images) {
+            const Image& image = slot_images[image_id];
+            for (const auto& [address, length] :
+                 gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes)) {
+                if (const auto device_address = gpu_memory->GpuToCpuAddress(address)) {
+                    before_write(*device_address, length);
+                }
+            }
+        }
     }
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
