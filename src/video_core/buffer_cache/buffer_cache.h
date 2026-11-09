@@ -20,6 +20,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
+#include "video_core/buffer_cache/native_storage_size.h"
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
@@ -3768,9 +3769,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         return NULL_BINDING;
     }
 
-    // The size word after a plain pointer is part of the answer; pool and native pointers ignore
-    // it.
-    const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
+    // Read-only table pointers use their pool size; other bindings also depend on the next word.
+    const bool reads_size_word = !(table_pointer && !is_written);
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
     // two page walks cost Ocarina's GPU thread ~6%. Answers hold until the page table changes.
@@ -3814,16 +3814,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                 const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
                 return (std::min)(memory_layout_size, limit);
             }
-            // A native (Switch 2) compute program's pointer is bare: the word after it is another
-            // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
-            // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
+            // Bare native pointers may carry a larger, aligned length (MKW's 16.2 MiB probes).
+            // Smaller parameters, such as Fortune's Weave's DLSS handle 266, never shrink the bind.
             if (native_pointer) {
                 u64 pool_size = memory_layout_size;
                 // Adjacent native pools can share one memory layout; the pointer stays in its own.
                 if (const auto mapping = gpu_memory->GetNativeMappingSizeFrom(gpu_addr)) {
                     pool_size = (std::min<u64>)(pool_size, *mapping);
                 }
-                return static_cast<u32>((std::min<u64>)(pool_size, 8_MiB));
+                return NativeStorageBufferSize(pool_size, next_qword);
             }
             const u32 packed_size = static_cast<u32>(next_qword);
             const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
