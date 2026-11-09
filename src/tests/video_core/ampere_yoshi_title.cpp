@@ -292,3 +292,83 @@ TEST_CASE("Yoshi uniform array gathers reject reserved spans and unsupported pay
     REQUIRE(discarded);
     REQUIRE(discarded.instructions.size() == 6);
 }
+
+TEST_CASE("Yoshi bindless gathers preserve coordinates handles offsets and result order",
+          "[video_core][ampere][yoshi]") {
+    constexpr std::array captures{
+        Instruction{{0x020e7364, 0x38000031, 0x001e0f0c, 0x000f4200}},
+        Instruction{{0x02101364, 0x38000010, 0x001e0f12, 0x00014200}},
+        Instruction{{0x00247f63, 0x3000040e, 0x0c1e1f0e, 0x000f4200}},
+    };
+    for (const auto& capture : captures) {
+        const bool offsets = capture.Bits(76, 1) != 0;
+        for (const u32 guard : {0U, 7U, 9U}) {
+            for (const u32 mask : {1U, 3U, 5U, 7U, 15U}) {
+                for (const u32 component : {0U, 1U, 2U, 3U}) {
+                    for (const u32 second : {capture.Bits(64, 8), 255U}) {
+                        auto instruction = capture;
+                        Set(instruction, 12, 4, guard);
+                        Set(instruction, 72, 4, mask);
+                        Set(instruction, 87, 2, component);
+                        Set(instruction, 64, 8, second);
+                        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+                        INFO(lowered.error);
+                        REQUIRE(lowered);
+                        CHECK(lowered.required_texture_buffer == ~0U);
+                        const auto& words = lowered.instructions;
+                        const u32 source = capture.Bits(24, 8);
+                        const u32 handle = offsets ? 216 + capture.Bits(40, 6) : capture.Bits(32, 8);
+                        REQUIRE(words[0] == Copy(guard, 250, source));
+                        REQUIRE(words[1] == Copy(guard, 251, source + 1));
+                        REQUIRE(words[2] == Copy(guard, 246, handle));
+                        if (offsets) REQUIRE(words[3] == Copy(guard, 247, capture.Bits(32, 8)));
+                        const u32 gather = offsets ? 4U : 3U;
+                        CHECK(words[gather] ==
+                              (0xdec00000000000faULL | (u64{guard} << 16) | (u64{250} << 8) |
+                               (u64{246} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
+                               (u64{offsets} << 36) | (u64{component} << 38) |
+                               (u64{capture.Bits(90, 1)} << 49) | (u64{7} << 51)));
+                        const u32 count = static_cast<u32>(std::popcount(mask));
+                        REQUIRE(words.size() == gather + count + 2);
+                        for (u32 i = 0; i < count; ++i) {
+                            const u32 target = second == 255 || i < 2
+                                                 ? capture.Bits(16, 8) + i : second + i - 2;
+                            CHECK(words[gather + 1 + i] == Copy(guard, target, 250 + i));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Yoshi bindless gather extensions reject unsafe spans and unsupported modes",
+          "[video_core][ampere][yoshi]") {
+    constexpr Instruction reg{{0x020e7364, 0x38000031, 0x001e0f0c, 0x000f4200}};
+    for (const auto [bit, count, value] : std::array{
+             std::array{24U, 8U, 245U}, std::array{32U, 8U, 246U},
+             std::array{32U, 8U, 255U}, std::array{16U, 8U, 245U},
+             std::array{64U, 8U, 15U}, std::array{40U, 19U, 1U},
+             std::array{59U, 1U, 0U}, std::array{60U, 1U, 0U},
+             std::array{61U, 3U, 5U}, std::array{72U, 4U, 0U},
+             std::array{76U, 1U, 1U}, std::array{77U, 1U, 1U},
+             std::array{78U, 1U, 1U}, std::array{79U, 1U, 1U},
+             std::array{91U, 1U, 1U}, std::array{96U, 1U, 1U}}) {
+        auto invalid = reg;
+        Set(invalid, bit, count, value);
+        REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    }
+    constexpr Instruction uniform{{0x00247f63, 0x3000040e, 0x0c1e1f0e, 0x000f4200}};
+    for (const auto [bit, count, value] : std::array{
+             std::array{24U, 8U, 215U}, std::array{32U, 8U, 216U},
+             std::array{16U, 8U, 215U}, std::array{64U, 8U, 215U},
+             std::array{64U, 8U, 37U}, std::array{46U, 1U, 1U},
+             std::array{59U, 1U, 1U}, std::array{60U, 1U, 0U},
+             std::array{61U, 3U, 5U}, std::array{77U, 1U, 1U},
+             std::array{78U, 1U, 1U}, std::array{79U, 1U, 1U},
+             std::array{91U, 1U, 0U}, std::array{96U, 1U, 1U}}) {
+        auto invalid = uniform;
+        Set(invalid, bit, count, value);
+        REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    }
+}
