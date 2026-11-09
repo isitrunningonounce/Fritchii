@@ -4,6 +4,8 @@ See `docs/Coding.md` for technical coding guidance.
 
 Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
+Target pull requests and merges at `nx2`, this fork's default branch.
+
 ## Game bug reports
 
 Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Each `Booting game: <program id>` line starts a session; the build is on the first line (`Lichii Version: ... | nx2-<sha>`). Known program ids:
