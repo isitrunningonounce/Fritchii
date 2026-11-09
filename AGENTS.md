@@ -104,6 +104,7 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 
 ## Builds
 
+- On this workstation, always copy completed binaries and their runtime dependencies into their own `F:\source\repos\Fritchii-releases\out\<build-name>\` folder, and point test shortcuts there.
 - Cloud machines build with clang and Ninja for compile and unit-test checks.
 - The build the owner tests runs on the owner's Windows PC (DESKTOP-4UD89UT, Ryzen 9 5900X), built with clang using 12 jobs (`cmake --build <dir> --parallel 12`).
 - On the PC the toolchain is clang-cl (LLVM 22) with the VS 2022 SDK, Qt 6.8.3 in `C:/lx/qt`, Ninja and sccache. Source is `C:/lx/src`, the persistent build dir is `C:/lx/build`, and `C:/lx/configure.sh` holds the configure flags. Build and package a fix with one command: `bash C:/lx/build-fix.sh <branch> <build-name> "<Game> - <fix>" ["ENV=VAL ..."] ["log filter"]`.
