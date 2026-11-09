@@ -4,7 +4,7 @@ See `docs/Coding.md` for technical coding guidance.
 
 Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
-Target pull requests and merges at `nx2`, this fork's default branch.
+Target pull requests and merges at `fritchii-releases`, this fork's default branch.
 
 ## Game bug reports
 
