@@ -1344,11 +1344,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (!passes) {
         return false;
     }
-    if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
-        TraceDlssContract(native_key, false);
-    }
     if (native_key == passes->prepass) {
-        dlss_chain.spatial_only = passes->spatial_only;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
@@ -1360,9 +1356,6 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     }
     dlss_chain.pending.insert(native_key);
     dlss_chain.output_pass = native_key == passes->output;
-    if (dlss_chain.spatial_only) {
-        return false;
-    }
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
                              GameDlssBlocker() != VideoCore::GameDlssReason::None;
     if (dlss_chain.output_pass) {
@@ -1530,18 +1523,6 @@ void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReaso
 bool KeplerCompute::FinishDlssEvaluation() {
     dlss_chain.active = false;
     dlss_chain.output_pass = false;
-    if (dlss_chain.spatial_only) {
-        dlss_chain.pending.clear();
-        using namespace VideoCommon::FireEmblemUpscale;
-        if (UseReplacement(StarFoxProgramId, StarFoxOutputProgramKey,
-                           std::getenv("EDEN_NX2_DLSS_REPLACEMENT"))) {
-            return TryFireEmblemUpscale(false);
-        }
-        dlss_motion_vectors.reset();
-        dlss_depth.reset();
-        (void)fe_upscale_jitter.Take();
-        return false;
-    }
     dlss_chain.programs.insert(dlss_chain.pending.begin(), dlss_chain.pending.end());
     dlss_chain.pending.clear();
     const bool complete = dlss_chain.rejected == 0;
@@ -1827,15 +1808,13 @@ void KeplerCompute::CaptureFireEmblemJitter() {
         return;
     }
     const auto color = GetTICEntry(index);
-    if (!ValidInput(color, dlss_chain.spatial_only)) {
+    if (!ValidInput(color)) {
         return;
     }
     fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
         {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
          std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
-    if (!dlss_chain.spatial_only) {
-        RememberDlssMotionVectors();
-    }
+    RememberDlssMotionVectors();
 }
 
 void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
@@ -1889,24 +1868,21 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
     }
 }
 
-bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
+bool KeplerCompute::TryFireEmblemUpscale() {
     using namespace VideoCommon::FireEmblemUpscale;
-    static const bool requested_history = [] {
+    static const bool use_history = [] {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
         return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
     }();
-    const bool use_history = allow_history && requested_history;
-    const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
-    const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
     if (!jitter || (use_history && (!motion || !depth))) {
-        static std::array<bool, 2> reported{};
-        if (!reported[game_index]) {
-            reported[game_index] = true;
-            LOG_WARNING(HW_GPU, "{} replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
-                        game, jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
+        static bool reported{};
+        if (!reported) {
+            reported = true;
+            LOG_WARNING(HW_GPU, "Fire Emblem replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
+                        jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
         }
         return false;
     }
@@ -1926,7 +1902,7 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
-    if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
+    if (!input || !output || !ValidPair(*input, *output) ||
         jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
         return false;
@@ -1945,19 +1921,16 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
-    const auto input_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
-                                                     : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
-                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input, input_format), surface(*output, output_format),
+        surface(*input, Tegra::RenderTargetFormat::B10G11R11_FLOAT),
+        surface(*output, Tegra::RenderTargetFormat::B10G11R11_FLOAT),
         use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
         use_history ? &*depth : nullptr, jitter->offset,
         use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
-    static std::array<u32, 2> logged{};
-    if (logged[game_index]++ < 8) {
-        LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
-                 game, done ? "applied" : "unavailable; retaining native dispatch", use_history,
+    static u32 logged{};
+    if (logged++ < 8) {
+        LOG_INFO(HW_GPU, "Fire Emblem DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
+                 done ? "applied" : "unavailable; retaining native dispatch", use_history,
                  input->Address(), input->Width(), input->Height(), output->Address(),
                  output->Width(), output->Height(), jitter->offset[0], jitter->offset[1]);
     }

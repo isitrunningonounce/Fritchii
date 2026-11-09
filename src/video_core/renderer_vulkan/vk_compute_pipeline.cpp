@@ -399,6 +399,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         ++ssbo_index;
     }
 
+    buffer_cache.SynchronizeComputeStorageImages(texture_cache);
     texture_cache.SynchronizeDescriptors(true);
 
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;

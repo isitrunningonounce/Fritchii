@@ -299,6 +299,32 @@ public:
 
     void UpdateComputeBuffers();
 
+    template <typename TextureCache>
+    void SynchronizeComputeStorageImages(TextureCache& texture_cache) {
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            const Binding& binding = channel_state->compute_storage_buffers[index];
+            if (!binding.gpu_addr || !binding.size) {
+                return;
+            }
+            for (const auto& [address, length] :
+                 gpu_memory->GetSubmappedRange(binding.gpu_addr, binding.size)) {
+                const auto device_address = gpu_memory->GpuToCpuAddress(address);
+                if (!device_address || !texture_cache.IsRegionGpuModified(*device_address, length)) {
+                    continue;
+                }
+                // Image writes and storage buffers can share guest memory while using separate
+                // host allocations. Transfer the image's contents before binding the buffer.
+                texture_cache.DownloadMemory(
+                    *device_address, length, [this](DAddr written_address, u64 written_size) {
+                        // Preserve buffer-owned padding and finish older readbacks before
+                        // the image writes its texels into guest memory.
+                        DownloadMemory(written_address, written_size);
+                        WriteMemory(written_address, written_size);
+                    });
+            }
+        });
+    }
+
     void BindHostGeometryBuffers(bool is_indexed);
 
     void BindHostStageBuffers(size_t stage);

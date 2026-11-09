@@ -330,7 +330,7 @@ private:
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
     std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
-    bool TryFireEmblemUpscale(bool allow_history = true);
+    bool TryFireEmblemUpscale();
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
@@ -343,7 +343,6 @@ private:
     /// the game's own network output is shown instead of the replacement upscale.
     struct DlssChain {
         bool active{};
-        bool spatial_only{};
         bool output_pass{};
         u32 rejected{};
         u32 clean_evaluations{};
