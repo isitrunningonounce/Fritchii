@@ -99,6 +99,7 @@ add_executable(tests
     video_core/pipeline_cache_files.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp
+    video_core/native_storage_size.cpp
     video_core/native_indirect_reset.cpp
     video_core/native_qmd.cpp
     video_core/gpu_command_safety.cpp
