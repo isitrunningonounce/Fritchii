@@ -171,13 +171,6 @@ GeometryExitEnvelope AnalyzeGeometryExit(const Code& code) {
             read_sources(true);
             write_register(bits(index, 16, 8));
             write_predicate(bits(index, 81, 3));
-        } else if (opcode == 0x321) {
-            // ALD: reads the attribute index and vertex; writes 1-4 consecutive registers.
-            read_register(bits(index, 24, 8));
-            read_register(bits(index, 32, 8));
-            const u32 destination = bits(index, 16, 8), components = bits(index, 74, 2) + 1;
-            if (destination != 255)
-                for (u32 i = 0; i < components; ++i) write_register(destination + i);
         } else if (opcode == 0x322) {
             // AST: stores 1-4 components from operand b for the vertex in c; writes nothing.
             const u32 value = bits(index, 32, 8), components = bits(index, 74, 2) + 1;
