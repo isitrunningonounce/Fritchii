@@ -218,6 +218,14 @@ TEST_CASE("Yoshi 3D SURED preserves all coordinates and the OR operation", "[amp
         invalid.words[0] = (invalid.words[0] & 0xffffffU) | (coordinate << 24);
         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
     }
+    for (const u32 dimension : {1U, 3U}) {
+        for (const u32 operation : {1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
+            auto invalid = captured;
+            invalid.words[1] = (invalid.words[1] & 0x1fffffffU) | (dimension << 29);
+            invalid.words[2] = 0x0010e000U | (operation << 23);
+            REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+        }
+    }
     for (const u32 coordinate : {214U, 218U}) {
         auto crossing = captured;
         crossing.words[0] = (crossing.words[0] & 0xffffffU) | (coordinate << 24);
