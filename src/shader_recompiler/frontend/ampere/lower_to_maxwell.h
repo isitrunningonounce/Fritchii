@@ -1591,20 +1591,24 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36));
             break;
         }
-        case 0x59f: { // SURED.D.STRONG.GPU.IGN U32, direct descriptor, buffer or 2D.
+        case 0x59f: { // SURED.D.STRONG.GPU.IGN U32, direct descriptor, buffer/2D/3D.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
-            if ((insn.words[2] & ~0x03800000U) != 0x0010e000 || (dimension != 1 && dimension != 3) || binding >= 18 ||
-                offset > 0x1fff || insn.Bits(59, 2) || coordinate > 253)
+            const u32 operation = insn.Bits(87, 3);
+            // Eglantine nx2 supports 3D ADD/OR with the same Maxwell surface encoding.
+            if ((insn.words[2] & ~0x03800000U) != 0x0010e000 ||
+                (dimension != 1 && dimension != 3 && dimension != 5) ||
+                (dimension == 5 && operation != 0 && operation != 6) || binding >= 18 ||
+                offset > 0x1fff || insn.Bits(59, 2) || coordinate > (dimension == 5 ? 252U : 253U))
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
             result.required_texture_buffer = binding;
             // Maxwell SURED: operand 0-7, coordinates 8-15, op 24, U32 zero at 20,
-            // type 33 (1 = buffer, 3 = 2D), bound offset 36, bound 51.
+            // type 33 (1 = buffer, 3 = 2D, 5 = 3D), bound offset 36, bound 51.
             emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
-                (u64{insn.Bits(87, 3)} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+                (u64{operation} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
             break;
         }
         case 0x301: // BREV register.
@@ -2012,7 +2016,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native global load mode");
             if (opcode == 0x381) {
                 // Bit 77 (strong/scoped ordering) needs nothing extra from a Maxwell LDG.
-                if ((insn.words[2] & ~0x2e00U) != 0x001e8100 || (address & 1) || address >= 246)
+                if ((insn.words[2] & ~0x2e0fU) != 0x001e8100 || (address & 1) || address >= 246)
                     return fail(index, "native global load mode");
             } else {
                 // The uniform base sits where a register source would (bits 32-37).
@@ -2040,6 +2044,23 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                          (u64{insn.Bits(90, 1) ? address + 1 : 255} << 20) | (u64{1} << 43));
                     address = 250;
                 }
+            }
+            // PR #762 (311d43e84e): LDG's separate predicate zeros Rd when false,
+            // without accessing memory. The execution predicate still leaves Rd untouched.
+            const u32 load_predicate = opcode == 0x381
+                                          ? (7U - insn.Bits(64, 3)) | (insn.Bits(67, 1) << 3) : 7U;
+            if (load_predicate != 7) {
+                if (native_predicate != 7) {
+                    relocations.push_back({static_cast<u32>(result.instructions.size()), index + 1});
+                    emit(0xe24000000000000fULL | (u64{native_predicate ^ 8U} << 16));
+                }
+                const u32 load_branch = static_cast<u32>(result.instructions.size());
+                emit(0xe24000000000000fULL | (u64{load_predicate} << 16));
+                for (u32 component = 0; component < (size <= 4 ? 1U : 1U << (size - 4)); ++component)
+                    mov_imm(static_cast<u32>(dest) + component, 0);
+                relocations.push_back({static_cast<u32>(result.instructions.size()), index + 1});
+                emit(0xe24000000007000fULL);
+                relocations.push_back({load_branch, index, false, static_cast<u32>(result.instructions.size())});
             }
             emit(base(0xeed0000000000000ULL) | (u64{address} << 8) |
                  (u64{insn.Bits(40, 24)} << 20) | (u64{1} << 45) |
@@ -3237,12 +3258,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x845: case 0x906: {
             const bool round_up = opcode == 0x906;
+            // PR #762 also supports the immediate I2F.F16 destination.
+            const u32 destination_size = insn.Bits(75, 2);
             if (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
-                (insn.words[2] & ~0xc400U) != 0x00201000U)
+                (round_up ? (destination_size != 1 && destination_size != 2) ||
+                                (insn.words[2] & ~0xdc00U) != 0x00200000U
+                          : (insn.words[2] & ~0xc400U) != 0x00201000U))
                 return fail(index, "native immediate integer-to-float conversion mode");
             if (insn.words[2] != (round_up ? 0x00209000U : 0x0020d000U)) {
                 mov_imm(250, insn.words[1]);
-                emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{2} << 10) |
+                emit(base(0x5cb8000000000000ULL) | (u64{destination_size} << 8) | (u64{2} << 10) |
                      (u64{insn.Bits(74, 1)} << 13) | (u64{250} << 20) |
                      (u64{insn.Bits(78, 2)} << 39));
                 break;
