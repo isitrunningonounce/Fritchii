@@ -48,8 +48,8 @@ else()
     set(IS_NIGHTLY_BUILD false)
 endif()
 
-if (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
-    # Logs keep the commit: "Lichii Frizti vN | <branch>-<commit>".
+if (FRIZTI_VERSION)
+    # Logs keep the commit, release builds too: "Fritchii build-N | <branch>-<commit>".
     string(SUBSTRING ${GIT_COMMIT} 0 10 GIT_DESC)
 else()
     set(GIT_DESC ${BUILD_VERSION})
@@ -57,14 +57,16 @@ endif()
 
 # Generate cpp with Git revision from template
 
-set(BUILD_AUTO_UPDATE_STABLE_REPO "zortos293/Lichii")
+# build-N releases are published here, and their update checks read its releases.
+set(BUILD_AUTO_UPDATE_REPO "isitrunningonounce/Fritchii")
+set(BUILD_AUTO_UPDATE_STABLE_REPO "${BUILD_AUTO_UPDATE_REPO}")
 set(BUILD_AUTO_UPDATE_STABLE_API "api.github.com")
-set(BUILD_AUTO_UPDATE_API_PATH "/repos/zortos293/Lichii/releases?per_page=100")
+set(BUILD_AUTO_UPDATE_API_PATH "/repos/${BUILD_AUTO_UPDATE_REPO}/releases?per_page=100")
 set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
-set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")
 if (NIGHTLY_BUILD)
     set(REPO_NAME "Lichii Nightly")
-elseif (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
+elseif (FRIZTI_VERSION)
+    # Release builds stay Fritchii (its UI and defaults); their version is the build-N tag.
     set(REPO_NAME "Fritchii")
 else()
     set(REPO_NAME "Lichii")

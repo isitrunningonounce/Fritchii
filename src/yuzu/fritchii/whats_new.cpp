@@ -86,7 +86,8 @@ void SetNotes(QTextBrowser* browser, const QString& markdown) {
 
 QString VersionName() {
     QString version = QString::fromUtf8(Common::g_build_version);
-    if (!version.isEmpty() && !version.startsWith(QLatin1Char('v'))) {
+    // "5.5" reads "v5.5"; release builds keep their tag ("build-12").
+    if (!version.isEmpty() && version.front().isDigit()) {
         version.prepend(QLatin1Char('v'));
     }
     return QStringLiteral("Fritchii %1").arg(version).trimmed();
