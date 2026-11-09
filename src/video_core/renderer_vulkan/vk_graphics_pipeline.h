@@ -461,4 +461,6 @@ private:
     std::optional<PipelineBuild> build;
 };
 
+void NoteDrawReuseProbeFrame();
+
 } // namespace Vulkan
