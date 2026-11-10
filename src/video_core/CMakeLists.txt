@@ -186,6 +186,9 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_clear_layers.h
     renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
+    renderer_vulkan/lichii_dynamic_rendering.h
+    renderer_vulkan/lichii_shader_object_cache.cpp
+    renderer_vulkan/lichii_shader_object_cache.h
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_helper.h

@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Lichii mod (clang-cl): the MSVC STL's vectorized std::find static_asserts on StorageBufferAddr.
+#if defined(__clang__) && defined(_MSC_VER)
+#define _USE_STD_VECTOR_ALGORITHMS 0
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>

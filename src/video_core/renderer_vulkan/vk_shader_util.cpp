@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,20 +20,52 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/renderer_vulkan/lichii_dynamic_rendering.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
 
+namespace {
+// Lichii: with shader objects on, a module's SPIR-V is kept until its pipeline makes its shader
+// objects from it (they take SPIR-V, not modules).
+std::mutex spirv_mutex;
+std::unordered_map<VkShaderModule, std::vector<u32>> spirv_by_module;
+} // Anonymous namespace
+
 vk::ShaderModule BuildShader(const Device& device, std::span<const u32> code) {
-    return device.GetLogical().CreateShaderModule({
+    vk::ShaderModule module = device.GetLogical().CreateShaderModule({
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
         .codeSize = static_cast<u32>(code.size_bytes()),
         .pCode = code.data(),
     });
+    if (UseShaderObjects(device)) {
+        std::scoped_lock lock{spirv_mutex};
+        spirv_by_module[*module].assign(code.begin(), code.end());
+    }
+    return module;
+}
+
+std::vector<u32> TakeShaderSpirv(VkShaderModule module) {
+    std::scoped_lock lock{spirv_mutex};
+    const auto it = spirv_by_module.find(module);
+    if (it == spirv_by_module.end()) {
+        return {};
+    }
+    std::vector<u32> code = std::move(it->second);
+    spirv_by_module.erase(it);
+    return code;
+}
+
+void ForgetShaderSpirv(VkShaderModule module) {
+    if (module == VK_NULL_HANDLE) {
+        return;
+    }
+    std::scoped_lock lock{spirv_mutex};
+    spirv_by_module.erase(module);
 }
 
 bool SpirvSelfCheck() {

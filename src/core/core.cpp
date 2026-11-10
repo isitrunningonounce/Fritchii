@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <cstdlib>
 #include <atomic>
 #include <memory>
@@ -80,6 +82,82 @@
 #include "video_core/video_core.h"
 
 namespace Core {
+
+namespace {
+// LICHII_ROMFS_SCAN=<folder>: at load, lists every RomFS file (path, size, first bytes) in
+// <folder>/index.txt and copies the ones that look like shader archives to <folder>/files.
+void ScanRomFS(Loader::AppLoader& loader) {
+    const char* out_env = std::getenv("LICHII_ROMFS_SCAN");
+    if (out_env == nullptr || out_env[0] == '\0') {
+        return;
+    }
+    FileSys::VirtualFile romfs_file;
+    if (loader.ReadRomFS(romfs_file) != Loader::ResultStatus::Success || !romfs_file) {
+        LOG_ERROR(Core, "LICHII_ROMFS_SCAN: no RomFS");
+        return;
+    }
+    const auto root = FileSys::ExtractRomFS(romfs_file);
+    if (!root) {
+        LOG_ERROR(Core, "LICHII_ROMFS_SCAN: RomFS could not be read");
+        return;
+    }
+    const std::filesystem::path out{std::string{out_env}};
+    std::filesystem::create_directories(out / "files");
+    std::ofstream index{out / "index.txt"};
+    u64 files{}, copied{}, copied_bytes{};
+    std::vector<u8> buffer;
+    const auto copy = [&](const FileSys::VirtualFile& file, const std::string& path) {
+        const auto target = out / "files" / std::filesystem::path{path}.relative_path();
+        std::filesystem::create_directories(target.parent_path());
+        std::ofstream dest{target, std::ios::binary};
+        constexpr size_t Chunk = 16 << 20;
+        for (size_t offset = 0; offset < file->GetSize(); offset += Chunk) {
+            buffer = file->ReadBytes(std::min(Chunk, file->GetSize() - offset), offset);
+            dest.write(reinterpret_cast<const char*>(buffer.data()),
+                       static_cast<std::streamsize>(buffer.size()));
+        }
+        ++copied;
+        copied_bytes += file->GetSize();
+    };
+    const auto walk = [&](auto&& self, const FileSys::VirtualDir& dir,
+                          const std::string& prefix) -> void {
+        for (const auto& file : dir->GetFiles()) {
+            const std::string path = prefix + "/" + file->GetName();
+            const auto head = file->ReadBytes(std::min<size_t>(16, file->GetSize()));
+            std::string hex, ascii;
+            for (const u8 byte : head) {
+                hex += fmt::format("{:02x}", byte);
+                ascii += byte >= 0x20 && byte < 0x7f ? static_cast<char>(byte) : '.';
+            }
+            index << path << '\t' << file->GetSize() << '\t' << hex << '\t' << ascii << '\n';
+            ++files;
+            std::string lower = Common::ToLower(file->GetName());
+            const bool by_name = lower.find("shader") != std::string::npos ||
+                                 lower.find(".bnsh") != std::string::npos ||
+                                 lower.find(".bfsha") != std::string::npos ||
+                                 lower.find(".sharc") != std::string::npos;
+            const bool by_magic = ascii.starts_with("BNSH") || ascii.starts_with("FSHA") ||
+                                  lower.find("zsdic") != std::string::npos ||
+                                  path.starts_with("/Shader/") || path.starts_with("/Layout2Shader/");
+            // LICHII_ROMFS_COPY=<substring>: also copy the files whose path contains it.
+            static const std::string extra = [] {
+                const char* value = std::getenv("LICHII_ROMFS_COPY");
+                return std::string{value ? value : ""};
+            }();
+            const bool by_request = !extra.empty() && path.find(extra) != std::string::npos;
+            if ((by_name || by_magic || by_request) && copied_bytes < (u64{8} << 30)) {
+                copy(file, path);
+            }
+        }
+        for (const auto& sub : dir->GetSubdirectories()) {
+            self(self, sub, prefix + "/" + sub->GetName());
+        }
+    };
+    walk(walk, root, "");
+    LOG_INFO(Core, "LICHII_ROMFS_SCAN: {} files listed, {} shader-like files copied ({} MiB) to {}",
+             files, copied, copied_bytes >> 20, out_env);
+}
+} // Anonymous namespace
 
 std::atomic<u64> g_nx2_present_count{};
 
@@ -435,6 +513,7 @@ struct System::Impl {
         }
 
         LOG_INFO(Core, "Loading {} ({:016X}) ...", name, params.program_id);
+        ScanRomFS(*app_loader);
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);

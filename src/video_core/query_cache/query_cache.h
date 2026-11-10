@@ -25,6 +25,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -306,6 +307,19 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         LOG_INFO(HW_GPU, "nx2 report addr={:#x} type={} flags={:#x} payload={:#x} as={} device={:#x}", addr,
                  static_cast<u32>(counter_type), static_cast<u32>(flags), payload, gpu_memory->GetID(),
                  gpu_memory->GpuToCpuAddress(addr).value_or(0));
+    }
+    // LICHII_OCCLUSION_FORCE=<count> (test): every occlusion (samples passed) report returns this
+    // constant instead of the GPU's count, as if everything were visible (or hidden with 0).
+    static const std::optional<u32> forced_occlusion = []() -> std::optional<u32> {
+        const char* value = std::getenv("LICHII_OCCLUSION_FORCE");
+        if (value == nullptr || value[0] == '\0') {
+            return std::nullopt;
+        }
+        return static_cast<u32>(std::strtoul(value, nullptr, 0));
+    }();
+    if (forced_occlusion && counter_type == QueryType::ZPassPixelCount64) [[unlikely]] {
+        counter_type = QueryType::Payload;
+        payload = *forced_occlusion;
     }
     size_t streamer_id = static_cast<size_t>(counter_type);
     auto* streamer = impl->streamers[streamer_id];

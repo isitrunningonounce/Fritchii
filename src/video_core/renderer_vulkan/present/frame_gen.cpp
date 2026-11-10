@@ -8,6 +8,7 @@
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -286,7 +287,8 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
 
         scheduler.RequestOutsideRenderPassOperationContext();
-        fsr3_chain->Generate(device, scheduler, *destination->storage_view, blend, flow_scale);
+        fsr3_chain->Generate(device, scheduler, *destination->image, *destination->storage_view,
+                             blend, flow_scale);
     } else if (chain) {
         chain->SetTarget(device, last_generations, generation, destination->index,
                          *destination->storage_view);
@@ -310,11 +312,15 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
 
     built_flow_scale = flow_scale;
 
-    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3) {
+    const bool fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    if (fsr3) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
     }
+    LOG_INFO(Render_Vulkan, "Frame generation: {} at {}x{}, multiplier {}, target {} fps, flow {}",
+             fsr3 ? "FSR 3" : "LSFG", extent.width, extent.height, Settings::FrameGenMultiplier(),
+             Settings::values.frame_gen_target_rate.GetValue(), flow_scale);
     built_extent = extent;
     built_format = format;
     frame_count = 0;

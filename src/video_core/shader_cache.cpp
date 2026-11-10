@@ -5,6 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -18,6 +24,7 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
+#include "common/logging.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
@@ -64,6 +71,125 @@ u64 VertexAttributeMaskOf(const Shader::Environment& env) {
     }
     return VertexAttributeMask(input_generic);
 }
+namespace {
+// LICHII_BFSHA_CHECK=<folder of decompressed .bfsha/.sarc files>: each new native program's raw
+// code (the 128-byte header and the first instructions after it) is searched for in the game's
+// shader archives on a worker thread, to tell whether they hold the code the game uploads.
+class BfshaCheck {
+public:
+    static BfshaCheck* Get() {
+        static const char* dir = std::getenv("LICHII_BFSHA_CHECK");
+        if (dir == nullptr || dir[0] == '\0') {
+            return nullptr;
+        }
+        static BfshaCheck instance{dir};
+        return &instance;
+    }
+
+    void Submit(GPUVAddr address, std::vector<u8> header, std::vector<u8> code, u32 slot = 0,
+                bool mesh = false) {
+        {
+            std::scoped_lock lock{mutex};
+            queue.push_back({address, std::move(header), std::move(code), slot, mesh});
+        }
+        cv.notify_one();
+    }
+
+private:
+    struct Job {
+        GPUVAddr address;
+        std::vector<u8> header;
+        std::vector<u8> code;
+        u32 slot{};
+        bool mesh{};
+    };
+    struct Blob {
+        std::string name;
+        std::vector<u8> data;
+    };
+
+    explicit BfshaCheck(const char* dir) : folder{dir} {
+        worker = std::thread{[this] { Run(); }};
+        worker.detach();
+    }
+
+    void Load() {
+        for (const auto& entry : std::filesystem::directory_iterator{folder}) {
+            const auto name = entry.path().filename().string();
+            if (!entry.is_regular_file() ||
+                (name.find(".bfsha") == std::string::npos && name.find(".sarc") == std::string::npos &&
+                 name.find(".bin") == std::string::npos)) {
+                continue;
+            }
+            std::ifstream file{entry.path(), std::ios::binary};
+            Blob blob{name, {std::istreambuf_iterator<char>(file), {}}};
+            LOG_INFO(HW_GPU, "LICHII_BFSHA_CHECK: loaded {} ({} MiB)", name, blob.data.size() >> 20);
+            blobs.push_back(std::move(blob));
+        }
+    }
+
+    void Run() {
+        Load();
+        u64 checked{}, code_found{}, header_found{};
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, [this] { return !queue.empty(); });
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            ++checked;
+            std::string where = "not found";
+            bool header_match = false;
+            for (const auto& blob : blobs) {
+                const auto it = std::search(blob.data.begin(), blob.data.end(),
+                                            std::boyer_moore_horspool_searcher(job.code.begin(),
+                                                                               job.code.end()));
+                if (it == blob.data.end()) {
+                    continue;
+                }
+                const size_t offset = static_cast<size_t>(it - blob.data.begin());
+                where = fmt::format("{} +{:#x}", blob.name, offset);
+                // Is the 128-byte header right before the code, or anywhere in the archive?
+                header_match = offset >= job.header.size() &&
+                               std::equal(job.header.begin(), job.header.end(),
+                                          blob.data.begin() + (offset - job.header.size()));
+                if (!header_match) {
+                    const auto h = std::search(blob.data.begin(), blob.data.end(),
+                                               std::boyer_moore_horspool_searcher(
+                                                   job.header.begin(), job.header.end()));
+                    if (h != blob.data.end()) {
+                        where += fmt::format(", header elsewhere at +{:#x}",
+                                             static_cast<size_t>(h - blob.data.begin()));
+                    } else {
+                        where += ", header not in archive";
+                    }
+                } else {
+                    where += ", header right before the code";
+                }
+                break;
+            }
+            code_found += where != "not found" ? 1 : 0;
+            header_found += header_match ? 1 : 0;
+            if (checked <= 64 || checked % 50 == 0 || job.slot == 99 ||
+                (job.mesh && where == "not found")) {
+                LOG_INFO(HW_GPU, "LICHII_BFSHA_CHECK: program {:#x} slot {}{}: {} ({} checked, code "
+                         "found {}, header right before it {})",
+                         job.address, job.slot, job.mesh ? " (mesh pipeline)" : "", where, checked,
+                         code_found, header_found);
+            }
+        }
+    }
+
+    std::filesystem::path folder;
+    std::vector<Blob> blobs;
+    std::deque<Job> queue;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::thread worker;
+};
+} // Anonymous namespace
 
 u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept {
     u32 mask = 0;
@@ -197,6 +323,16 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
             last_shaders_valid = false;
             return false;
         }
+        if (!shader_info && native) {
+            if (auto* check = BfshaCheck::Get();
+                check && gpu_memory->IsFullyMappedRange(shader_addr, 128 + 64)) {
+                std::vector<u8> header(128), code(64);
+                gpu_memory->ReadBlockUnsafe(shader_addr, header.data(), header.size());
+                gpu_memory->ReadBlockUnsafe(shader_addr + 128, code.data(), code.size());
+                check->Submit(shader_addr, std::move(header), std::move(code), static_cast<u32>(index),
+                              mesh);
+            }
+        }
         if (!shader_info) {
             const u32 start_address{native ? 0 : shader_config.offset};
             try {
@@ -317,6 +453,14 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
+            if (auto* check = BfshaCheck::Get();
+                check && kepler_compute->IsNativeMode() &&
+                gpu_memory->IsFullyMappedRange(shader_addr, 128 + 64)) {
+                std::vector<u8> header(128), code(64);
+                gpu_memory->ReadBlockUnsafe(shader_addr, header.data(), header.size());
+                gpu_memory->ReadBlockUnsafe(shader_addr + 128, code.data(), code.size());
+                check->Submit(shader_addr, std::move(header), std::move(code), 99);
+            }
             ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
             shader = MakeShaderInfo(env, *cpu_shader_addr);
         } catch (const Shader::Ampere::TrapGuardError&) {

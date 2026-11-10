@@ -848,6 +848,14 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
         }
+        // LICHII_SKIP_BUILTIN=<text>: skip the built-in patches whose name contains it (tests;
+        // "*" skips all). The Add-Ons list is the persistent way.
+        if (const char* skip = std::getenv("LICHII_SKIP_BUILTIN");
+            skip != nullptr && skip[0] != '\0' &&
+            (std::strcmp(skip, "*") == 0 || patch.name.find(skip) != std::string_view::npos)) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": LICHII_SKIP_BUILTIN", patch.name);
+            continue;
+        }
         if (patch.build_id != build_id) {
             LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
                      patch.build_id);

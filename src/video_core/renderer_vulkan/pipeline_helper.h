@@ -244,6 +244,20 @@ public:
         });
     }
 
+    /// Lichii: identifies the set layout these bindings make (with how it is created), for
+    /// shader objects made against it.
+    u64 LayoutHash(bool use_push_descriptor) const noexcept {
+        u64 hash = use_push_descriptor ? 0x9E3779B97F4A7C15ULL : 0;
+        for (const VkDescriptorSetLayoutBinding& entry : bindings) {
+            const u64 words[4]{entry.binding, static_cast<u64>(entry.descriptorType),
+                               entry.descriptorCount, entry.stageFlags};
+            for (const u64 word : words) {
+                hash = (hash ^ word) * 0x100000001B3ULL;
+            }
+        }
+        return hash ^ (static_cast<u64>(is_compute) << 62) ^ (static_cast<u64>(uses_mesh) << 61);
+    }
+
     VkPushConstantRange PushConstantRange() const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;

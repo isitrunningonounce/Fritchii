@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <vector>
@@ -20,6 +23,8 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/arm/dynarmic/lichii_hooks.h"
+#include "core/arm/dynarmic/lichii_zstd_hle.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
@@ -337,6 +342,23 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                      matching_sdk, matching_sdk ? load_base : 0, session ? session->id : 0);
         }
     }
+    // LICHII_DUMP_MODULES=<folder>: the decompressed image of each module, with its segments.
+    if (const char* dump_dir = std::getenv("LICHII_DUMP_MODULES"); dump_dir && dump_dir[0]) {
+        const std::filesystem::path folder{std::string{dump_dir}};
+        std::filesystem::create_directories(folder);
+        std::ofstream image{folder / (nso_file.GetName() + ".bin"), std::ios::binary};
+        image.write(reinterpret_cast<const char*>(codeset.memory.data()),
+                    static_cast<std::streamsize>(codeset.memory.size()));
+        std::ofstream info{folder / (nso_file.GetName() + ".txt")};
+        info << fmt::format("load_base {:#x}\nimage_size {:#x}\n", load_base, image_size);
+        static constexpr const char* segment_names[3] = {"text", "rodata", "data"};
+        for (size_t i = 0; i < 3; ++i) {
+            info << fmt::format("{} offset {:#x} size {:#x}\n", segment_names[i],
+                                nso_header.segments[i].location, nso_header.segments[i].size);
+        }
+    }
+    Core::LichiiHooks::SetModuleBase(nso_file.GetName(), load_base);
+    Core::ZstdHle::SetModuleBase(nso_file.GetName(), load_base);
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {

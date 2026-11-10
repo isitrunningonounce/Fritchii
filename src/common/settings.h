@@ -452,7 +452,9 @@ struct Values {
                                                 true,
                                                 true};
 
-    SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen", Category::Renderer,
+    // Saved as frame_gen_enabled, not frame_gen: a frame_gen=true left by builds before Fritchii
+    // v5 turned it on unasked and flickered the camera (2026-11-09).
+    SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen_enabled", Category::Renderer,
                                       Specialization::Default, true, false};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,
@@ -1059,8 +1061,7 @@ extern Values values;
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
 
-/// Whether frame generation runs: the setting, and never in Fritchii builds, which hide its
-/// settings (a value left on by an older build made the camera flicker, 2026-11-09).
+/// Whether frame generation runs (an experimental opt-in; the host frame pacer is off meanwhile).
 [[nodiscard]] bool FrameGenActive();
 [[nodiscard]] u32 FrameGenMultiplier();
 /// Whether emulation runs at the speed limit: use_speed_limit, and in Fritchii always for Ocarina
@@ -1082,6 +1083,15 @@ bool GetDebugKnobAt(u8 i);
 
 void UpdateGPUAccuracy();
 bool IsGPULevelHigh();
+/// Lichii mod: config values a launcher can override for one session without saving them.
+/// LICHII_DLSS=1: NVIDIA DLSS in place of the game's pass (nvidia_dlss).
+bool NvidiaDlssEnabled();
+/// Sets (or, with null or "", clears) one of those launcher variables for this process: the
+/// Graphics menu uses it for the next game start (LICHII_DLSS, LICHII_RESOLUTION,
+/// LICHII_SKIP_BUILTIN, LICHII_DLSS_FG, LICHII_DLSS_FG_MULTIPLIER).
+void SetSessionOverride(const char* name, const char* value);
+/// LICHII_OOT_NO_SHARPEN=1: Ocarina of Time anti-aliasing "No sharpening" (oot_anti_aliasing).
+bool OotNoSharpening();
 
 bool IsDMALevelDefault();
 bool IsDMALevelSafe();

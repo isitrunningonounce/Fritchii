@@ -10,6 +10,7 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
+#include "common/frame_gen_stats.h"
 #include "common/game_presets.h"
 #include "common/shutdown_progress.h"
 #include "common/settings.h"
@@ -5280,7 +5281,17 @@ void MainWindow::UpdateStatusBar() {
         emu_speed_label->setText(tr("Speed: %1%").arg(results.emulation_speed * 100.0, 0, 'f', 0));
     }
 
-    QString fpsText = tr("Game: %1 FPS").arg(std::round(results.average_game_fps), 0, 'f', 0);
+    // DLSS Frame Generation generating: Game counts what reaches the screen (generated frames
+    // included), with the game's own frames beside it.
+    const double shown_fps = Common::FrameGenStats::shown_fps.load(std::memory_order_relaxed);
+    const bool frame_gen = Common::FrameGenStats::active.load(std::memory_order_relaxed) &&
+                           Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed) &&
+                           shown_fps > results.average_game_fps * 1.2;
+    QString fpsText =
+        frame_gen ? tr("Game: %1 FPS (%2 real + Frame Gen)")
+                        .arg(std::round(shown_fps), 0, 'f', 0)
+                        .arg(std::round(results.average_game_fps), 0, 'f', 0)
+                  : tr("Game: %1 FPS").arg(std::round(results.average_game_fps), 0, 'f', 0);
     if (!m_fpsSuffix.isEmpty())
         fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
 

@@ -9,10 +9,19 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <fmt/format.h>
+#include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/lichii_hooks.h"
+#include "core/arm/dynarmic/lichii_zstd_hle.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
@@ -63,6 +72,15 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    if (instruction == LichiiHooks::Pacibsp) {
+        if (ZstdHle::IsHookedEntry(vaddr, m_process->GetProgramId(), m_memory) ||
+            ZstdHle::IsHookedStreamEntry(vaddr, m_process->GetProgramId(), m_memory)) {
+            return ZstdHle::Brk;
+        }
+        if (LichiiHooks::Enabled()) {
+            return LichiiHooks::InstructionFor(vaddr, instruction);
+        }
+    }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -134,6 +152,57 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (exception == Dynarmic::A64::Exception::Breakpoint &&
+        ZstdHle::GetMode() != ZstdHle::Mode::Off && pc == ZstdHle::Target()) {
+        // LICHII_ZSTD_HLE: decoded on the host and back to the caller, or on into the guest
+        // decoder (past its PACIBSP, a no-op here).
+        auto& jit = *m_parent.m_jit;
+        if (ZstdHle::Run(jit, m_memory)) {
+            jit.SetPC(jit.GetRegister(30));
+        }
+        return;
+    }
+    if (exception == Dynarmic::A64::Exception::Breakpoint &&
+        ZstdHle::GetMode() != ZstdHle::Mode::Off && pc == ZstdHle::StreamTarget()) {
+        // LICHII_ZSTD_HLE: the game's streaming decoder, one read buffer per call.
+        auto& jit = *m_parent.m_jit;
+        if (ZstdHle::RunStream(jit, m_memory)) {
+            jit.SetPC(jit.GetRegister(30));
+        }
+        return;
+    }
+    if (std::string hook; exception == Dynarmic::A64::Exception::Breakpoint &&
+                          LichiiHooks::IsHook(pc, &hook)) {
+        // LICHII_HOOK: the arguments and the text they point to, then on past the PACIBSP.
+        auto& jit = *m_parent.m_jit;
+        const auto text_at = [&](u64 address, u64 length_hint) -> std::string {
+            if (address < 0x1000 || !m_memory.IsValidVirtualAddressRange(address, 1)) {
+                return {};
+            }
+            std::string text;
+            const u64 limit = length_hint > 0 && length_hint < 160 ? length_hint : 160;
+            for (u64 i = 0; i < limit; ++i) {
+                if (!m_memory.IsValidVirtualAddressRange(address + i, 1)) break;
+                const u8 c = m_memory.Read8(address + i);
+                if (c == 0 && length_hint == 0) break;
+                if (c < 0x20 || c >= 0x7f) return text.size() >= 3 ? text : std::string{};
+                text.push_back(static_cast<char>(c));
+            }
+            return text.size() >= 3 ? text : std::string{};
+        };
+        const u64 x0 = jit.GetRegister(0), x1 = jit.GetRegister(1);
+        const u64 x2 = jit.GetRegister(2), x3 = jit.GetRegister(3);
+        const std::string s0 = text_at(x0, x1 < 160 ? x1 : 0);
+        const std::string s1 = text_at(x1, x2 < 160 ? x2 : 0);
+        const std::string s2 = text_at(x2, x3 < 160 ? x3 : 0);
+        const std::string line = fmt::format("{} x0='{}' x1='{}' x2='{}' len1={} len2={}", hook,
+                                             s0, s1, s2, x1 < 160 ? x1 : 0, x2 < 160 ? x2 : 0);
+        if (LichiiHooks::FirstTime(line)) {
+            LOG_INFO(Core_ARM, "LICHII_HOOK {} lr={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x}", line,
+                     jit.GetRegister(30), x0, x1, x2, x3);
+        }
+        return;
+    }
     if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
         const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
         if (point != WindowTrace::Point::None) {
@@ -459,7 +528,88 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
+namespace {
+struct StoredBlock {
+    u64 location;
+    u32 first_instruction;
+    u32 reserved;
+};
+static_assert(sizeof(StoredBlock) == 16);
+
+std::filesystem::path StoredBlocksPath(u64 program_id) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "lichii_jit" /
+           fmt::format("{:016X}.bin", program_id);
+}
+} // Anonymous namespace
+
+void ArmDynarmic64::PrecompileStoredBlocks() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LICHII_JIT_PRECOMPILE");
+        return value != nullptr && value[0] == '1';
+    }();
+    const u64 program_id = m_cb->m_process->GetProgramId();
+    if (!enabled || program_id == 0 || program_id != m_system.GetApplicationProcessProgramID()) {
+        return;
+    }
+    std::ifstream in{StoredBlocksPath(program_id), std::ios::binary};
+    if (!in) {
+        return;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    size_t stored = 0;
+    size_t compiled = 0;
+    StoredBlock block{};
+    while (in.read(reinterpret_cast<char*>(&block), sizeof(block))) {
+        ++stored;
+        compiled += m_jit->PrecompileBlock(block.location, block.first_instruction) ? 1 : 0;
+    }
+    LOG_INFO(Core_ARM, "LICHII_JIT: core {} precompiled {} of {} stored blocks in {:.2f} s",
+             m_core_index, compiled, stored,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+}
+
+void ArmDynarmic64::ReportCompiledBlocks() {
+    // Every 10 s, from whichever core gets here first.
+    static std::atomic<s64> next_report{0};
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 due = next_report.load(std::memory_order_relaxed);
+    if (now < due || !next_report.compare_exchange_strong(due, now + 10'000)) {
+        return;
+    }
+    const auto stats = Dynarmic::A64::TakeCompileStats();
+    const auto blocks = Dynarmic::A64::TakeNewBlocks();
+    LOG_INFO(Core_ARM,
+             "LICHII_JIT: last 10 s: {} blocks translated in {:.1f} ms of CPU time ({} not seen "
+             "before)",
+             stats.blocks, static_cast<double>(stats.nanoseconds) / 1e6, blocks.size());
+    const u64 program_id = m_system.GetApplicationProcessProgramID();
+    if (blocks.empty() || program_id == 0) {
+        return;
+    }
+    static std::mutex file_mutex;
+    std::scoped_lock lock{file_mutex};
+    const auto path = StoredBlocksPath(program_id);
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    std::ofstream out{path, std::ios::binary | std::ios::app};
+    for (const auto& [location, pc] : blocks) {
+        const StoredBlock block{
+            .location = location,
+            .first_instruction = m_cb->m_memory.Read32(pc),
+            .reserved = 0,
+        };
+        out.write(reinterpret_cast<const char*>(&block), sizeof(block));
+    }
+}
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    if (!m_blocks_precompiled) {
+        m_blocks_precompiled = true;
+        PrecompileStoredBlocks();
+    }
+    ReportCompiledBlocks();
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Run());
 }

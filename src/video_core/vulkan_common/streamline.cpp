@@ -5,6 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <stop_token>
+#include <thread>
+#include <utility>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -15,6 +22,7 @@
 
 #include <fmt/format.h>
 
+#include "common/frame_gen_stats.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -49,6 +57,40 @@ struct State {
     std::vector<std::string> device_extensions;
     bool started{};
     bool attached{};
+    // DLSS Frame Generation (LICHII_DLSS_FG).
+    bool fg_wanted{};    ///< Loaded with DLSS and its requirements read
+    bool fg_available{}; ///< Supported on the attached device
+    ExtraQueues fg_queues{};
+    std::vector<std::string> fg_device_extensions;
+    // Per frame: the token of the latest DLSS evaluation, until a present takes it (worker).
+    std::atomic<const sl::FrameToken*> fg_tagged{};
+    bool fg_reflex_set{}; ///< Worker
+    bool fg_reflex_on{};  ///< Worker: Reflex set for the player's frame generation switch on
+    // eBlockNoClientQueues: frame generation's inputs fence, from the present thread to the worker.
+    VkDevice device{};
+    PFN_vkWaitSemaphores wait_semaphores{};
+    std::atomic<VkSemaphore> fg_inputs_fence{};
+    std::atomic<u64> fg_inputs_value{};
+    u64 fg_wait_timeouts{};
+    // Timing for the periodic log (ns): worker fence waits, present calls, present to present.
+    std::atomic<u64> fg_wait_ns{};
+    u64 fg_acquire_ns{};
+    std::atomic<u64> fg_free_wait_ns{};
+    u64 fg_present_ns{};
+    u64 fg_interval_ns{};
+    std::chrono::steady_clock::time_point fg_present_begin{};
+    std::chrono::steady_clock::time_point fg_last_present{};
+    bool fg_on{};         ///< Present thread from here on
+    u32 fg_frames{};      ///< Generated frames per rendered one while on
+    u32 fg_max_frames{1}; ///< DLSSGState::numFramesToGenerateMax
+    u64 fg_presents{};
+    u64 fg_generated_presents{};
+    sl::DLSSGStatus fg_last_status{};
+    // Frames shown on screen per second (Common::FrameGenStats), present thread.
+    std::chrono::steady_clock::time_point fg_window_begin{};
+    u64 fg_window_shown{};
+    u64 fg_window_generated{};
+    u64 fg_window_presents{};
 };
 
 State& GetState() {
@@ -213,6 +255,9 @@ bool Load(State& state, const std::filesystem::path& path) {
         Resolve(m, "slEvaluateFeature", api.evaluate_feature) &&
         Resolve(m, "slFreeResources", api.free_resources) &&
         Resolve(m, "slSetVulkanInfo", api.set_vulkan_info)) {
+        // Frame generation tags its inputs per frame (optional for DLSS alone).
+        api.set_tag_for_frame = reinterpret_cast<PFun_slSetTagForFrame*>(
+            reinterpret_cast<void*>(GetProcAddress(m, "slSetTagForFrame")));
         return true;
     }
     FreeLibrary(state.module);
@@ -296,7 +341,7 @@ bool Start() {
     if (state.started) {
         return true;
     }
-    if (!Settings::values.nvidia_dlss.GetValue()) {
+    if (!Settings::NvidiaDlssEnabled()) {
         return false;
     }
     if (!state.module) {
@@ -332,7 +377,10 @@ bool Start() {
     // Streamline's plugins come from the loader's folder or the NVIDIA app's downloads (OTA); the
     // DLSS model from the loader's folder, else the NVIDIA app's copy.
     const wchar_t* plugin_paths[] = {state.plugin_dir.c_str(), state.model_dir.c_str()};
-    const sl::Feature features[] = {sl::kFeatureDLSS};
+    // Frame generation needs Reflex and PCL loaded with it.
+    const bool want_fg = FrameGenRequested();
+    const sl::Feature features[] = {sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex,
+                                    sl::kFeaturePCL};
     sl::Preferences preferences{};
     preferences.logLevel = LogLevel() >= 2 ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
     preferences.logMessageCallback = LogFromStreamline;
@@ -341,8 +389,12 @@ bool Start() {
     preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking |
                         sl::PreferenceFlags::eUseManualHooking | sl::PreferenceFlags::eAllowOTA |
                         sl::PreferenceFlags::eLoadDownloadedPlugins;
+    if (want_fg) {
+        // slSetTagForFrame (frame generation's tags, valid until present) needs it.
+        preferences.flags |= sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    }
     preferences.featuresToLoad = features;
-    preferences.numFeaturesToLoad = 1;
+    preferences.numFeaturesToLoad = want_fg ? 4 : 1;
     preferences.engine = sl::EngineType::eCustom;
     preferences.engineVersion = "1.0";
     preferences.projectId = PROJECT_ID;
@@ -380,6 +432,51 @@ bool Start() {
         device_extensions.end()) {
         std::erase(state.device_extensions, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
+    state.fg_wanted = false;
+    state.fg_queues = {};
+    state.fg_device_extensions.clear();
+    if (want_fg) {
+        sl::FeatureRequirements fg{};
+        if (const sl::Result result = api.get_feature_requirements(sl::kFeatureDLSS_G, fg);
+            result != sl::Result::eOk) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS Frame Generation: no plugin (result {}); sl.dlss_g.dll, "
+                        "nvngx_dlssg.dll, sl.reflex.dll and sl.pcl.dll go next to "
+                        "sl.interposer.dll. Running without it",
+                        static_cast<int>(result));
+        } else {
+            state.fg_wanted = true;
+            state.fg_queues = {fg.vkNumComputeQueuesRequired, fg.vkNumGraphicsQueuesRequired,
+                               fg.vkNumOpticalFlowQueuesRequired};
+            state.fg_device_extensions = Names(fg.vkNumDeviceExtensions, fg.vkDeviceExtensions);
+            for (std::string& name :
+                 Names(fg.vkNumInstanceExtensions, fg.vkInstanceExtensions)) {
+                if (std::ranges::find(state.instance_extensions, name) ==
+                    state.instance_extensions.end()) {
+                    state.instance_extensions.push_back(std::move(name));
+                }
+            }
+            std::string extensions;
+            for (const std::string& name : state.fg_device_extensions) {
+                extensions += (extensions.empty() ? "" : ", ") + name;
+            }
+            std::string features12;
+            for (const std::string& name : Names(fg.vkNumFeatures12, fg.vkFeatures12)) {
+                features12 += (features12.empty() ? "" : ", ") + name;
+            }
+            std::string features13;
+            for (const std::string& name : Names(fg.vkNumFeatures13, fg.vkFeatures13)) {
+                features13 += (features13.empty() ? "" : ", ") + name;
+            }
+            LOG_INFO(Render_Vulkan,
+                     "DLSS Frame Generation asks for {} compute, {} graphics and {} optical flow "
+                     "queues; device extensions: {}; Vulkan 1.2 features: {}; 1.3 features: {}",
+                     fg.vkNumComputeQueuesRequired, fg.vkNumGraphicsQueuesRequired,
+                     fg.vkNumOpticalFlowQueuesRequired, extensions.empty() ? "none" : extensions,
+                     features12.empty() ? "none" : features12,
+                     features13.empty() ? "none" : features13);
+        }
+    }
     sl::FeatureVersion version{};
     api.get_feature_version(sl::kFeatureDLSS, version);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline {} started from {} (DLSS {})",
@@ -405,8 +502,49 @@ std::vector<std::string> DeviceExtensions() {
     return state.started ? state.device_extensions : std::vector<std::string>{};
 }
 
+bool FrameGenRequested() {
+    // Read at every game start: the status bar sets it for the next one.
+    const char* value = std::getenv("LICHII_DLSS_FG");
+    return value != nullptr && value[0] == '1';
+}
+
+ExtraQueues ExtraQueuesWanted() {
+    const State& state = GetState();
+    return state.started && state.fg_wanted ? state.fg_queues : ExtraQueues{};
+}
+
+std::vector<std::string> FrameGenDeviceExtensions() {
+    const State& state = GetState();
+    return state.started && state.fg_wanted ? state.fg_device_extensions
+                                            : std::vector<std::string>{};
+}
+
+void DropFrameGen(const char* reason) {
+    State& state = GetState();
+    if (state.fg_wanted) {
+        LOG_WARNING(Render_Vulkan, "DLSS Frame Generation is off: {}", reason);
+    }
+    state.fg_wanted = false;
+    state.fg_queues = {};
+    state.fg_device_extensions.clear();
+}
+
+void* FrameGenProcAddress(const char* name) {
+    const State& state = GetState();
+    // Only once the device is attached: Streamline's Vulkan proxies need it.
+    if (!state.started || !state.attached || !state.fg_available || !state.module) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(GetProcAddress(state.module, name));
+}
+
+bool IsFrameGenAvailable() {
+    const State& state = GetState();
+    return state.started && state.attached && state.fg_available;
+}
+
 bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
-                  u32 graphics_family, vk::DeviceDispatch& dld) {
+                  u32 graphics_family, u32 optical_flow_family, vk::DeviceDispatch& dld) {
     State& state = GetState();
     if (!WantsDevice()) {
         return false;
@@ -417,6 +555,18 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     info.physicalDevice = physical;
     info.computeQueueFamily = graphics_family;
     info.graphicsQueueFamily = graphics_family;
+    if (state.fg_wanted) {
+        // The device was created with frame generation's queues after the renderer's first
+        // graphics queue (Device::GetDeviceQueueCreateInfos): compute, then graphics, then optical
+        // flow (in its own family, or after those in the graphics family).
+        info.computeQueueIndex = 1;
+        info.graphicsQueueIndex = 1 + state.fg_queues.compute;
+        info.opticalFlowQueueFamily = optical_flow_family;
+        info.opticalFlowQueueIndex = optical_flow_family == graphics_family
+                                         ? 1 + state.fg_queues.compute + state.fg_queues.graphics
+                                         : 0;
+        info.useNativeOpticalFlowMode = state.fg_queues.optical_flow != 0;
+    }
     if (const sl::Result result = state.api.set_vulkan_info(info); result != sl::Result::eOk) {
         LOG_ERROR(Render_Vulkan, "Streamline did not take the Vulkan device (result {})",
                   static_cast<int>(result));
@@ -450,13 +600,412 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     hook(dld.vkQueuePresentKHR, "vkQueuePresentKHR");
     hook(dld.vkDeviceWaitIdle, "vkDeviceWaitIdle");
     state.attached = true;
+    state.device = device;
+    state.wait_semaphores = dld.vkWaitSemaphores;
     LOG_INFO(Render_Vulkan, "NVIDIA DLSS is available through Streamline");
+
+    state.fg_available = false;
+    if (state.fg_wanted) {
+        const auto feature_function = [&](sl::Feature feature, const char* name, auto& function) {
+            void* address = nullptr;
+            if (state.api.get_feature_function(feature, name, address) == sl::Result::eOk) {
+                function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(address);
+            }
+            return function != nullptr;
+        };
+        Api& api = state.api;
+        const sl::Result supported = api.is_feature_supported(sl::kFeatureDLSS_G, adapter);
+        const bool functions =
+            feature_function(sl::kFeatureDLSS_G, "slDLSSGSetOptions", api.dlssg_set_options) &&
+            feature_function(sl::kFeatureDLSS_G, "slDLSSGGetState", api.dlssg_get_state) &&
+            feature_function(sl::kFeatureReflex, "slReflexSetOptions", api.reflex_set_options) &&
+            feature_function(sl::kFeatureReflex, "slReflexSleep", api.reflex_sleep) &&
+            feature_function(sl::kFeaturePCL, "slPCLSetMarker", api.pcl_set_marker) &&
+            api.set_tag_for_frame != nullptr;
+        if (supported != sl::Result::eOk || !functions) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS Frame Generation is not available (Streamline result {}, functions "
+                        "{}); DLSS keeps running without it",
+                        static_cast<int>(supported), functions ? "found" : "missing");
+        } else {
+            sl::DLSSGState fg_state{};
+            sl::DLSSGOptions probe{};
+            api.dlssg_get_state(sl::ViewportHandle{0u}, fg_state, &probe);
+            state.fg_available = true;
+            state.fg_max_frames = (std::max)(fg_state.numFramesToGenerateMax, 1u);
+            Common::FrameGenStats::max_multiplier.store(state.fg_max_frames + 1,
+                                                       std::memory_order_relaxed);
+            if (const char* const value = std::getenv("LICHII_DLSS_FG_MULTIPLIER");
+                value && value[0] != '\0') {
+                Common::FrameGenStats::multiplier.store(
+                    static_cast<unsigned>(std::clamp(std::atoi(value), 2, 6)),
+                    std::memory_order_relaxed);
+            }
+            Common::FrameGenStats::available.store(true, std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "DLSS Frame Generation is available: up to {} generated frames per rendered "
+                     "one, optical flow queue family {} index {}",
+                     fg_state.numFramesToGenerateMax, info.opticalFlowQueueFamily,
+                     info.opticalFlowQueueIndex);
+        }
+    }
     return true;
 }
 
 bool IsDlssAvailable() {
     const State& state = GetState();
     return state.started && state.attached;
+}
+
+// Calls slReflexSleep for the latest frame on its own thread: Reflex counts as active for
+// DLSS-G without holding the Vulkan worker.
+class ReflexSleeper {
+public:
+    ReflexSleeper() : thread{[this](std::stop_token stop) { Run(stop); }} {}
+
+    void Post(const sl::FrameToken* token) {
+        {
+            std::scoped_lock lock{mutex};
+            pending = token;
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Run(std::stop_token stop) {
+        while (true) {
+            const sl::FrameToken* token{};
+            {
+                std::unique_lock lock{mutex};
+                if (!cv.wait(lock, stop, [this] { return pending != nullptr; })) {
+                    return;
+                }
+                token = std::exchange(pending, nullptr);
+            }
+            const State& state = GetState();
+            if (IsFrameGenAvailable() && state.api.reflex_sleep) {
+                state.api.reflex_sleep(*token);
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    const sl::FrameToken* pending{};
+    std::jthread thread;
+};
+
+// LICHII_DLSS_FG_WAIT=1: CPU wait for frame generation's inputs fence before tagging. Off: it held
+// the worker ~20 ms per frame, and the tagged inputs are copies in a ring (vk_streamline_dlss).
+bool FrameGenWaitsForInputs() {
+    static const bool waits = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_WAIT");
+        return value && value[0] == '1';
+    }();
+    return waits;
+}
+
+void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const sl::Resource& motion,
+                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle) {
+    State& state = GetState();
+    if (!IsFrameGenAvailable()) {
+        return;
+    }
+    const Api& api = state.api;
+    // The player's switch (status bar): off, no token reaches the present (frame generation off)
+    // and Reflex goes back to off, so nothing of it costs.
+    const bool user_on = Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed);
+    if (!state.fg_reflex_set || user_on != state.fg_reflex_on) {
+        // DLSS-G needs Reflex in a low latency mode and slReflexSleep every frame (else it does
+        // nothing while still reporting two presented frames: "eDLSSGStatusFailReflexNot-
+        // DetectedAtRuntime"). LICHII_DLSS_FG_REFLEX=0|1|2: off, low latency (default), boost.
+        sl::ReflexOptions reflex{};
+        reflex.mode = sl::ReflexMode::eLowLatency;
+        if (const char* const value = std::getenv("LICHII_DLSS_FG_REFLEX")) {
+            reflex.mode = value[0] == '0'   ? sl::ReflexMode::eOff
+                          : value[0] == '2' ? sl::ReflexMode::eLowLatencyWithBoost
+                                            : sl::ReflexMode::eLowLatency;
+        }
+        if (!user_on) {
+            reflex.mode = sl::ReflexMode::eOff;
+        }
+        const sl::Result result = api.reflex_set_options(reflex);
+        LOG_INFO(Render_Vulkan, "DLSS Frame Generation {} by the player; Reflex mode {} (result {})",
+                 user_on ? "on" : "off", static_cast<int>(reflex.mode), static_cast<int>(result));
+        state.fg_reflex_set = true;
+        state.fg_reflex_on = user_on;
+    }
+    if (!user_on) {
+        return;
+    }
+    // DLSS-G only runs with Reflex active ("eDLSSGStatusFailReflexNotDetectedAtRuntime - sl.reflex
+    // must be enabled and active -1 != frame" without slReflexSleep each frame, or with the low
+    // latency mode off, while still reporting two presented frames). Inline on the worker the
+    // sleep held it ~14 ms a frame (28 real fps), as Reflex keeps a single frame in flight: by
+    // default it sleeps on a thread of its own. LICHII_DLSS_FG_REFLEX_SLEEP=0 none, 1 inline.
+    static const int reflex_sleep = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_REFLEX_SLEEP");
+        return value ? std::atoi(value) : 2;
+    }();
+    if (reflex_sleep == 1) {
+        const auto sleep_begin = std::chrono::steady_clock::now();
+        api.reflex_sleep(frame);
+        state.fg_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - sleep_begin)
+                                       .count()),
+                                   std::memory_order_relaxed);
+    } else if (reflex_sleep == 2) {
+        static ReflexSleeper sleeper;
+        sleeper.Post(&frame);
+    }
+    api.pcl_set_marker(sl::PCLMarker::eSimulationStart, frame);
+    api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, frame);
+    api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, frame);
+    // With eBlockNoClientQueues frame generation keeps running on its own queues after the
+    // present: the previous frame's inputs must be consumed before this frame's copies replace
+    // them. This command buffer is submitted after the wait, so a CPU wait orders it.
+    if (const VkSemaphore fence = state.fg_inputs_fence.load(std::memory_order_acquire);
+        fence && state.wait_semaphores && FrameGenWaitsForInputs()) {
+        const auto wait_begin = std::chrono::steady_clock::now();
+        const u64 value = state.fg_inputs_value.load(std::memory_order_acquire);
+        const VkSemaphoreWaitInfo wait{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .semaphoreCount = 1,
+            .pSemaphores = &fence,
+            .pValues = &value,
+        };
+        if (state.wait_semaphores(state.device, &wait, 100'000'000) == VK_TIMEOUT &&
+            state.fg_wait_timeouts++ == 0) {
+            LOG_WARNING(Render_Vulkan, "DLSS Frame Generation: inputs fence wait timed out");
+        }
+        state.fg_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - wait_begin)
+                                       .count()),
+                                   std::memory_order_relaxed);
+    }
+    // The game draws over its depth and motion next frame, before this one is presented.
+    sl::ResourceTag tags[] = {
+        sl::ResourceTag{const_cast<sl::Resource*>(&depth), sl::kBufferTypeDepth,
+                        lifecycle, &area},
+        sl::ResourceTag{const_cast<sl::Resource*>(&motion), sl::kBufferTypeMotionVectors,
+                        lifecycle, &area},
+    };
+    const auto tag_begin = std::chrono::steady_clock::now();
+    const sl::Result result =
+        api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, tags, static_cast<u32>(std::size(tags)),
+                              reinterpret_cast<sl::CommandBuffer*>(cmdbuf));
+    state.fg_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - tag_begin)
+                                   .count()),
+                               std::memory_order_relaxed);
+    if (result != sl::Result::eOk) {
+        static std::atomic<bool> warned{};
+        if (!warned.exchange(true)) {
+            LOG_WARNING(Render_Vulkan, "DLSS Frame Generation: tagging failed (result {})",
+                        static_cast<int>(result));
+        }
+        return;
+    }
+    state.fg_tagged.store(&frame, std::memory_order_release);
+}
+
+void NoteFrameGenAcquire(u64 ns) {
+    State& state = GetState();
+    if (state.fg_on) {
+        state.fg_acquire_ns += ns;
+    }
+}
+
+void NoteFrameGenFreeWait(u64 ns) {
+    State& state = GetState();
+    if (state.fg_on) {
+        state.fg_free_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
+}
+
+VkQueue FrameGenDeviceQueue(VkDevice device, u32 family, u32 index) {
+    const State& state = GetState();
+    if (!state.module) {
+        return VK_NULL_HANDLE;
+    }
+    const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+        reinterpret_cast<void*>(GetProcAddress(state.module, "vkGetDeviceQueue")));
+    if (!get_queue) {
+        return VK_NULL_HANDLE;
+    }
+    VkQueue queue{};
+    get_queue(device, family, index, &queue);
+    return queue;
+}
+
+bool FrameGenDropsPresentIds() {
+    if (!IsFrameGenAvailable()) {
+        return false;
+    }
+    const char* const value = std::getenv("LICHII_DLSS_FG_PRESENT_ID");
+    return !value || value[0] != '1';
+}
+
+u32 FrameGenSwapchainImages() {
+    if (!IsFrameGenAvailable()) {
+        return 0;
+    }
+    const char* const value = std::getenv("LICHII_DLSS_FG_IMAGES");
+    return value ? static_cast<u32>(std::atoi(value)) : 0;
+}
+
+void* TakeFrameGenToken() {
+    State& state = GetState();
+    if (!IsFrameGenAvailable()) {
+        return nullptr;
+    }
+    return const_cast<sl::FrameToken*>(state.fg_tagged.exchange(nullptr, std::memory_order_acq_rel));
+}
+
+void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
+                           u32 game_bottom) {
+    State& state = GetState();
+    if (!IsFrameGenAvailable()) {
+        return;
+    }
+    const Api& api = state.api;
+    const bool want_on = token != nullptr;
+    const u32 multiplier = Common::FrameGenStats::multiplier.load(std::memory_order_relaxed);
+    const u32 frames = want_on ? std::clamp<u32>(multiplier, 2, state.fg_max_frames + 1) - 1 : 0;
+    if (want_on != state.fg_on || frames != state.fg_frames) {
+        // Off for frames without a DLSS evaluation (menus, loading): nothing to generate from.
+        sl::DLSSGOptions options{};
+        options.mode = want_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        options.numFramesToGenerate = (std::max)(frames, 1u);
+        options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        // The default blocks the presenting queue (the emulator's only graphics queue) until
+        // frame generation finishes: the real frame rate halved (50 -> 26 fps). LICHII_DLSS_FG_BLOCK=1
+        // goes back to it.
+        const char* const block = std::getenv("LICHII_DLSS_FG_BLOCK");
+        options.queueParallelismMode = block && block[0] == '1'
+                                           ? sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue
+                                           : sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
+        const sl::Result result = api.dlssg_set_options(sl::ViewportHandle{0u}, options);
+        if (want_on) {
+            LOG_INFO(Render_Vulkan, "DLSS Frame Generation on, {}x (result {})", frames + 1,
+                     static_cast<int>(result));
+        } else {
+            LOG_INFO(Render_Vulkan, "DLSS Frame Generation off (result {})",
+                     static_cast<int>(result));
+        }
+        state.fg_on = want_on;
+        state.fg_frames = frames;
+        Common::FrameGenStats::active.store(want_on, std::memory_order_relaxed);
+        state.fg_window_begin = {};
+        state.fg_window_shown = 0;
+        state.fg_window_generated = 0;
+        state.fg_window_presents = 0;
+    }
+    if (!token) {
+        return;
+    }
+    const auto& frame = *static_cast<const sl::FrameToken*>(token);
+    api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, frame);
+    // The game image's rectangle in the backbuffer, a few pixels in: frame generation runs inside
+    // it and copies the edges as they are. Scaled to fullscreen, the last row came out dark and
+    // generation smeared it into a black line while running (LICHII_DLSS_FG_INSET=n, default 4).
+    static const u32 inset = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_INSET");
+        return value ? static_cast<u32>(std::atoi(value)) : 4u;
+    }();
+    if (game_right > game_left + 2 * inset && game_bottom > game_top + 2 * inset) {
+        const sl::Extent subrect{game_top + inset, game_left + inset,
+                                 game_right - game_left - 2 * inset,
+                                 game_bottom - game_top - 2 * inset};
+        sl::ResourceTag backbuffer{nullptr, sl::kBufferTypeBackbuffer,
+                                   sl::ResourceLifecycle::eValidUntilPresent, &subrect};
+        api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &backbuffer, 1, nullptr);
+    }
+    api.pcl_set_marker(sl::PCLMarker::ePresentStart, frame);
+    state.fg_present_begin = std::chrono::steady_clock::now();
+}
+
+void FrameGenAfterPresent(void* token) {
+    State& state = GetState();
+    if (!IsFrameGenAvailable() || !token) {
+        return;
+    }
+    const Api& api = state.api;
+    api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *static_cast<const sl::FrameToken*>(token));
+    ++state.fg_presents;
+    const auto now = std::chrono::steady_clock::now();
+    const auto ns = [](auto duration) {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+    };
+    state.fg_present_ns += ns(now - state.fg_present_begin);
+    if (state.fg_last_present != std::chrono::steady_clock::time_point{}) {
+        state.fg_interval_ns += ns(now - state.fg_last_present);
+    }
+    state.fg_last_present = now;
+    sl::DLSSGState fg_state{};
+    if (api.dlssg_get_state(sl::ViewportHandle{0u}, fg_state, nullptr) != sl::Result::eOk) {
+        return;
+    }
+    if (fg_state.inputsProcessingCompletionFence) {
+        state.fg_inputs_value.store(fg_state.lastPresentInputsProcessingCompletionFenceValue,
+                                    std::memory_order_release);
+        state.fg_inputs_fence.store(static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence),
+                                    std::memory_order_release);
+    }
+    // What reached the screen, for the frontend's FPS counters (one-second windows).
+    {
+        const u32 shown = (std::max)(fg_state.numFramesActuallyPresented, 1u);
+        state.fg_window_shown += shown;
+        state.fg_window_generated += shown > 1 ? 1 : 0;
+        ++state.fg_window_presents;
+        if (state.fg_window_begin == std::chrono::steady_clock::time_point{}) {
+            state.fg_window_begin = now;
+        } else if (const auto elapsed = now - state.fg_window_begin;
+                   elapsed >= std::chrono::seconds{1}) {
+            const double seconds = std::chrono::duration<double>(elapsed).count();
+            Common::FrameGenStats::shown_fps.store(
+                static_cast<double>(state.fg_window_shown) / seconds, std::memory_order_relaxed);
+            Common::FrameGenStats::generated_share.store(
+                static_cast<double>(state.fg_window_generated) /
+                    static_cast<double>(state.fg_window_presents),
+                std::memory_order_relaxed);
+            state.fg_window_begin = now;
+            state.fg_window_shown = 0;
+            state.fg_window_generated = 0;
+            state.fg_window_presents = 0;
+        }
+    }
+    if (fg_state.numFramesActuallyPresented > 1) {
+        ++state.fg_generated_presents;
+    }
+    if (fg_state.status != state.fg_last_status) {
+        LOG_WARNING(Render_Vulkan, "DLSS Frame Generation status {:#x}",
+                    static_cast<u32>(fg_state.status));
+        state.fg_last_status = fg_state.status;
+    }
+    if (state.fg_presents % 300 == 1) {
+        const u64 window = state.fg_presents == 1 ? 1 : 300;
+        const u64 wait_ns = state.fg_wait_ns.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan,
+                 "DLSS Frame Generation: {} of {} rendered frames presented with generated ones "
+                 "(last: {} presented); per frame: present call {:.2f} ms, present interval "
+                 "{:.2f} ms, worker waits (inputs fence + tagging) {:.2f} ms, render wait + acquire {:.2f} ms, renderer waits "
+                 "for a free frame {:.2f} ms",
+                 state.fg_generated_presents, state.fg_presents,
+                 fg_state.numFramesActuallyPresented,
+                 static_cast<double>(state.fg_present_ns) / 1e6 / static_cast<double>(window),
+                 static_cast<double>(state.fg_interval_ns) / 1e6 / static_cast<double>(window),
+                 static_cast<double>(wait_ns) / 1e6 / static_cast<double>(window),
+                 static_cast<double>(state.fg_acquire_ns) / 1e6 / static_cast<double>(window),
+                 static_cast<double>(state.fg_free_wait_ns.exchange(0, std::memory_order_relaxed)) /
+                     1e6 / static_cast<double>(window));
+        state.fg_acquire_ns = 0;
+        state.fg_present_ns = 0;
+        state.fg_interval_ns = 0;
+    }
 }
 
 void Stop() {
@@ -467,6 +1016,15 @@ void Stop() {
     const sl::Result result = state.api.shutdown();
     state.started = false;
     state.attached = false;
+    Common::FrameGenStats::active.store(false, std::memory_order_relaxed);
+    Common::FrameGenStats::available.store(false, std::memory_order_relaxed);
+    // The next game start sets frame generation up again.
+    state.fg_available = false;
+    state.fg_reflex_set = false;
+    state.fg_on = false;
+    state.fg_frames = 0;
+    state.fg_tagged.store(nullptr, std::memory_order_relaxed);
+    state.fg_inputs_fence.store(VK_NULL_HANDLE, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline stopped (result {})", static_cast<int>(result));
 }
 

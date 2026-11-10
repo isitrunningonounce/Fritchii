@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "dynarmic/interface/A64/config.h"
@@ -126,10 +127,25 @@ public:
     /// the resulting instructions as a vector of their string representations.
     std::string Disassemble() const;
 
+    /// Lichii: compiles the block at a location descriptor (from TakeNewBlocks of an earlier run)
+    /// before it runs, if the guest code there still starts with first_instruction. Not while
+    /// Run is executing. Returns true when it compiled one.
+    bool PrecompileBlock(std::uint64_t location, std::uint32_t first_instruction);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
+
+/// Lichii: blocks compiled, and the time spent compiling them, by every JIT since the last call.
+struct CompileStats {
+    std::uint64_t blocks = 0;
+    std::uint64_t nanoseconds = 0;
+};
+CompileStats TakeCompileStats();
+
+/// Lichii: each block compiled since the last call, once: (location descriptor, guest pc).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> TakeNewBlocks();
 
 }  // namespace A64
 }  // namespace Dynarmic

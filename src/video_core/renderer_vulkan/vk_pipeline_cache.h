@@ -12,13 +12,16 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
 #include <stop_token>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -116,6 +119,44 @@ struct ShaderPools {
     Shader::ObjectPool<Shader::IR::Inst> inst{8192};
     Shader::ObjectPool<Shader::IR::Block> block{32};
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
+};
+
+/// A Shader::Info kept as its serialization (LichiiIO::PutInfo, a few hundred bytes) and expanded
+/// to the full struct (tens of KiB) the first time something reads it. The precompiled store
+/// holds ~100k distinct infos and a session reads a few thousand of them.
+struct PackedInfo {
+    std::vector<u8> bytes;
+    /// Vertex attributes the stage reads or passes on (2 bits each), for keys without expanding.
+    u64 generic_mask = ~0ULL;
+    [[nodiscard]] const Shader::Info& Get() const;
+    mutable std::once_flag once;
+    mutable std::unique_ptr<Shader::Info> decoded;
+};
+
+/// Reads like a pointer to the Shader::Info (bool, *, ->), expanding it on first use.
+class InfoRef {
+public:
+    InfoRef() = default;
+    explicit InfoRef(std::shared_ptr<const PackedInfo> packed_) : packed{std::move(packed_)} {}
+    explicit operator bool() const noexcept {
+        return packed != nullptr;
+    }
+    const Shader::Info& operator*() const {
+        return packed->Get();
+    }
+    const Shader::Info* operator->() const {
+        return &packed->Get();
+    }
+    /// The serialization, without expanding it.
+    [[nodiscard]] const std::vector<u8>& Bytes() const {
+        return packed->bytes;
+    }
+    [[nodiscard]] u64 GenericMask() const {
+        return packed->generic_mask;
+    }
+
+private:
+    std::shared_ptr<const PackedInfo> packed;
 };
 
 struct ComputePipelineCacheEntry {
@@ -266,6 +307,145 @@ private:
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
+    /// Whether the current draw may be skipped while its pipeline is not ready.
+    [[nodiscard]] bool CanSkipCurrentDraw() const noexcept;
+
+    /// The SPIR-V and shader info of a translated pipeline, kept so pipelines with the same
+    /// programs whose fixed state does not reach the shaders skip translation (LICHII_SPIRV_REUSE).
+    struct ReusableStages {
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
+        /// Shared: identical infos (the same program in many pairs, every stored entry) are one
+        /// copy (PipelineCache::InternInfo).
+        std::array<InfoRef, Maxwell::MaxShaderStage> infos;
+        std::vector<VideoCommon::RecordedEnvQueries> queries;
+        std::array<u64, Maxwell::MaxShaderProgram> unique_hashes{};
+        /// ReuseState of the translated key, with only the vertex attribute types it reads.
+        FixedPipelineState state{};
+        /// The attribute_types bits of the vertex inputs the vertex stage reads or passes on.
+        u64 attribute_mask = ~0ULL;
+        /// Translations read from lichii_precompile_translations.bin keep their SPIR-V there:
+        /// the module index per stage (-1: none or in spirv), read when a pipeline needs it.
+        std::array<s32, Maxwell::MaxShaderStage> stored_spirv{-1, -1, -1, -1, -1};
+        /// First boot: the module index per stage in the spool file (-1: none).
+        std::array<s32, Maxwell::MaxShaderStage> spool_spirv{-1, -1, -1, -1, -1};
+        /// Archive translations made at boot keep their SPIR-V compressed (zstd) until stored.
+        std::array<std::shared_ptr<const std::vector<u8>>, Maxwell::MaxShaderStage> spirv_zstd;
+        std::array<u32, Maxwell::MaxShaderStage> spirv_words{};
+    };
+
+    /// The SPIR-V of a stage, from memory or read from the translation store.
+    [[nodiscard]] std::vector<u32> ReusableSpirv(const ReusableStages& stages, size_t stage);
+    /// Reads (and decompresses) one SPIR-V module of the translation store; empty on failure.
+    [[nodiscard]] std::vector<u32> ReadStoredSpirv(s32 module);
+
+    /// Where each SPIR-V module of the translation store is in its file (zstd frame each).
+    struct SpirvStore {
+        struct Module {
+            u64 offset;
+            u32 compressed_size;
+            u32 words;
+        };
+        std::filesystem::path path;
+        std::vector<Module> modules;
+        std::mutex mutex;
+        std::ifstream file;
+    };
+    std::unique_ptr<SpirvStore> spirv_store;
+
+    /// LICHII_PRECOMPILE first boot: every translated SPIR-V module goes to this temporary file as
+    /// soon as it exists (compressed, one copy per distinct module), so hundreds of thousands of
+    /// translations do not wait in memory (~20 GB) until the store is written.
+    struct SpirvSpool {
+        std::filesystem::path path;
+        std::fstream file;
+        std::vector<SpirvStore::Module> modules;
+        std::unordered_map<u64, s32> by_hash;
+        std::mutex mutex;
+        u64 end{};
+    };
+    std::unique_ptr<SpirvSpool> spirv_spool;
+    [[nodiscard]] s32 SpoolSpirv(const std::vector<u32>& spirv);
+    [[nodiscard]] std::vector<u8> ReadSpoolFrame(s32 index);
+
+    /// LICHII_PRECOMPILE: one compressed copy of each distinct SPIR-V module translated at boot
+    /// (by its hash and size), shared by every translation that produced it.
+    std::mutex spirv_intern_mutex;
+    std::unordered_map<u64, std::shared_ptr<const std::vector<u8>>> spirv_intern;
+    /// One copy of each distinct Shader::Info held by reusable_stages (keyed by its serialization).
+    [[nodiscard]] InfoRef InternInfo(const Shader::Info& info);
+    std::mutex info_intern_mutex;
+    std::unordered_map<u64, std::shared_ptr<const PackedInfo>> info_intern;
+
+    /// The fixed state with the fields the translation never reads cleared.
+    [[nodiscard]] FixedPipelineState ReuseState(const FixedPipelineState& state) const noexcept;
+
+    /// LICHII_PRECOMPILE_DIR: translates the native programs of the game's shader archives
+    /// (vertex + pixel variations) at boot and keeps them for reuse (LICHII_SPIRV_REUSE).
+    void PrecompileArchives(std::stop_token stop_loading,
+                            const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// Format of lichii_precompile_translations.bin and of what its translations contain: bump it
+    /// whenever the translation of archive programs changes (recompiler, environments, templates),
+    /// or the stored translations keep being used.
+    static constexpr u32 PrecompileStoreVersion = 4;
+
+    /// A precompiled compute pipeline as stored: its key, the local memory it assumed, SPIR-V,
+    /// info and the environment answers checked on first use.
+    struct StoredCompute {
+        ComputePipelineCacheKey key;
+        u32 local_memory_size{};
+        std::vector<u32> spirv;
+        Shader::Info info;
+        VideoCommon::RecordedEnvQueries queries;
+    };
+
+    /// Writes the translations added since stores_before (and the compute pipelines) to path.
+    void SavePrecompileStore(const std::filesystem::path& path, u64 validity,
+                             const std::vector<FixedPipelineState>& templates,
+                             const std::unordered_set<const ReusableStages*>& stores_before,
+                             std::vector<StoredCompute> compute);
+
+    /// Reads path if its fingerprint is validity: fills reusable_stages and the compute cache,
+    /// and returns the keys LICHII_PRECOMPILE_PIPELINES builds.
+    bool LoadPrecompileStore(const std::filesystem::path& path, u64 validity,
+                             std::vector<GraphicsPipelineCacheKey>& prebuild_keys,
+                             const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// LICHII_PRECOMPILE_PIPELINES: builds and drops a Vulkan pipeline for each key's
+    /// translation, so the driver's cache has them before the game asks.
+    /// Builds the keys' pipelines on prebuild_workers in chunks until done or stop; true when done.
+    bool PrebuildPrecompiledPipelines(std::stop_token stop,
+                                      std::vector<GraphicsPipelineCacheKey> prebuild_keys,
+                                      std::vector<FixedPipelineState> extra_states,
+                                      const std::function<void(size_t, size_t)>& progress = {});
+    /// LICHII_PRECOMPILE_PIPELINES: runs PrebuildPrecompiledPipelines behind the loading screen
+    /// (LICHII_PREBUILD_BACKGROUND=1: after boot, on low-priority threads), unless marker already
+    /// names this store and driver (their cache has them).
+    /// LICHII_PIPELINE_EXPERIMENT: times driver builds of stored translations with parts of the
+    /// game's own state changed (see the log).
+    void RunPipelineExperiment(const std::vector<GraphicsPipelineCacheKey>& keys);
+    /// LICHII_SHADER_OBJECT_EXPERIMENT: times VK_EXT_shader_object compiles and binary reloads.
+    void RunShaderObjectExperiment(const std::vector<GraphicsPipelineCacheKey>& keys);
+    /// LICHII_SHADER_OBJECTS: compiles every stored translation's stages into the shader object
+    /// binary file once per store and driver (the white loading bar).
+    void PrecompileShaderObjects(std::stop_token stop_loading,
+                                 const VideoCore::DiskResourceLoadCallback& callback,
+                                 u64 store_validity);
+    void StartBackgroundPrebuild(std::vector<GraphicsPipelineCacheKey> prebuild_keys,
+                                 std::filesystem::path marker, std::string marker_value,
+                                 std::stop_token stop_loading,
+                                 const VideoCore::DiskResourceLoadCallback& callback);
+
+    void StoreReusableStages(const GraphicsPipelineCacheKey& key,
+                             std::shared_ptr<ReusableStages> stages);
+
+    /// Builds the current pipeline from an earlier translation when its environments answer the
+    /// same; nullptr otherwise.
+    std::unique_ptr<GraphicsPipeline> TryReuseGraphicsPipeline(GraphicsEnvironments& environments);
+
+
+    /// The concrete type of the environments passed to CreateGraphicsPipeline (no RTTI here).
+    enum class EnvKind { Unknown, Graphics, File };
     /// Whether the current draw may be skipped while its pipeline is not ready (native draws
     /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never; with
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
@@ -348,7 +528,8 @@ private:
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
-        bool libraries_only = false, TranslationRecord* record = nullptr);
+        bool libraries_only = false, TranslationRecord* record = nullptr,
+        EnvKind env_kind = EnvKind::Unknown);
 
     /// EDEN_NX2_PRECOMPILED_FAST (zortos293/Lichii#896): the current key's pipeline from the
     /// shader infos and SPIR-V the precompiled preparation kept, when the key is precompiled and
@@ -606,6 +787,19 @@ private:
     size_t compute_rebuilt_after_evict{}; ///< Evicted compute programs dispatched again
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
+    /// LICHII_PRECOMPILE: compute pipelines built from archive programs, with what their
+    /// translation assumed. The first dispatch that uses one checks it against the launch and
+    /// rebuilds it the usual way when something differs.
+    struct PrecompiledCompute {
+        VideoCommon::RecordedEnvQueries queries;
+        u32 local_memory_size{};
+    };
+    ::Common::unordered_map<ComputePipelineCacheKey, PrecompiledCompute> precompiled_compute;
+    /// Program hash -> the key it was precompiled with (diagnostics for runtime misses).
+    std::unordered_map<u64, ComputePipelineCacheKey> precompiled_compute_programs;
+    u32 precompiled_compute_used{};
+    u32 precompiled_compute_rebuilt{};
+
     ShaderPools main_pools;
     /// EDEN_NX2_ASYNC_TRANSLATE=2: the GPU thread's reference translation at enqueue uses these
     /// rather than releasing main_pools under whatever the GPU thread's own builds hold
@@ -613,6 +807,16 @@ private:
     std::unique_ptr<ShaderPools> verify_pools;
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
+
+    std::mutex reusable_stages_mutex;
+    /// Translations by a hash of their programs, one per distinct shader-relevant state.
+    std::unordered_map<u64, std::vector<std::shared_ptr<const ReusableStages>>> reusable_stages;
+    /// Mesh registers + pass-through header seen in the disk cache, and the shader-relevant states
+    /// of its mesh pipelines (count, a full state): what the archive precompiler translates with.
+    std::vector<std::array<u32, 23>> observed_mesh_states;
+    /// Lowered program hash of every archive program -> its stage (LICHII_PRECOMPILE diagnostics).
+    std::unordered_map<u64, u32> precompiled_programs;
+    std::unordered_map<u64, std::pair<u32, FixedPipelineState>> observed_mesh_templates;
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
@@ -673,6 +877,13 @@ private:
     std::chrono::steady_clock::time_point background_last_save{}; ///< Under background_mutex
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> background_workers;
+    /// The loading bar: effect shaders expected after the disk cache, and the disk cache's count.
+    size_t loading_extra{};
+    size_t loading_base{};
+    /// LICHII_PRECOMPILE_PIPELINES after boot: its threads, then the thread feeding them (last:
+    /// stopped and joined first).
+    std::unique_ptr<Common::ThreadWorker> prebuild_workers;
+    std::jthread prebuild_thread;
 
     /// EDEN_NX2_ASYNC_TRANSLATE=1/2: graphics pipelines translated off the GPU thread. Null with
     /// the switch off. Reset first in the destructor (its threads build with the members above).

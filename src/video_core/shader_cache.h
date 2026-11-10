@@ -185,8 +185,11 @@ private:
     bool IsRejected(VAddr addr);
     /// Remembers the exception being handled as this address's rejection.
     void RememberRejection(VAddr addr);
+protected:
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
+
+private:
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 

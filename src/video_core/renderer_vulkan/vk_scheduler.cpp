@@ -16,6 +16,7 @@
 #include <thread>
 #include <utility>
 
+#include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -29,6 +30,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
+#include "video_core/renderer_vulkan/lichii_dynamic_rendering.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -373,6 +375,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    state.dynamic_rendering = false;
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string render_pass_info =
@@ -421,12 +424,118 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     framebuffer->MarkResolveShadowsUpToDate();
 }
 
-void Scheduler::RealizeDeferredClear() {
+void Scheduler::BeginRenderingImpl(const Framebuffer* framebuffer, const DeferredClear* clear) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    // The framebuffer's render pass only marks an instance as active here: the draws use
+    // pipelines made for dynamic rendering (lichii_dynamic_rendering.h).
+    state.renderpass = framebuffer->RenderPass();
+    state.framebuffer = framebuffer->Handle();
+    state.render_area = render_area;
+    state.dynamic_rendering = true;
+
+    struct Attachments {
+        std::array<VkRenderingAttachmentInfo, 8> colors{};
+        VkRenderingAttachmentInfo depth{};
+        VkRenderingAttachmentInfo stencil{};
+        u32 color_count{};
+        bool has_depth{};
+        bool has_stencil{};
+        u32 layers{};
+        VkExtent2D area{};
+    } attachments;
+    const auto make = [](VkImageView view, bool cleared, const VkClearValue& value) {
+        return VkRenderingAttachmentInfo{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = cleared ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = value,
+        };
+    };
+    attachments.color_count = framebuffer->NumColorSlots();
+    for (u32 slot = 0; slot < attachments.color_count; ++slot) {
+        const bool cleared = clear != nullptr && (clear->color_clear_mask & (1u << slot)) != 0;
+        attachments.colors[slot] =
+            make(framebuffer->ColorView(slot), cleared,
+                 clear != nullptr ? clear->color_values[slot] : VkClearValue{});
+    }
+    if (framebuffer->DepthStencilView() != VK_NULL_HANDLE) {
+        const bool cleared = clear != nullptr && clear->depth_stencil;
+        const VkClearValue value = clear != nullptr ? clear->depth_stencil_value : VkClearValue{};
+        attachments.has_depth = framebuffer->HasAspectDepthBit();
+        attachments.has_stencil = framebuffer->HasAspectStencilBit();
+        attachments.depth = make(framebuffer->DepthStencilView(), cleared, value);
+        attachments.stencil = attachments.depth;
+    }
+    attachments.layers = framebuffer->Layers();
+    attachments.area = render_area;
+
+    Record([attachments](vk::CommandBuffer cmdbuf) {
+        const VkRenderingInfo rendering_info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea =
+                {
+                    .offset = {.x = 0, .y = 0},
+                    .extent = attachments.area,
+                },
+            .layerCount = attachments.layers,
+            .viewMask = 0,
+            .colorAttachmentCount = attachments.color_count,
+            .pColorAttachments = attachments.colors.data(),
+            .pDepthAttachment = attachments.has_depth ? &attachments.depth : nullptr,
+            .pStencilAttachment = attachments.has_stencil ? &attachments.stencil : nullptr,
+        };
+        cmdbuf.BeginRendering(rendering_info);
+    });
+    num_renderpass_images = framebuffer->NumImages();
+    renderpass_images = framebuffer->Images();
+    renderpass_image_ranges = framebuffer->ImageRanges();
+    framebuffer->MarkResolveShadowsUpToDate();
+}
+
+void Scheduler::RequestRendering(const Framebuffer* framebuffer, std::source_location location) {
+    if (!UseDynamicRendering(device) || !framebuffer->SupportsDynamicRendering()) {
+        RequestRenderpass(framebuffer, location);
+        return;
+    }
+    if (deferred_clear.framebuffer == framebuffer) {
+        RealizeDeferredClear(true);
+        return;
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    if (state.dynamic_rendering && state.renderpass && framebuffer->Handle() == state.framebuffer &&
+        render_area.width == state.render_area.width &&
+        render_area.height == state.render_area.height) {
+        return;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
+    EndRenderPass();
+    BeginRenderingImpl(framebuffer, nullptr);
+}
+
+void Scheduler::RealizeDeferredClear(bool dynamic) {
     if (deferred_clear.framebuffer == nullptr) {
         return;
     }
     const DeferredClear dc = deferred_clear;
     deferred_clear = {};
+    if (dynamic && UseDynamicRendering(device) && dc.framebuffer->SupportsDynamicRendering()) {
+        EndRenderPass();
+        BeginRenderingImpl(dc.framebuffer, &dc);
+        return;
+    }
 
     std::array<VkClearValue, 9> clear_values{};
     u32 count = 0;
@@ -492,7 +601,8 @@ void Scheduler::FlushDeferredClear() {
 
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
     if (deferred_clear.framebuffer == framebuffer) {
-        RealizeDeferredClear();
+        // Helpers draw with pipelines made for the render pass: realize the clear as one.
+        RealizeDeferredClear(false);
         return;
     }
     const VkRenderPass renderpass = framebuffer->RenderPass();
@@ -501,7 +611,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // A deferred clear's pass serves the draws after its first one too: ending it there and
     // beginning the framebuffer's own pass stored the attachments only to load them back (about
     // 9 render passes a frame in Ocarina of Time, at GraphicsPipeline::ConfigureDraw).
-    if (state.renderpass != VK_NULL_HANDLE &&
+    if (!state.dynamic_rendering && state.renderpass != VK_NULL_HANDLE &&
         (renderpass == state.renderpass || state.clear_variant) &&
         framebuffer_handle == state.framebuffer && render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
@@ -513,6 +623,80 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+}
+
+void Scheduler::RecordBatchedCopy(VkBuffer src, VkBuffer dst,
+                                  std::span<const VkBufferCopy> copies) {
+    static constexpr VkMemoryBarrier READ_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    static constexpr VkMemoryBarrier TRANSFER_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    RequestOutsideRenderPassOperationContext();
+    // Inside the batch, a copy that writes bytes an earlier one wrote, or reads them, has to wait
+    // for it (transfers are unordered without a barrier).
+    bool conflict = false;
+    if (copy_batch_open) {
+        for (const VkBufferCopy& copy : copies) {
+            for (const CopyRange& range : copy_batch_writes) {
+                const bool writes = range.buffer == dst && copy.dstOffset < range.end &&
+                                    range.begin < copy.dstOffset + copy.size;
+                const bool reads = range.buffer == src && copy.srcOffset < range.end &&
+                                   range.begin < copy.srcOffset + copy.size;
+                if (writes || reads) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (conflict) {
+                break;
+            }
+        }
+    }
+    boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies.begin(), copies.end());
+    const bool leading = !copy_batch_open;
+    recording_batched_copy = true;
+    Record([src, dst, vk_copies, leading, conflict](vk::CommandBuffer cmdbuf) {
+        if (leading) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+        } else if (conflict) {
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, TRANSFER_BARRIER);
+        }
+        cmdbuf.CopyBuffer(src, dst, vk_copies);
+    });
+    recording_batched_copy = false;
+    if (leading || conflict) {
+        copy_batch_writes.clear();
+    }
+    copy_batch_open = true;
+    for (const VkBufferCopy& copy : copies) {
+        copy_batch_writes.push_back({dst, copy.dstOffset, copy.dstOffset + copy.size});
+    }
+}
+
+void Scheduler::CloseCopyBatch() {
+    static constexpr VkMemoryBarrier WRITE_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+    };
+    copy_batch_open = false;
+    copy_batch_writes.clear();
+    // Towards everything after the batch: graphics, compute and later transfers.
+    Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
+    });
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
@@ -537,6 +721,16 @@ bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
     if (!pipeline) {
         return true;
     }
+
+    // Lichii: a pipeline bakes some states (a mesh pipeline its topology, primitive restart and
+    // vertex input) and leaves them undefined for the shader objects drawn after it, while the
+    // state tracker still holds them as set. Going from a pipeline to shader objects sets
+    // everything again.
+    const bool shader_objects = pipeline->WantsShaderObjects();
+    if (shader_objects && !state.shader_objects_bound) {
+        state_tracker.InvalidateCommandBufferState();
+    }
+    state.shader_objects_bound = shader_objects;
 
     if (!pipeline->UsesExtendedDynamicState()) {
         state.needs_state_enable_refresh = true;
@@ -721,7 +915,9 @@ void Scheduler::ReportWorkTimes() {
         std::array<u32, 3> max_size{};
     };
     std::map<std::pair<u64, u64>, Totals> by_shaders;
+    std::map<std::string, std::pair<double, u32>> by_command; // LICHII_GPU_TRACE_COMMANDS
     double total_ms{};
+    double commands_ms{};
     for (u32 i = 0; i < count; ++i) {
         if (results[i * 2].available == 0 || results[i * 2 + 1].available == 0) {
             continue;
@@ -731,6 +927,26 @@ void Scheduler::ReportWorkTimes() {
                               trace_timestamp_bits)) *
                           trace_timestamp_period / 1e6;
         const WorkTrace& item = trace_work_items[i];
+        if (item.fragment_hash == CommandTraceMarker) {
+            // "const char *__cdecl Vulkan::Scheduler::CommandName<class X::<lambda_n>>(void)"
+            std::string name = reinterpret_cast<const char*>(item.hash);
+            if (const size_t open = name.find("CommandName<"); open != std::string::npos) {
+                name = name.substr(open + 12);
+                if (const size_t close = name.rfind(">(void)"); close != std::string::npos) {
+                    name.resize(close);
+                }
+            }
+            for (const char* prefix : {"class ", "struct "}) {
+                if (name.rfind(prefix, 0) == 0) {
+                    name = name.substr(std::strlen(prefix));
+                }
+            }
+            auto& entry = by_command[name];
+            entry.first += ms;
+            ++entry.second;
+            commands_ms += ms;
+            continue;
+        }
         Totals& totals = by_shaders[{item.hash, item.fragment_hash}];
         totals.total_ms += ms;
         ++totals.count;
@@ -744,8 +960,8 @@ void Scheduler::ReportWorkTimes() {
                                                                by_shaders.end());
     std::ranges::sort(sorted, std::greater<>{},
                       [](const auto& entry) { return entry.second.total_ms; });
-    if (sorted.size() > 8) {
-        sorted.resize(8);
+    if (sorted.size() > 24) {
+        sorted.resize(24);
     }
     std::string slowest;
     for (const auto& [shaders, totals] : sorted) {
@@ -760,6 +976,20 @@ void Scheduler::ReportWorkTimes() {
     LOG_INFO(Render_Vulkan,
              "DKB gpu_work renderer_frame={} timed={} timed_sum_ms={:.3f} slowest:{}",
              trace_sample_frame, count, total_ms, slowest);
+    if (!by_command.empty()) {
+        std::vector<std::pair<double, std::string>> ranked;
+        for (const auto& [name, entry] : by_command) {
+            ranked.emplace_back(entry.first,
+                                fmt::format("{:.3f} ms in {} commands: {}", entry.first,
+                                            entry.second, name));
+        }
+        std::ranges::sort(ranked, std::greater<>{});
+        LOG_INFO(Render_Vulkan, "LICHII gpu_commands renderer_frame={} commands_sum_ms={:.3f}",
+                 trace_sample_frame, commands_ms);
+        for (size_t i = 0; i < ranked.size() && i < 18; ++i) {
+            LOG_INFO(Render_Vulkan, "LICHII gpu_commands   {}", ranked[i].second.substr(0, 260));
+        }
+    }
 }
 
 void Scheduler::TraceGpuSubmission() {
@@ -942,6 +1172,7 @@ void Scheduler::InvalidateState() {
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
+    state.shader_objects_bound = false;
     state_tracker.InvalidateCommandBufferState();
 }
 
@@ -976,7 +1207,8 @@ void Scheduler::EndRenderPass()
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
+                       dynamic_rendering = state.dynamic_rendering](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
             for (size_t i = 0; i < num_images; ++i) {
@@ -1013,7 +1245,11 @@ void Scheduler::EndRenderPass()
                         .subresourceRange = range,
                 };
             }
-            cmdbuf.EndRenderPass();
+            if (dynamic_rendering) {
+                cmdbuf.EndRendering();
+            } else {
+                cmdbuf.EndRenderPass();
+            }
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
@@ -1031,6 +1267,7 @@ void Scheduler::EndRenderPass()
         });
 
         state.renderpass = VkRenderPass{};
+        state.dynamic_rendering = false;
         state.clear_variant = false;
         num_renderpass_images = 0;
     }

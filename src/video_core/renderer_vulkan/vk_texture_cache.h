@@ -505,6 +505,25 @@ public:
     /// once it ends.
     void MarkResolveShadowsUpToDate() const;
 
+    /// Lichii: dynamic rendering takes the attachments' views by colour slot (null where unused).
+    [[nodiscard]] VkImageView ColorView(size_t slot) const noexcept {
+        return color_views[slot];
+    }
+
+    [[nodiscard]] VkImageView DepthStencilView() const noexcept {
+        return depth_stencil_view;
+    }
+
+    /// Colour slots up to the last one in use.
+    [[nodiscard]] u32 NumColorSlots() const noexcept {
+        return num_color_slots;
+    }
+
+    /// False when the framebuffer resolves into shadow images (tilers), which needs its render pass.
+    [[nodiscard]] bool SupportsDynamicRendering() const noexcept {
+        return num_resolve_shadows == 0;
+    }
+
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
 
@@ -523,6 +542,9 @@ private:
     bool is_rescaled{};
     std::array<VkImage, 9> resolve_shadow_images{};
     u32 num_resolve_shadows = 0;
+    std::array<VkImageView, NUM_RT> color_views{};
+    VkImageView depth_stencil_view{};
+    u32 num_color_slots = 0;
     TextureCacheRuntime* runtime_ptr{nullptr};
     RenderPassKey render_pass_key{};
     RenderPassCache* render_pass_cache{nullptr};

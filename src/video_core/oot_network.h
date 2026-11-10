@@ -50,7 +50,7 @@ struct BypassState {
 
 inline bool BypassEnabled(u64 program_id) {
     return program_id == ProgramId &&
-           Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::NoSharpening;
+           Settings::OotNoSharpening();
 }
 
 } // namespace VideoCommon::OotNetwork

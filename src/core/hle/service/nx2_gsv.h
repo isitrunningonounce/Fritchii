@@ -35,6 +35,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/lichii_telemetry.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/device_memory.h"
 #include "video_core/rasterizer_interface.h"
@@ -514,10 +515,21 @@ private:
     }
 
     // Sub 101: (start u64, last u64, flags...) after CreateGpuAccessibleMemory's svc 0x80.
+    // LICHII_GPU_MEM_TRACE=1: the GPU memory create/map/unmap/destroy calls at info level (the
+    // first 3000), to see what a game allocates and frees again.
+    template <typename... Args>
+    static void GpuMemTrace(fmt::format_string<Args...> format, Args&&... args) {
+        static const bool enabled = std::getenv("LICHII_GPU_MEM_TRACE") != nullptr;
+        static std::atomic<int> logged{};
+        if (enabled && logged.fetch_add(1, std::memory_order_relaxed) < 200000) {
+            LOG_INFO(Service, "{}", fmt::format(format, std::forward<Args>(args)...));
+        }
+    }
     void SubRegisterMemory(HLERequestContext& ctx) {
         const auto* b = ctx.CommandBuffer();
         const u64 start = u64{b[2]} | (u64{b[3]} << 32);
         const u64 last = u64{b[4]} | (u64{b[5]} << 32);
+        GpuMemTrace("nx2:gpu sub 101 start={:#x} last={:#x} size={:#x} [6]={:#x} [7]={:#x}", start, last, last - start + 1, b[6], b[7]);
         LOG_DEBUG(Service, "nx2:gpu sub 101 start={:#x} last={:#x} [6]={:#x} [7]={:#x}", start,
                     last, b[6], b[7]);
         if (last > start) {
@@ -559,6 +571,7 @@ private:
         const u64 c = u64{cmd_buf[8]} | (u64{cmd_buf[9]} << 32);
         // Words 3-4: first GPU address, 5-6: last, 7: memory handle, 8-9: offset into it.
         const u32 handle = cmd_buf[7];
+        GpuMemTrace("nx2:gpu 211 map [{:#x}, {:#x}] size={:#x} handle={} offset={:#x} words {:08x}", a, b, b - a + 1, handle, c, fmt::join(std::span<const u32>{cmd_buf + 2, 16}, " "));
         LOG_DEBUG(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
                  handle, c, slot);
         if (const auto it = m_memory.find(handle); it != m_memory.end() && b > a) {
@@ -594,6 +607,7 @@ private:
         const auto* w = ctx.CommandBuffer();
         const u64 first = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
+        GpuMemTrace("nx2:gpu 213 unmap [{:#x}, {:#x}] size={:#x}", first, last, last - first + 1);
         LOG_DEBUG(Service, "nx2:gpu 213 unmap [{:#x}, {:#x}] slot={}", first, last, w[8]);
         if (last > first) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
@@ -618,6 +632,7 @@ private:
         const u32 handle = w[2];
         if (const auto it = m_memory.find(handle); it != m_memory.end()) {
             const auto [address, size] = it->second;
+            GpuMemTrace("nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}]", handle, address, size);
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
@@ -1799,7 +1814,7 @@ private:
         }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
-            LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
+            LOG_INFO(Service, "nx2:vi2 229 present #{} by t{} token={:#x} slot={} image={}", m_presents, ctx.GetThread().GetThreadId(),
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
         }
         NoteFrameFence(~w[22], w[24]);
@@ -1900,6 +1915,12 @@ private:
             if (const u32 fence_id = ~w[22]; fence_id < 192 &&
                 !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
                 ++m_stats.ran_ahead;
+            }
+            if (m_stats.last_present != std::chrono::steady_clock::time_point{} &&
+                Core::Telemetry::Enabled()) {
+                Core::Telemetry::NotePresent(to_us(entered - m_stats.last_present),
+                                             to_us(waited - entered), to_us(composited - waited),
+                                             to_us(paced - composited));
             }
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);

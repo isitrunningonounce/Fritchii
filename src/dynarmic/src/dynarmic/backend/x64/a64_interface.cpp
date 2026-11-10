@@ -6,9 +6,16 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
@@ -30,6 +37,59 @@
 namespace Dynarmic::A64 {
 
 using namespace Backend::X64;
+
+namespace {
+// Lichii: what the JITs compile while the game runs (see TakeCompileStats, TakeNewBlocks).
+std::atomic<std::uint64_t> compiled_blocks{};
+std::atomic<std::uint64_t> compile_nanoseconds{};
+std::mutex new_blocks_mutex;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> new_blocks;
+std::unordered_set<std::uint64_t> seen_blocks;
+
+void NoteCompiled(IR::LocationDescriptor descriptor, std::uint64_t pc,
+                  std::chrono::steady_clock::duration elapsed) {
+    compiled_blocks.fetch_add(1, std::memory_order_relaxed);
+    compile_nanoseconds.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+        std::memory_order_relaxed);
+    std::scoped_lock lock{new_blocks_mutex};
+    if (seen_blocks.insert(descriptor.Value()).second) {
+        new_blocks.emplace_back(descriptor.Value(), pc);
+    }
+}
+// LICHII_JIT_MAP=<file>: one line per emitted block, "host_start host_size guest_pc guest_insns"
+// (hex), for an external sampling profiler to name the guest code behind JIT samples. A later
+// line for the same host address replaces an earlier one (the cache was cleared in between).
+void NoteJitMap(const void* host, std::size_t size, std::uint64_t pc, std::uint64_t insns) {
+    static std::FILE* const file = [] {
+        const char* path = std::getenv("LICHII_JIT_MAP");
+        return path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
+    }();
+    if (file == nullptr) {
+        return;
+    }
+    static std::mutex mutex;
+    std::scoped_lock lock{mutex};
+    std::fprintf(file, "%llx %llx %llx %llx\n",
+                 static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(host)),
+                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(pc),
+                 static_cast<unsigned long long>(insns));
+    std::fflush(file);
+}
+}  // namespace
+
+CompileStats TakeCompileStats() {
+    return CompileStats{
+        .blocks = compiled_blocks.exchange(0, std::memory_order_relaxed),
+        .nanoseconds = compile_nanoseconds.exchange(0, std::memory_order_relaxed),
+    };
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> TakeNewBlocks() {
+    std::scoped_lock lock{new_blocks_mutex};
+    return std::exchange(new_blocks, {});
+}
 
 static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A64::UserConfig& conf) {
     return RunCodeCallbacks{
@@ -254,14 +314,40 @@ private:
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
+        const auto begin = std::chrono::steady_clock::now();
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         Optimization::Optimize(ir_block, conf, polyfill_options);
-        return emitter.Emit(ir_block).entrypoint;
+        const auto emitted = emitter.Emit(ir_block);
+        const CodePtr entrypoint = emitted.entrypoint;
+        NoteJitMap(entrypoint, emitted.size, arch_descriptor.PC(), ir_block.CycleCount());
+        if (!precompiling) {
+            NoteCompiled(descriptor, arch_descriptor.PC(), std::chrono::steady_clock::now() - begin);
+        }
+        return entrypoint;
     }
+
+public:
+    bool PrecompileBlock(std::uint64_t location, std::uint32_t first_instruction) {
+        const IR::LocationDescriptor descriptor{location};
+        if (emitter.GetBasicBlock(descriptor)) {
+            return false;
+        }
+        const auto code = conf.callbacks->MemoryReadCode(A64::LocationDescriptor{descriptor}.PC());
+        if (!code || *code != first_instruction) {
+            return false;  // other code there now
+        }
+        precompiling = true;
+        GetBlock(descriptor);
+        precompiling = false;
+        return true;
+    }
+
+private:
+    bool precompiling = false;
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
         if (Has(hr, HaltReason::CacheInvalidation)) {
@@ -308,6 +394,10 @@ HaltReason Jit::Run() {
 
 HaltReason Jit::Step() {
     return impl->Step();
+}
+
+bool Jit::PrecompileBlock(std::uint64_t location, std::uint32_t first_instruction) {
+    return impl->PrecompileBlock(location, first_instruction);
 }
 
 void Jit::ClearCache() {

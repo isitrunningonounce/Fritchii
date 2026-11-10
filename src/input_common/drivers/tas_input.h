@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -198,5 +199,9 @@ private:
     std::vector<TASCommand> record_commands{};
     size_t current_command{0};
     TASCommand last_input{}; // only used for recording
+    // LICHII_TAS_AUTOSTART (tas_input.cpp)
+    bool autostarted{false};
+    std::chrono::steady_clock::time_point first_update{};
+    std::chrono::steady_clock::time_point started{};
 };
 } // namespace InputCommon::TasInput

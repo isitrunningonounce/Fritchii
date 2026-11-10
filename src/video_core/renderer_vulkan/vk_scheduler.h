@@ -6,12 +6,15 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <utility>
 #include <queue>
@@ -111,6 +114,11 @@ public:
     void RequestRenderpass(const Framebuffer* framebuffer,
                            std::source_location location = std::source_location::current());
 
+    /// Lichii: requests a rendering instance for the game's draws: dynamic rendering when
+    /// LICHII_DYNAMIC_RENDERING is on (their pipelines are made for it), else a render pass.
+    void RequestRendering(const Framebuffer* framebuffer,
+                          std::source_location location = std::source_location::current());
+
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
 
@@ -186,10 +194,78 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
+        RecordNamed(CommandName<T>(), std::forward<T>(command));
+    }
+
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void Record(T&& c) {
+        RecordNamed(CommandName<T>(),
+                    [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+                        command(cmdbuf);
+                    });
+    }
+
+    /// The recorded lambda's type, as the compiler names it (its enclosing function), for
+    /// LICHII_GPU_TRACE_COMMANDS.
+    template <typename T>
+    static const char* CommandName() {
+#ifdef _MSC_VER
+        return __FUNCSIG__;
+#else
+        return __PRETTY_FUNCTION__;
+#endif
+    }
+
+    /// LICHII_GPU_TRACE_COMMANDS=1 (with EDEN_DKB_FRAME_TRACE=1): times every recorded command of
+    /// a sampled submission on the GPU, grouped by the function that recorded it, to find GPU
+    /// time spent outside draws and dispatches (copies, clears, barriers, queries).
+    static bool TraceCommands() {
+        static const bool enabled = std::getenv("LICHII_GPU_TRACE_COMMANDS") != nullptr;
+        return enabled;
+    }
+
+    /// LICHII_BATCH_COPIES=1: buffer copies recorded back to back share one barrier before and
+    /// one after them (plus transfer barriers only between copies that touch the same bytes),
+    /// instead of a full barrier pair each: mid-frame uploads drained the GPU ~1800 times a frame.
+    static bool BatchCopies() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LICHII_BATCH_COPIES");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    /// Records copies from src to dst inside the current copy batch (BatchCopies).
+    void RecordBatchedCopy(VkBuffer src, VkBuffer dst,
+                           std::span<const VkBufferCopy> copies);
+
+    /// Closes an open copy batch with its barrier towards graphics and compute.
+    void CloseCopyBatch();
+
+    template <typename T>
+    void RecordNamed(const char* name, T&& command) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
         ++record_serial;
+        if (copy_batch_open && !recording_batched_copy) [[unlikely]] {
+            CloseCopyBatch();
+        }
+        // Not the submission itself: it ends the command buffers.
+        if (TraceCommands() && trace_work_pool &&
+            std::strstr(name, "SubmitExecution") == nullptr) [[unlikely]] {
+            auto timed = [this, name, inner = std::move(command)](vk::CommandBuffer cmdbuf,
+                                                                   vk::CommandBuffer upload) {
+                TraceGpuWork(cmdbuf, reinterpret_cast<u64>(name), CommandTraceMarker, {},
+                             [&] { inner(cmdbuf, upload); });
+            };
+            if (!chunk->Record(timed)) {
+                DispatchWork();
+                (void)chunk->Record(timed);
+            }
+            return;
+        }
         if (chunk->Record(command)) {
             return;
         }
@@ -197,14 +273,8 @@ public:
         (void)chunk->Record(command);
     }
 
-    template <typename T>
-        requires std::is_invocable_v<T, vk::CommandBuffer>
-    void Record(T&& c) {
-        this->RecordWithUploadBuffer(
-            [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-                command(cmdbuf);
-            });
-    }
+    /// fragment_hash of a WorkTrace that times a whole command: hash is its name (CommandName).
+    static constexpr u64 CommandTraceMarker = ~u64{0};
 
     /// Whether a command was recorded since the last Flush or Finish (EXP61: a flush with nothing
     /// to submit is skipped).
@@ -427,6 +497,11 @@ private:
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
+        /// The active instance is dynamic rendering (renderpass then holds the framebuffer's
+        /// render pass only to mark one as active).
+        bool dynamic_rendering = false;
+        /// The last graphics bind was shader objects (a pipeline bind leaves states undefined).
+        bool shader_objects_bound = false;
     };
 
     struct DeferredClear {
@@ -441,8 +516,11 @@ private:
     void BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
                              const VkClearValue* clear_values, u32 clear_value_count);
 
-    /// If a deferred clear is pending.
-    void RealizeDeferredClear();
+    /// Begins a dynamic rendering instance for the framebuffer, with a deferred clear's load ops.
+    void BeginRenderingImpl(const Framebuffer* framebuffer, const DeferredClear* clear);
+
+    /// If a deferred clear is pending. dynamic: realize it as dynamic rendering (when enabled).
+    void RealizeDeferredClear(bool dynamic = true);
 
     void WorkerThread(std::stop_token stop_token);
 
@@ -488,7 +566,7 @@ private:
     };
     SubmissionTrace trace_work;
     std::vector<SubmissionTrace> trace_submissions;
-    static constexpr u32 TraceMaxWork = 4096;
+    static constexpr u32 TraceMaxWork = 32768;
     struct WorkTrace {
         u64 hash{};
         u64 fragment_hash{};
@@ -507,6 +585,17 @@ private:
     u32 trace_timestamp_bits{};
     float trace_timestamp_period{};
     bool trace_gpu_recording{};
+
+    // BatchCopies: an open batch has its leading barrier recorded; its copies' destinations (and
+    // sources, for chained copies) decide when a transfer barrier is needed inside it.
+    struct CopyRange {
+        VkBuffer buffer;
+        VkDeviceSize begin;
+        VkDeviceSize end;
+    };
+    bool copy_batch_open{};
+    bool recording_batched_copy{};
+    std::vector<CopyRange> copy_batch_writes;
     bool trace_gpu_sampling{};
     bool trace_gpu_pending{};
     bool trace_gpu_failed{};

@@ -310,6 +310,42 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         }
         std::fclose(out);
     }
+
+    // <out>.addresses: every sampled instruction as "thread module+offset self inclusive", the
+    // self count where the thread was and the inclusive count of samples with it on the stack
+    // (each stack counted once), for line-level reports with the PDB.
+    std::map<std::pair<unsigned, DWORD64>, std::pair<unsigned, unsigned>> per_address;
+    for (const Sample& sample : samples) {
+        if (sample.depth == 0) {
+            continue;
+        }
+        ++per_address[{sample.thread, sample.frames[0]}].first;
+        for (unsigned i = 0; i < sample.depth; ++i) {
+            if (std::find(sample.frames.begin(), sample.frames.begin() + i, sample.frames[i]) !=
+                sample.frames.begin() + i) {
+                continue;
+            }
+            ++per_address[{sample.thread, sample.frames[i]}].second;
+        }
+    }
+    if (std::FILE* const out = std::fopen((std::string{path} + ".addresses").c_str(), "w")) {
+        for (const auto& [key, counts] : per_address) {
+            HMODULE module{};
+            char module_path[MAX_PATH] = "?";
+            DWORD64 offset = key.second;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(key.second), &module)) {
+                GetModuleFileNameA(module, module_path, sizeof(module_path));
+                offset = key.second - reinterpret_cast<DWORD64>(module);
+            }
+            const char* base = std::strrchr(module_path, '\\');
+            std::fprintf(out, "%s %s+0x%llx %u %u\n", targets[key.first].name.c_str(),
+                         base != nullptr ? base + 1 : module_path,
+                         static_cast<unsigned long long>(offset), counts.first, counts.second);
+        }
+        std::fclose(out);
+    }
     return text;
 }
 

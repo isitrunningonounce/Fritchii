@@ -175,6 +175,9 @@ public:
     /// Obtains current flush request fence id.
     [[nodiscard]] u64 CurrentSyncRequestFence() const;
 
+    /// Whether a CPU thread waits for a flush the GPU thread has not run yet (TickWork runs it).
+    [[nodiscard]] bool HasPendingSyncRequests() const;
+
     void WaitForSyncOperation(u64 fence);
 
     void WaitForIdle();

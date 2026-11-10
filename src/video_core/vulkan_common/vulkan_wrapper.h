@@ -285,6 +285,23 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetColorWriteMaskEXT vkCmdSetColorWriteMaskEXT{};
     PFN_vkCmdSetColorWriteEnableEXT vkCmdSetColorWriteEnableEXT{};
     PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT{};
+    PFN_vkCreateShadersEXT vkCreateShadersEXT{};
+    PFN_vkDestroyShaderEXT vkDestroyShaderEXT{};
+    PFN_vkGetShaderBinaryDataEXT vkGetShaderBinaryDataEXT{};
+    PFN_vkCmdBindShadersEXT vkCmdBindShadersEXT{};
+    PFN_vkCmdBeginRendering vkCmdBeginRendering{};
+    PFN_vkCmdEndRendering vkCmdEndRendering{};
+    PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT{};
+    PFN_vkCmdSetRasterizationSamplesEXT vkCmdSetRasterizationSamplesEXT{};
+    PFN_vkCmdSetSampleMaskEXT vkCmdSetSampleMaskEXT{};
+    PFN_vkCmdSetTessellationDomainOriginEXT vkCmdSetTessellationDomainOriginEXT{};
+    PFN_vkCmdSetProvokingVertexModeEXT vkCmdSetProvokingVertexModeEXT{};
+    PFN_vkCmdSetExtraPrimitiveOverestimationSizeEXT vkCmdSetExtraPrimitiveOverestimationSizeEXT{};
+    PFN_vkCmdSetDepthClipNegativeOneToOneEXT vkCmdSetDepthClipNegativeOneToOneEXT{};
+    PFN_vkCmdSetViewportSwizzleNV vkCmdSetViewportSwizzleNV{};
+    PFN_vkCmdSetRasterizationStreamEXT vkCmdSetRasterizationStreamEXT{};
+    PFN_vkCmdSetViewportWithCountEXT vkCmdSetViewportWithCountEXT{};
+    PFN_vkCmdSetScissorWithCountEXT vkCmdSetScissorWithCountEXT{};
     PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT{};
     PFN_vkCmdWaitEvents vkCmdWaitEvents{};
     PFN_vkCreateBuffer vkCreateBuffer{};
@@ -1088,6 +1105,25 @@ public:
 
     [[nodiscard]] RenderPass CreateRenderPass(const VkRenderPassCreateInfo& ci) const;
 
+    /// Lichii: VK_EXT_shader_object. Returns VK_SUCCESS or the error; *shader is null on failure.
+    VkResult CreateShaderEXT(const VkShaderCreateInfoEXT& ci, VkShaderEXT* shader) const noexcept {
+        *shader = VK_NULL_HANDLE;
+        if (dld->vkCreateShadersEXT == nullptr) {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        return dld->vkCreateShadersEXT(handle, 1, &ci, nullptr, shader);
+    }
+
+    void DestroyShaderEXT(VkShaderEXT shader) const noexcept {
+        if (shader != VK_NULL_HANDLE && dld->vkDestroyShaderEXT != nullptr) {
+            dld->vkDestroyShaderEXT(handle, shader, nullptr);
+        }
+    }
+
+    VkResult GetShaderBinaryDataEXT(VkShaderEXT shader, size_t* size, void* data) const noexcept {
+        return dld->vkGetShaderBinaryDataEXT(handle, shader, size, data);
+    }
+
     [[nodiscard]] RenderPass CreateRenderPass2(const VkRenderPassCreateInfo2& ci) const;
 
     [[nodiscard]] DescriptorSetLayout CreateDescriptorSetLayout(
@@ -1719,6 +1755,33 @@ public:
 
     void SetColorBlendEnableEXT(u32 first, Span<VkBool32> enables) const noexcept {
         dld->vkCmdSetColorBlendEnableEXT(handle, first, enables.size(), enables.data());
+    }
+
+    /// Lichii: VK_EXT_shader_object and dynamic rendering.
+    void BindShadersEXT(u32 count, const VkShaderStageFlagBits* stages,
+                        const VkShaderEXT* shaders) const noexcept {
+        dld->vkCmdBindShadersEXT(handle, count, stages, shaders);
+    }
+
+    void BeginRendering(const VkRenderingInfo& info) const noexcept {
+        dld->vkCmdBeginRendering(handle, &info);
+    }
+
+    void EndRendering() const noexcept {
+        dld->vkCmdEndRendering(handle);
+    }
+
+    /// Lichii: the raw dispatch, for the dynamic state commands shader objects need.
+    [[nodiscard]] const DeviceDispatch& Dispatch() const noexcept {
+        return *dld;
+    }
+
+    void SetViewportWithCountEXT(Span<VkViewport> viewports) const noexcept {
+        dld->vkCmdSetViewportWithCountEXT(handle, viewports.size(), viewports.data());
+    }
+
+    void SetScissorWithCountEXT(Span<VkRect2D> scissors) const noexcept {
+        dld->vkCmdSetScissorWithCountEXT(handle, scissors.size(), scissors.data());
     }
 
     void SetColorBlendEquationEXT(u32 first,

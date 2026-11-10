@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
 #include <random>
 
 #include "common/literals.h"
@@ -43,6 +45,19 @@ constexpr const std::size_t SecureAlignment = 128_KiB;
 namespace {
 
 using namespace Common::Literals;
+
+// LICHII_EXTRA_APP_MEMORY_MB=<n> (12 GB arrangement, Switch 2): n MiB more for the application pool
+// and the emulated DRAM. Ocarina keeps its memory nearly full and evicts and reloads a model ~18
+// times a second with the console's 9809 MiB.
+size_t ExtraApplicationMemory() {
+    static const size_t extra = [] {
+        const char* value = std::getenv("LICHII_EXTRA_APP_MEMORY_MB");
+        const size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        // Whole 2 MiB pages, at most 8 GiB.
+        return (std::min<size_t>)(mib, 8192) / 2 * 2 * 1024 * 1024;
+    }();
+    return extra;
+}
 
 u32 GetMemorySizeForInit() {
     switch (Settings::values.memory_layout_mode.GetValue()) {
@@ -94,7 +109,7 @@ size_t KSystemControl::Init::GetIntendedMemorySize() {
     case Smc::MemorySize_10GB:
         return 10_GiB;
     case Smc::MemorySize_12GB:
-        return 12_GiB + KSystemControl::Nx2GraphicsServerMemorySize;
+        return 12_GiB + KSystemControl::Nx2GraphicsServerMemorySize + ExtraApplicationMemory();
     }
 }
 
@@ -133,7 +148,7 @@ std::size_t KSystemControl::Init::GetApplicationPoolSize() {
         case Smc::MemoryArrangement_10GB:
             return 8178_MiB;
         case Smc::MemoryArrangement_12GB:
-            return 9809_MiB;
+            return 9809_MiB + ExtraApplicationMemory();
         }
     }();
 

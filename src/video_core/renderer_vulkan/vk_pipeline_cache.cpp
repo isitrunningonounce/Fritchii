@@ -9,14 +9,18 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <unordered_map>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <unordered_set>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -65,6 +69,8 @@
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/lichii_dynamic_rendering.h"
+#include "video_core/renderer_vulkan/lichii_shader_object_cache.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
@@ -72,6 +78,7 @@
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
 #include "video_core/renderer_vulkan/vk_precompiled_kept.h"
@@ -81,6 +88,8 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
+#include "video_core/renderer_vulkan/lichii_precompile_io.h"
+#include "common/zstd_compression.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -382,6 +391,95 @@ std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 /// Set while a translation thread builds (EDEN_NX2_ASYNC_TRANSLATE).
 thread_local bool t_translate_worker{};
 
+// Draws skipped because their pipeline was still building, reported with the runtime totals.
+std::atomic<u32> discarded_pending_draws{};
+// Skipped and deferred draws since the presenter last asked.
+std::atomic<u32> skipped_since_frame{};
+// Draws that could be skipped but whose pipeline finished within the frame's wait budget.
+std::atomic<u32> waited_pending_draws{};
+std::atomic<std::chrono::nanoseconds::rep> pending_wait_ns{};
+// What is left of this frame's wait budget (LICHII_DISCARD_WAIT_MS), refilled every frame.
+std::atomic<std::chrono::nanoseconds::rep> frame_wait_left_ns{};
+
+// LICHII_SPIRV_REUSE: pipelines built from an earlier translation, and reuse attempts whose
+// environments answered differently.
+std::atomic<u32> reused_pipelines{};
+std::atomic<u32> reuse_rejected{};
+std::atomic<u32> reuse_state_misses{};
+
+bool SpirvReuseEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LICHII_SPIRV_REUSE");
+        const bool on = value != nullptr && *value != '\0' && *value != '0';
+        LOG_INFO(Render_Vulkan, "LICHII_SPIRV_REUSE: {}", on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
+// New pipelines deferred to a later frame, and what is left of this frame's translation budget.
+std::atomic<u32> deferred_new_pipelines{};
+/// Set by the archive precompiler around CreateGraphicsPipeline: translate and keep for reuse only.
+thread_local bool t_translate_only{};
+/// Set by the archive precompiler around CreateComputePipeline: receives the SPIR-V and info.
+thread_local std::pair<std::vector<u32>, Shader::Info>* t_capture_compute{};
+/// Graphics pipelines built at runtime: mesh (never stored), in the disk cache, new.
+std::array<std::atomic<u32>, 3> runtime_built_kind{};
+std::atomic<std::chrono::nanoseconds::rep> frame_translate_left_ns{};
+
+std::chrono::nanoseconds GetTranslateBudget() {
+    static const std::chrono::nanoseconds budget = [] {
+        const char* value = std::getenv("LICHII_TRANSLATE_BUDGET_MS");
+        const int ms = std::clamp(value ? std::atoi(value) : 0, 0, 50);
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_TRANSLATE_BUDGET_MS: new pipelines for skippable draws are translated up "
+                 "to {} ms per frame{}",
+                 ms, ms == 0 ? " (off)" : "");
+        return std::chrono::nanoseconds{std::chrono::milliseconds{ms}};
+    }();
+    return budget;
+}
+
+std::chrono::nanoseconds GetDiscardWaitBudget() {
+    static const std::chrono::nanoseconds budget = [] {
+        const char* value = std::getenv("LICHII_DISCARD_WAIT_MS");
+        int ms = value ? std::atoi(value) : 0;
+        ms = std::clamp(ms, 0, 50);
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_DISCARD_WAIT_MS: a skippable draw waits for its pipeline up to {} ms "
+                 "per frame",
+                 ms);
+        return std::chrono::nanoseconds{std::chrono::milliseconds{ms}};
+    }();
+    return budget;
+}
+
+NativeDiscardMode GetNativeDiscardMode() {
+    static const NativeDiscardMode mode = [] {
+        const char* value = std::getenv("LICHII_NATIVE_DISCARD");
+        const std::string_view name = value ? value : "";
+        NativeDiscardMode result = NativeDiscardMode::Legacy;
+        if (name == "depth") {
+            result = NativeDiscardMode::Depth;
+        } else if (name == "never") {
+            result = NativeDiscardMode::Never;
+        } else if (name == "legacy") {
+            result = NativeDiscardMode::Legacy;
+        } else if (name == "always") {
+            result = NativeDiscardMode::Always;
+        } else if (!name.empty() && name != "legacy") {
+            LOG_WARNING(Render_Vulkan, "LICHII_NATIVE_DISCARD={} is unknown; use never, depth, "
+                                       "legacy or always",
+                        name);
+        }
+        static constexpr std::array names{"never", "depth", "legacy", "always"};
+        LOG_INFO(Render_Vulkan, "LICHII_NATIVE_DISCARD: native draws with unbuilt pipelines: {}",
+                 names[static_cast<size_t>(result)]);
+        return result;
+    }();
+    return mode;
+}
+
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
     if (t_translate_worker) {
         // SPIR-V a translation thread emits itself is the workers' time, not the GPU thread's.
@@ -503,9 +601,14 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
                                  u64 shader_hash, size_t stage_index,
                                  std::span<const u32> reference = {},
-                                 u128* spirv_hash = nullptr) {
+                                 u128* spirv_hash = nullptr,
+                                 std::vector<u32>* code_out = nullptr) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    if (code_out) {
+        // LICHII_SPIRV_REUSE: the SPIR-V is kept with the translation.
+        *code_out = code;
+    }
     return BuildStageModule(device, code, shader_hash, stage_index, spirv_hash);
 }
 
@@ -666,6 +769,17 @@ bool AmdAppCache(const Device& device) {
 }
 
 bool DriverCachesPipelines(const Device& device) {
+    // Lichii: the NVIDIA and AMD drivers keep their own cache, but per executable: a new build of
+    // the emulator starts it empty (every pipeline a 25-100 ms compile again). Ours, in the
+    // shader folder, survives that. Opt-in (LICHII_APP_PIPELINE_CACHE=1): it skips the prepared
+    // precompiled pipelines, which rely on the driver cache.
+    static const bool app_cache = [] {
+        const char* value = std::getenv("LICHII_APP_PIPELINE_CACHE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (app_cache) {
+        return false;
+    }
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
     case VK_DRIVER_ID_AMD_PROPRIETARY:
@@ -868,7 +982,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                     device.GetMaxVertexInputBindings(), Maxwell::NumVertexArrays);
     }
 
-    LOG_INFO(Render_Vulkan, "DynamicState setting value: {}", u32(Settings::values.dyna_state.GetValue()));
+    LOG_INFO(Render_Vulkan, "DynamicState setting value: {}", u32(EffectiveDynaState()));
 
     dynamic_features = {};
     dynamic_features.driver_id = device.GetDriverID();
@@ -1084,7 +1198,7 @@ void CanonicalizeKeyState(FixedPipelineState& state, const DynamicFeatures& feat
 bool RekeyForeignPipelines() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_REKEY_FOREIGN_PIPELINES");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
@@ -1280,7 +1394,7 @@ constexpr size_t MaxPipelinesWithoutUsedList = 3000;
 bool BackgroundPipelinesEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINES");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
@@ -1402,6 +1516,15 @@ void PlacePrecompileThread(bool full) {
 }
 
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+// LICHII_MESH_KEY=0 keeps the vertex attribute state in task/mesh pipeline keys (old behaviour).
+bool MeshKeyNormalized() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LICHII_MESH_KEY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 bool PreloadAllPipelines() {
     static const bool all = [] {
         const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
@@ -1897,6 +2020,12 @@ PipelineCache::~PipelineCache() {
     // The caches are written before anything slow is torn down, so a teardown cut short still
     // leaves them on disk.
     SaveUsedPipelines();
+    if (spirv_spool) {
+        // The first boot's temporary module file: the store holds its modules now.
+        spirv_spool->file.close();
+        std::error_code ec;
+        std::filesystem::remove(spirv_spool->path, ec);
+    }
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
@@ -1917,6 +2046,8 @@ PipelineCache::~PipelineCache() {
     DestroyPipelinesWithProgress(graphics_cache);
     DestroyPipelinesWithProgress(evicted_pipelines);
     DestroyPipelinesWithProgress(retired_translations);
+    // The shared shader objects go with the pipelines that used them.
+    ShaderObjectCache::Instance().Clear();
 }
 
 void PipelineCache::NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason) {
@@ -2557,6 +2688,16 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         return nullptr;
     }
     RefreshGraphicsKey();
+    if (maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled() &&
+        MeshKeyNormalized()) {
+        // Task and mesh pipelines have no vertex input: the vertex attribute registers left by
+        // earlier draws would key copies of the same pipeline. The next refresh rebuilds them.
+        auto& state = graphics_key.state;
+        state.attribute_types = 0;
+        state.attributes = {};
+        state.binding_divisors = {};
+        maxwell3d->dirty.flags[Dirty::VertexInput] = true;
+    }
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -2671,6 +2812,27 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
     if (is_new) {
+        if (!precompiled_compute_programs.empty()) {
+            // Which archive program this is, if any, and what it was precompiled with.
+            static u32 logged{};
+            const auto known = precompiled_compute_programs.find(key.unique_hash);
+            if (logged++ < 60) {
+                LOG_INFO(Render_Vulkan,
+                         "LICHII_PRECOMPILE compute miss: {:016x} shared {} workgroup {}x{}x{} local "
+                         "{}; {}",
+                         key.unique_hash, key.shared_memory_size, key.workgroup_size[0],
+                         key.workgroup_size[1], key.workgroup_size[2],
+                         qmd.local_pos_alloc + qmd.local_crs_alloc,
+                         known == precompiled_compute_programs.end()
+                             ? std::string{"program not in the archives"}
+                             : fmt::format("archive program precompiled with shared {} workgroup "
+                                           "{}x{}x{}",
+                                           known->second.shared_memory_size,
+                                           known->second.workgroup_size[0],
+                                           known->second.workgroup_size[1],
+                                           known->second.workgroup_size[2]));
+            }
+        }
         if (const auto evicted = evicted_compute.find(key); evicted != evicted_compute.end()) {
             // EXP51 evicted it: translated binding the pointers it bound, from the driver's
             // pipeline cache; its disk cache records are there already.
@@ -2734,6 +2896,34 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
                         key.unique_hash, rebuilt.failure);
             entry.rebuilds = MaxComputeRebuilds;
         }
+    } else if (!precompiled_compute.empty()) {
+        // A precompiled pipeline, used for the first time: is its translation valid here?
+        if (const auto it = precompiled_compute.find(key); it != precompiled_compute.end()) {
+            const PrecompiledCompute precompiled = std::move(it->second);
+            precompiled_compute.erase(it);
+            const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
+                                   shader->lowered_native};
+            const u32 local = qmd.local_pos_alloc + qmd.local_crs_alloc;
+            static const bool disabled = std::getenv("LICHII_PRECOMPILE_NO_COMPUTE") != nullptr;
+            const char* reason = disabled ? "disabled (LICHII_PRECOMPILE_NO_COMPUTE)"
+                                 : local > precompiled.local_memory_size
+                                     ? "local memory"
+                                     : env.ReplayQueries(precompiled.queries);
+            if (reason) {
+                ++precompiled_compute_rebuilt;
+                entry = CreateComputePipeline(key, shader);
+            } else {
+                ++precompiled_compute_used;
+            }
+            static u32 logged{};
+            if (reason != nullptr || logged++ < 20) {
+                LOG_INFO(Render_Vulkan,
+                         "LICHII_PRECOMPILE compute {:016x}: {} ({} used, {} rebuilt so far)",
+                         key.unique_hash, reason ? reason : "precompiled pipeline used",
+                         precompiled_compute_used, precompiled_compute_rebuilt);
+            }
+        }
     }
     entry.last_use_frame = frame_count;
     entry.dispatched = true;
@@ -2741,12 +2931,109 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
 }
 
+u32 TakeSkippedDrawsSinceLastFrame() noexcept {
+    return skipped_since_frame.exchange(0, std::memory_order::relaxed);
+}
+
+namespace {
+// LICHII_KEY_STATS: for the cached pipelines that share their shaders, counts which fixed-state
+// fields differ, to tell how many pipelines exist only because of baked state.
+void ReportCachedKeyStats(const std::vector<GraphicsPipelineCacheKey>& keys) {
+    std::unordered_map<u64, std::vector<const GraphicsPipelineCacheKey*>> groups;
+    for (const auto& key : keys) {
+        u64 shaders = 0;
+        for (const u64 hash : key.unique_hashes) {
+            shaders = shaders * 0x100000001b3ULL ^ hash;
+        }
+        groups[shaders].push_back(&key);
+    }
+    std::map<std::string, u32> fields;
+    u32 variants = 0;
+    u32 groups_with_variants = 0;
+    const auto note = [&](bool differs, const char* name) {
+        if (differs) {
+            ++fields[name];
+        }
+    };
+    for (const auto& [shaders, members] : groups) {
+        if (members.size() < 2) {
+            continue;
+        }
+        ++groups_with_variants;
+        const FixedPipelineState& a = members.front()->state;
+        for (size_t index = 1; index < members.size(); ++index) {
+            const FixedPipelineState& b = members[index]->state;
+            ++variants;
+            const u32 r1 = a.raw1 ^ b.raw1;
+            const u32 r2 = a.raw2 ^ b.raw2;
+            note(r1 & 0x3Fu, "raw1.dynamic_feature_flags");
+            note(r1 & (1u << 6), "raw1.xfb_enabled");
+            note(r1 & (1u << 7), "raw1.ndc_minus_one_to_one");
+            note(r1 & (3u << 8), "raw1.polygon_mode");
+            note(r1 & (0x7Fu << 10), "raw1.tessellation");
+            note(r1 & (0x1Fu << 15), "raw1.patch_control_points");
+            note(r1 & (1u << 20), "raw1.color_write_enable_dynamic");
+            note(r1 & (1u << 21), "raw1.dual_source_blend");
+            note(r1 & (0xFu << 24), "raw1.topology");
+            note(r1 & (0xFu << 28), "raw1.msaa_mode");
+            note(r2 & (7u << 1), "raw2.alpha_test_func");
+            note(r2 & (1u << 4), "raw2.early_z");
+            note(r2 & (1u << 5), "raw2.depth_enabled");
+            note(r2 & (0x1Fu << 6), "raw2.depth_format");
+            note(r2 & (1u << 11), "raw2.y_negate");
+            note(r2 & (1u << 12), "raw2.provoking_vertex_last");
+            note(r2 & (1u << 13), "raw2.conservative_raster");
+            note(r2 & (1u << 14), "raw2.smooth_lines");
+            note(r2 & (3u << 15), "raw2.alpha_to_coverage_one");
+            note(r2 & (7u << 17), "raw2.app_stage");
+            note(a.color_formats != b.color_formats, "color_formats");
+            note(a.alpha_test_ref != b.alpha_test_ref, "alpha_test_ref");
+            note(a.point_size != b.point_size, "point_size");
+            note(a.viewport_swizzles != b.viewport_swizzles, "viewport_swizzles");
+            note(a.attribute_types != b.attribute_types, "attribute_types/divisors");
+            note(std::memcmp(&a.dynamic_state, &b.dynamic_state, sizeof(a.dynamic_state)) != 0,
+                 "dynamic_state");
+            note(std::memcmp(&a.attachments, &b.attachments, sizeof(a.attachments)) != 0,
+                 "attachments(blend)");
+            note(std::memcmp(&a.attributes, &b.attributes, sizeof(a.attributes)) != 0,
+                 "vertex_attributes");
+            note(a.binding_divisors != b.binding_divisors, "binding_divisors");
+            note(a.vertex_strides != b.vertex_strides, "vertex_strides");
+            note(a.depth_bounds_min != b.depth_bounds_min || a.depth_bounds_max != b.depth_bounds_max,
+                 "depth_bounds");
+            note(a.line_stipple_factor != b.line_stipple_factor ||
+                     a.line_stipple_pattern != b.line_stipple_pattern,
+                 "line_stipple");
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "LICHII_KEY_STATS: {} cached pipelines, {} shader sets, {} sets with variants, {} "
+             "variant pipelines",
+             keys.size(), groups.size(), groups_with_variants, variants);
+    std::vector<std::pair<u32, std::string>> sorted;
+    for (const auto& [name, count] : fields) {
+        sorted.emplace_back(count, name);
+    }
+    std::ranges::sort(sorted, std::greater{});
+    for (const auto& [count, name] : sorted) {
+        LOG_INFO(Render_Vulkan, "LICHII_KEY_STATS:   {:5} variants differ in {}", count, name);
+    }
+}
+} // Anonymous namespace
+
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     // Read here, after nx2_switches.txt, and kept for the draws' lookups.
     canonical_keys = CanonicalKeys();
     static_cast<void>(EvictAbovePipelines()); // Chosen and logged at boot
     visual_workaround_title = title_id;
+    static const bool key_stats = std::getenv("LICHII_KEY_STATS") != nullptr;
+    std::vector<GraphicsPipelineCacheKey> stat_keys;
+    static const bool state_stats = std::getenv("LICHII_STATE_STATS") != nullptr;
+    std::unordered_map<u64, u32> state_counts;
+    std::unordered_map<u64, FixedPipelineState> state_examples;
+    std::unordered_map<u64, u32> attribute_counts;
+    std::unordered_map<u64, std::unordered_set<u64>> fragment_states;
     if (title_id == 0) {
         return;
     }
@@ -2809,21 +3096,21 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // cannot read, and their loader deletes a file it fails to read. The shared files of earlier
     // builds are copied once.
     pipeline_cache_filename =
-        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti", CACHE_VERSION);
+        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-lichiiv4", CACHE_VERSION);
     used_pipelines_filename =
-        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-frizti", CACHE_VERSION);
+        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-lichiiv4", CACHE_VERSION);
     // This fork's files of an earlier version with the same records (52 before 2026-11-08) are
     // copied to the current version's names, header rewritten, used list and merge log with them.
     // Copied, not renamed: older builds (a rollback to the previous release) keep their cache.
     for (const u32 previous : VideoCommon::VulkanOwnPreviousVersions) {
         const auto old_cache =
-            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti", previous);
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-lichiiv4", previous);
         // The shader cache's records file magic (the driver blob file uses VULKAN_CACHE_MAGIC_NUMBER).
         constexpr std::array<char, 8> RecordsMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
         if (VideoCommon::CopyCompatiblePipelineCache(old_cache, pipeline_cache_filename,
                                                      RecordsMagic, previous, CACHE_VERSION)) {
             VideoCommon::CopyOwnUnversionedFile(
-                VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-frizti", previous),
+                VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-lichiiv4", previous),
                 used_pipelines_filename);
             auto old_log = old_cache;
             old_log += ".merged";
@@ -2882,9 +3169,21 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
-            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", CACHE_VERSION);
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines-lichiiv4", CACHE_VERSION);
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+    }
+    // Lichii: the shader objects' binaries, kept beside the pipeline cache (LICHII_SHADER_OBJECTS).
+    if (UseShaderObjects(device)) {
+        ShaderObjectCache::Instance().Open(
+            device, pipeline_cache_filename.parent_path() / "lichii_shader_objects_v5.bin");
+    }
+    // LICHII_PRECOMPILE: the effect shaders built after the disk cache share its loading bar; the
+    // last boot left their count here so the bar knows its full length from the start.
+    loading_extra = 0;
+    if (const char* dir = std::getenv("LICHII_PRECOMPILE_DIR"); dir != nullptr && *dir != 0) {
+        std::ifstream hint{pipeline_cache_filename.parent_path() / "lichii_precompile_effects.count"};
+        hint >> loading_extra;
     }
 
     struct {
@@ -2996,10 +3295,55 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (key_stats) {
+            stat_keys.push_back(key);
+        }
+        if (state_stats) {
+            // LICHII_STATE_STATS: the shader-relevant fixed state of the cached pipelines.
+            FixedPipelineState reuse = ReuseState(key.state);
+            const u64 attributes = reuse.dynamic_vertex_input ? reuse.attribute_types : 0;
+            if (reuse.dynamic_vertex_input) {
+                reuse.attribute_types = 0;
+            }
+            const u64 state_hash =
+                Common::CityHash64(reinterpret_cast<const char*>(&reuse), reuse.Size());
+            ++state_counts[state_hash];
+            state_examples.try_emplace(state_hash, reuse);
+            ++attribute_counts[attributes];
+            fragment_states[key.unique_hashes[5]].insert(state_hash);
+        }
+
+        // Task/mesh pipelines translate with their mesh state: entries of builds that did not store
+        // it, or any on a device without mesh shaders, are skipped.
+        if (std::ranges::any_of(envs, [this](const FileEnvironment& env) {
+                return (env.ShaderStage() == Shader::Stage::Task ||
+                        env.ShaderStage() == Shader::Stage::Mesh) &&
+                       (!device.IsExtMeshShaderSupported() || !env.HasMeshState());
+            })) {
+            return;
+        }
         RecordRef ref = record_extent(file);
         if (streaming) {
             // The key as stored, before the rekeying and masking below.
             ref.key_hash = Common::CityHash64(reinterpret_cast<const char*>(&key), sizeof(key));
+        }
+        // The mesh states and mesh pipeline states the archive precompiler translates with.
+        for (const FileEnvironment& env : envs) {
+            if (env.ShaderStage() != Shader::Stage::Mesh) {
+                continue;
+            }
+            std::array<u32, 23> mesh_state{};
+            std::memcpy(mesh_state.data(), env.MeshRegisters().data(), 3 * sizeof(u32));
+            std::memcpy(mesh_state.data() + 3, &env.MeshPrimitiveHeader(), 20 * sizeof(u32));
+            if (std::ranges::find(observed_mesh_states, mesh_state) == observed_mesh_states.end()) {
+                observed_mesh_states.push_back(mesh_state);
+            }
+            const FixedPipelineState reuse = ReuseState(key.state);
+            const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(&reuse), reuse.Size());
+            auto& entry = observed_mesh_templates[hash];
+            if (entry.first++ == 0) {
+                entry.second = key.state;
+            }
         }
 
         if ((key.state.extended_dynamic_state != 0) !=
@@ -3181,6 +3525,42 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (state_stats) {
+        std::vector<std::pair<u32, u64>> order;
+        for (const auto& [hash, count] : state_counts) order.push_back({count, hash});
+        std::sort(order.rbegin(), order.rend());
+        size_t fragments_one = 0, fragments_total = fragment_states.size(), max_states = 0;
+        for (const auto& [fragment, states] : fragment_states) {
+            fragments_one += states.size() == 1 ? 1 : 0;
+            max_states = (std::max)(max_states, states.size());
+        }
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_STATE_STATS: {} distinct shader-relevant states (vertex attribute types "
+                 "aside), {} distinct attribute type sets; {} of {} fragment programs use one "
+                 "state, at most {}",
+                 state_counts.size(), attribute_counts.size(), fragments_one, fragments_total,
+                 max_states);
+        for (size_t i = 0; i < order.size() && i < 12; ++i) {
+            const FixedPipelineState& s = state_examples.at(order[i].second);
+            LOG_INFO(Render_Vulkan,
+                     "LICHII_STATE_STATS: state {:016x} in {} pipelines: raw1 {:#x} raw2 {:#x} "
+                     "topology {} msaa {} alpha_test {} ref {:#x} point {:#x} swizzles {:04x}",
+                     order[i].second, order[i].first, s.raw1, s.raw2,
+                     static_cast<u32>(s.topology.Value()), static_cast<u32>(s.msaa_mode.Value()),
+                     static_cast<u32>(s.alpha_test_func.Value()), s.alpha_test_ref, s.point_size,
+                     fmt::join(s.viewport_swizzles, ""));
+        }
+        std::vector<std::pair<u32, u64>> attribute_order;
+        for (const auto& [types, count] : attribute_counts) attribute_order.push_back({count, types});
+        std::sort(attribute_order.rbegin(), attribute_order.rend());
+        for (size_t i = 0; i < attribute_order.size() && i < 8; ++i) {
+            LOG_INFO(Render_Vulkan, "LICHII_STATE_STATS: attribute types {:016x} in {} pipelines",
+                     attribute_order[i].second, attribute_order[i].first);
+        }
+    }
+    if (key_stats) {
+        ReportCachedKeyStats(stat_keys);
+        }
     if (foreign_records != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipeline records were stored by another GPU driver{}",
@@ -3206,7 +3586,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     std::unique_lock lock{state.mutex};
-    callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
+    callback(VideoCore::LoadCallbackStage::Build, 0, state.total + loading_extra);
     state.has_loaded = true;
     lock.unlock();
 
@@ -3216,6 +3596,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
              boot_stream ? "; records streamed: " + StreamTotalsText(boot_stream->Totals())
                          : std::string{"; records in memory"});
     boot_stream.reset();
+    // The effect shaders continue the same bar after these.
+    loading_base = state.total;
+    PrecompileArchives(stop_loading, callback);
+    // The status bar counts pipelines built since it was last idle: what loading built is not
+    // "building shaders" once the game runs.
+    shader_notify.ForgetBuilt();
 
     const size_t background_count =
         (std::min)(deferred_graphics.size(), BackgroundPipelineLimit(queued_graphics));
@@ -5601,7 +5987,20 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 }
 } // Anonymous namespace
 
+namespace {
+u64 HashPrograms(const std::array<u64, Maxwell::MaxShaderProgram>& unique_hashes);
+} // Anonymous namespace
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+    // Translating a new pipeline runs on this thread, so once a frame has spent its translation
+    // budget (LICHII_TRANSLATE_BUDGET_MS), skippable draws that need one wait for a later frame.
+    if (GetTranslateBudget().count() > 0 &&
+        frame_translate_left_ns.load(std::memory_order::relaxed) <= 0 &&
+        graphics_cache.find(graphics_key) == graphics_cache.end() && CanSkipCurrentDraw()) {
+        deferred_new_pipelines.fetch_add(1, std::memory_order::relaxed);
+        skipped_since_frame.fetch_add(1, std::memory_order::relaxed);
+        return nullptr;
+    }
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
@@ -5633,12 +6032,25 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
             // EDEN_NX2_ASYNC_TRANSLATE=1/2: a draw that may be skipped has its new pipeline
             // translated on a translation thread, and is skipped (as for an unbuilt pipeline)
             // until it is ready. The entry stays empty meanwhile.
-            if (translate_queue && EnqueueTranslation(keep_pointers)) {
+            // Lichii: a key the archive precompiler (or an earlier translation) already holds is
+            // reused at once on this thread instead of queued (TryReuseGraphicsPipeline).
+            bool reusable = false;
+            {
+                std::scoped_lock lock{reusable_stages_mutex};
+                reusable = reusable_stages.contains(HashPrograms(graphics_key.unique_hashes));
+            }
+            if (!reusable && translate_queue && EnqueueTranslation(keep_pointers)) {
                 NoteSkippedLookup();
                 ++translate_stats.skipped;
                 return nullptr;
             }
+            const auto begin = std::chrono::steady_clock::now();
             pipeline = CreateGraphicsPipeline(keep_pointers);
+            frame_translate_left_ns.fetch_sub(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin)
+                    .count(),
+                std::memory_order::relaxed);
         }
         // A precompiled one's are forgotten once it builds (CheckPrecompiledBuilds)
         if (pipeline && !precompiled && evicted_pointer_slots.Size() != 0) {
@@ -5797,6 +6209,8 @@ void ReportTranslateProfile() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    frame_wait_left_ns.store(GetDiscardWaitBudget().count(), std::memory_order::relaxed);
+    frame_translate_left_ns.store(GetTranslateBudget().count(), std::memory_order::relaxed);
     ReportWorstFrame();
     ReportAsyncDiscard();
     ReportTranslateProfile();
@@ -6051,11 +6465,21 @@ void PipelineCache::StopBackgroundPipelines() {
     background_workers.reset();
 }
 
+bool PipelineCache::CanSkipCurrentDraw() const noexcept {
+    if (!use_asynchronous_shaders) {
+        return false;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    return CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
+                                 maxwell3d->regs.zeta_enable != 0, draw_state.draw_element_count,
+                                 draw_state.draw_element_count, GetNativeDiscardMode());
+}
+
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    if (!use_asynchronous_shaders) {
+    if (!CanSkipCurrentDraw()) {
         return pipeline;
     }
     const bool discard = DrawMayBeSkipped();
@@ -6204,7 +6628,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateCachedGraphicsPipeline(
         for (auto& env : envs) {
             env_ptrs.push_back(&env);
         }
-        if (auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false)}) {
+        if (auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false,
+                                                 nullptr, nullptr, false, nullptr, EnvKind::File)}) {
             return pipeline;
         }
     }
@@ -6222,7 +6647,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
     std::unique_ptr<EmissionBudget::Reservation> reservation, bool libraries_only,
-    TranslationRecord* record) try {
+    TranslationRecord* record, EnvKind env_kind) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -6485,6 +6910,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
     }
+    // Every environment has answered its queries now; keep them with the SPIR-V below so later
+    // pipelines of these programs can skip translation (LICHII_SPIRV_REUSE).
+    std::shared_ptr<ReusableStages> reusable;
+    if (SpirvReuseEnabled() && env_kind != EnvKind::Unknown) {
+        reusable = std::make_shared<ReusableStages>();
+        for (Shader::Environment* const env : envs) {
+            if (env_kind == EnvKind::Graphics) {
+                reusable->queries.push_back(
+                    static_cast<const VideoCommon::GraphicsEnvironment*>(env)->RecordQueries());
+            } else {
+                reusable->queries.push_back(
+                    static_cast<const VideoCommon::FileEnvironment*>(env)->RecordQueries());
+            }
+        }
+    }
     // The mesh fallback binds its output buffer (and, for task draws, payload, offsets and
     // indirect arguments) into the descriptor set every stage shares: with the stages' own storage
     // buffers they must fit the set's limit (zortos293/Lichii#642; only fallback pipelines).
@@ -6510,6 +6950,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
         if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
+            return false;
+        }
+        // Lichii: LICHII_SHADER_OBJECTS draws these programs as shader objects (their binaries
+        // precompiled per driver), so they are not made pipeline libraries.
+        if (static const bool shader_objects = [] {
+                const char* value = std::getenv("LICHII_SHADER_OBJECTS");
+                return value != nullptr && value[0] == '1';
+            }();
+            shader_objects) {
             return false;
         }
         if (key.state.extended_dynamic_state_2 == 0 &&
@@ -6646,7 +7095,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const auto begin = std::chrono::steady_clock::now();
             modules[stage_index] = EmitShaderModule(
                 device, profile, runtime_info, program, binding, key.unique_hashes[index],
-                stage_index, {}, use_libraries ? &spirv_hashes[stage_index] : nullptr);
+                stage_index, {}, use_libraries ? &spirv_hashes[stage_index] : nullptr,
+                reusable ? &reusable->spirv[stage_index] : nullptr);
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
             }
@@ -6672,9 +7122,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         for (size_t stage = 0; stage < infos.size(); ++stage) {
             if (infos[stage]) {
                 infos[stage] = &job->programs[stage + 1].info;
+                if (reusable) {
+                    reusable->infos[stage] = InternInfo(*infos[stage]);
+                }
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries](
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries,
+                       reusable = std::move(reusable), stored_key = key](
                           std::array<u128, Maxwell::MaxShaderStage>& stage_hashes) mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
@@ -6685,13 +7139,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     stage_modules[stage] =
                         BuildStageModule(device, job->emitted_spirv[stage], hashes[stage + 1],
                                          stage, use_libraries ? &stage_hashes[stage] : nullptr);
+                    if (reusable) {
+                        reusable->spirv[stage] = job->emitted_spirv[stage];
+                    }
                 } else if (job->runtime_infos[stage]) {
                     PrepareStageBindings(stage_binding, stage, use_libraries);
                     stage_modules[stage] = EmitShaderModule(
                         device, profile, *job->runtime_infos[stage], job->programs[stage + 1],
                         stage_binding, hashes[stage + 1], stage, job->reference_spirv[stage],
-                        use_libraries ? &stage_hashes[stage] : nullptr);
+                        use_libraries ? &stage_hashes[stage] : nullptr,
+                        reusable ? &reusable->spirv[stage] : nullptr);
                 }
+            }
+            if (reusable) {
+                StoreReusableStages(stored_key, std::move(reusable));
             }
             auto job_pools = std::move(job->pools);
             job.reset();
@@ -6705,6 +7166,19 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             AddRuntimeSpirvTime(1, begin);
             return stage_modules;
         };
+    }
+    if (reusable && !emit_stages) {
+        // Emitted on this thread above: the pipeline copies these infos as they are now.
+        for (size_t stage = 0; stage < infos.size(); ++stage) {
+            if (infos[stage]) {
+                reusable->infos[stage] = InternInfo(*infos[stage]);
+            }
+        }
+        StoreReusableStages(key, std::move(reusable));
+    }
+    if (t_translate_only) {
+        // LICHII_PRECOMPILE_DIR: the translation is kept for reuse; no Vulkan pipeline is built.
+        return nullptr;
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel && !libraries_only ? &workers
                                                                                    : nullptr};
@@ -6936,6 +7410,380 @@ void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
     }
 }
 
+FixedPipelineState PipelineCache::ReuseState(const FixedPipelineState& source) const noexcept {
+    // Fields MakeRuntimeInfo and the translation never read are cleared, so pipelines that differ
+    // only in them share one translation.
+    FixedPipelineState state = source;
+    state.depth_format.Assign(0);
+    std::memset(&state.dynamic_state, 0, sizeof(state.dynamic_state));
+    std::memset(&state.attachments, 0, sizeof(state.attachments));
+    state.binding_divisors = {};
+    state.vertex_strides = {};
+    state.depth_bounds_min = 0;
+    state.depth_bounds_max = 0;
+    state.line_stipple_factor = 0;
+    state.line_stipple_pattern = 0;
+    // A driver update changes no translation (the profile depends on the driver, not on its
+    // version): the translations made before it stay reusable.
+    state.driver_version = 0;
+    if (!device.IsMoltenVK()) {
+        // Colour output types are taken from the formats only on MoltenVK.
+        state.color_formats = {};
+    }
+    if (!state.dynamic_vertex_input) {
+        // The union holds the vertex divisors then, which are vertex input state.
+        state.enabled_divisors = 0;
+    }
+    return state;
+}
+
+namespace {
+u64 HashPrograms(const std::array<u64, Maxwell::MaxShaderProgram>& unique_hashes) {
+    return Common::CityHash64(reinterpret_cast<const char*>(unique_hashes.data()),
+                              sizeof(unique_hashes));
+}
+
+bool SameReuseState(const FixedPipelineState& a, const FixedPipelineState& b) {
+    const size_t size = a.Size();
+    return size == b.Size() && std::memcmp(&a, &b, size) == 0;
+}
+} // Anonymous namespace
+
+s32 PipelineCache::SpoolSpirv(const std::vector<u32>& spirv) {
+    const size_t bytes = spirv.size() * sizeof(u32);
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(spirv.data()), bytes) ^
+                     (u64{spirv.size()} << 40);
+    {
+        std::scoped_lock lock{spirv_spool->mutex};
+        if (const auto it = spirv_spool->by_hash.find(hash); it != spirv_spool->by_hash.end()) {
+            return it->second;
+        }
+    }
+    const std::vector<u8> compressed =
+        Common::Compression::CompressDataZSTD(reinterpret_cast<const u8*>(spirv.data()), bytes, 1);
+    std::scoped_lock lock{spirv_spool->mutex};
+    if (const auto it = spirv_spool->by_hash.find(hash); it != spirv_spool->by_hash.end()) {
+        return it->second;
+    }
+    auto& file = spirv_spool->file;
+    file.clear();
+    file.seekp(static_cast<std::streamoff>(spirv_spool->end));
+    file.write(reinterpret_cast<const char*>(compressed.data()),
+               static_cast<std::streamsize>(compressed.size()));
+    if (!file) {
+        return -1;
+    }
+    const s32 index = static_cast<s32>(spirv_spool->modules.size());
+    spirv_spool->modules.push_back({spirv_spool->end, static_cast<u32>(compressed.size()),
+                                    static_cast<u32>(spirv.size())});
+    spirv_spool->end += compressed.size();
+    spirv_spool->by_hash.emplace(hash, index);
+    return index;
+}
+
+std::vector<u8> PipelineCache::ReadSpoolFrame(s32 index) {
+    if (!spirv_spool || index < 0) {
+        return {};
+    }
+    std::scoped_lock lock{spirv_spool->mutex};
+    if (static_cast<size_t>(index) >= spirv_spool->modules.size()) {
+        return {};
+    }
+    const SpirvStore::Module& where = spirv_spool->modules[index];
+    std::vector<u8> frame(where.compressed_size);
+    auto& file = spirv_spool->file;
+    file.clear();
+    file.flush();
+    file.seekg(static_cast<std::streamoff>(where.offset));
+    file.read(reinterpret_cast<char*>(frame.data()), static_cast<std::streamsize>(frame.size()));
+    if (!file) {
+        LOG_ERROR(Render_Vulkan, "LICHII_PRECOMPILE: could not read spooled SPIR-V module {}",
+                  index);
+        return {};
+    }
+    return frame;
+}
+
+const Shader::Info& PackedInfo::Get() const {
+    std::call_once(once, [this] {
+        LichiiIO::Reader r{bytes};
+        decoded = std::make_unique<Shader::Info>(LichiiIO::GetInfo(r));
+    });
+    return *decoded;
+}
+
+InfoRef PipelineCache::InternInfo(const Shader::Info& info) {
+    // The same program appears in thousands of precompiled pairs with the same info: keep one,
+    // packed (a translation made at run time is used at once, so it keeps the expanded copy).
+    LichiiIO::Writer w;
+    LichiiIO::PutInfo(w, info);
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(w.buffer.data()),
+                                        w.buffer.size()) ^
+                     (u64{w.buffer.size()} << 44);
+    std::scoped_lock lock{info_intern_mutex};
+    auto& slot = info_intern[hash];
+    if (!slot) {
+        auto packed = std::make_shared<PackedInfo>();
+        packed->bytes = std::move(w.buffer);
+        packed->generic_mask = 0;
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            if (info.loads.Generic(index) || info.passthrough.Generic(index)) {
+                packed->generic_mask |= u64{0b11} << (index * 2);
+            }
+        }
+        if (!t_translate_only) {
+            std::call_once(packed->once, [&] {
+                packed->decoded = std::make_unique<Shader::Info>(info);
+            });
+        }
+        slot = std::move(packed);
+    }
+    return InfoRef{slot};
+}
+
+void PipelineCache::StoreReusableStages(const GraphicsPipelineCacheKey& key,
+                                        std::shared_ptr<ReusableStages> stages) {
+    constexpr size_t MaxPerPrograms = 32;
+    stages->unique_hashes = key.unique_hashes;
+    stages->state = ReuseState(key.state);
+    if (stages->state.dynamic_vertex_input) {
+        // Only the types of the inputs the vertex stage reads or passes on reach its SPIR-V.
+        u64 mask = ~0ULL;
+        if (const auto& vertex = stages->infos[0]) {
+            // Computed when the info was packed: reading it here would expand every vertex info.
+            mask = vertex.GenericMask();
+        }
+        stages->attribute_mask = mask;
+        stages->state.attribute_types &= mask;
+    }
+    if (t_translate_only) {
+        // LICHII_PRECOMPILE: hundreds of thousands of translations wait in memory until they
+        // are stored. Each distinct module is kept once, compressed to its exact size (the
+        // compressor's buffer is sized for the worst case), and shared.
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            auto& spirv = stages->spirv[stage];
+            if (spirv.empty()) {
+                continue;
+            }
+            stages->spirv_words[stage] = static_cast<u32>(spirv.size());
+            if (spirv_spool) {
+                // Straight to the spool file: memory keeps only the module's index.
+                if (const s32 index = SpoolSpirv(spirv); index >= 0) {
+                    stages->spool_spirv[stage] = index;
+                    spirv = {};
+                    continue;
+                }
+            }
+            const size_t bytes = spirv.size() * sizeof(u32);
+            const u64 hash =
+                Common::CityHash64(reinterpret_cast<const char*>(spirv.data()), bytes) ^
+                (u64{spirv.size()} << 40);
+            {
+                std::scoped_lock intern_lock{spirv_intern_mutex};
+                if (const auto it = spirv_intern.find(hash); it != spirv_intern.end()) {
+                    stages->spirv_zstd[stage] = it->second;
+                }
+            }
+            if (!stages->spirv_zstd[stage]) {
+                const std::vector<u8> compressed = Common::Compression::CompressDataZSTD(
+                    reinterpret_cast<const u8*>(spirv.data()), bytes, 1);
+                auto exact = std::make_shared<const std::vector<u8>>(compressed.begin(),
+                                                                     compressed.end());
+                std::scoped_lock intern_lock{spirv_intern_mutex};
+                stages->spirv_zstd[stage] = spirv_intern.try_emplace(hash, std::move(exact))
+                                                .first->second;
+            }
+            spirv = {};
+        }
+    }
+    std::scoped_lock lock{reusable_stages_mutex};
+    auto& entries = reusable_stages[HashPrograms(key.unique_hashes)];
+    if (entries.size() >= MaxPerPrograms) {
+        return;
+    }
+    for (const auto& entry : entries) {
+        if (entry->attribute_mask == stages->attribute_mask &&
+            SameReuseState(entry->state, stages->state)) {
+            return;
+        }
+    }
+    entries.push_back(std::move(stages));
+}
+
+namespace {
+// Names the shader-relevant fixed-state fields that differ, for reuse misses on known programs.
+std::string DescribeReuseStateDiff(const FixedPipelineState& a, const FixedPipelineState& b) {
+    std::string diff;
+    const auto note = [&](bool differs, std::string_view name) {
+        if (differs) {
+            diff += ' ';
+            diff += name;
+        }
+    };
+    const u32 r1 = a.raw1 ^ b.raw1;
+    const u32 r2 = a.raw2 ^ b.raw2;
+    note(r1 & 0x3Fu, "dynamic_feature_flags");
+    note(r1 & (1u << 6), "xfb_enabled");
+    note(r1 & (1u << 7), "ndc");
+    note(r1 & (3u << 8), "polygon_mode");
+    note(r1 & (0xFFFu << 10), "tessellation");
+    note(r1 & (1u << 20), "color_write_enable_dynamic");
+    note(r1 & (1u << 21), "dual_source_blend");
+    note(r1 & (0xFu << 24), "topology");
+    note(r1 & (0xFu << 28), "msaa_mode");
+    note(r2 & (7u << 1), "alpha_test_func");
+    note(r2 & (1u << 4), "early_z");
+    note(r2 & (1u << 5), "depth_enabled");
+    note(r2 & (1u << 11), "y_negate");
+    note(r2 & (1u << 12), "provoking_vertex_last");
+    note(r2 & (1u << 13), "conservative_raster");
+    note(r2 & (1u << 14), "smooth_lines");
+    note(r2 & (3u << 15), "alpha_to_coverage_one");
+    note(r2 & (7u << 17), "app_stage");
+    note(a.color_formats != b.color_formats, "color_formats");
+    note(a.driver_id != b.driver_id || a.driver_version != b.driver_version, "driver");
+    note(a.alpha_test_ref != b.alpha_test_ref, "alpha_test_ref");
+    note(a.point_size != b.point_size, "point_size");
+    note(a.viewport_swizzles != b.viewport_swizzles, "viewport_swizzles");
+    note(a.attribute_types != b.attribute_types, "attribute_types");
+    note(std::memcmp(&a.attributes, &b.attributes, sizeof(a.attributes)) != 0, "vertex_attributes");
+    if (a.xfb_enabled && b.xfb_enabled) {
+        note(std::memcmp(&a.xfb_state, &b.xfb_state, sizeof(a.xfb_state)) != 0, "xfb_state");
+    }
+    return diff.empty() ? std::string{" (nothing in the compared fields)"} : diff;
+}
+} // Anonymous namespace
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::TryReuseGraphicsPipeline(
+    GraphicsEnvironments& environments) {
+    if (!SpirvReuseEnabled()) {
+        return nullptr;
+    }
+    static std::atomic<u32> logged_misses{};
+    static std::atomic<u32> logged_rejections{};
+    const FixedPipelineState state = ReuseState(graphics_key.state);
+    std::shared_ptr<const ReusableStages> stages;
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        const auto it = reusable_stages.find(HashPrograms(graphics_key.unique_hashes));
+        if (it == reusable_stages.end()) {
+            // A mesh pipeline nothing precompiled matches: is its pixel program known (with
+            // which mesh program key), and which mesh registers does the game use?
+            static std::atomic<u32> mesh_misses{};
+            if (maxwell3d->regs.IsMeshEnabled() && mesh_misses.fetch_add(1) < 40) {
+                u64 known_mesh = 0;
+                size_t pixel_known = 0;
+                for (const auto& [programs_hash, entries] : reusable_stages) {
+                    for (const auto& entry : entries) {
+                        if (entry->unique_hashes[5] == graphics_key.unique_hashes[5]) {
+                            ++pixel_known;
+                            known_mesh = entry->unique_hashes[1];
+                        }
+                    }
+                }
+                using Regs = Tegra::Engines::Maxwell3D::Regs;
+                const auto& regs = maxwell3d->regs;
+                // Undo the mesh state fold: which archive programs are the task and mesh ones?
+                const u64 state_hash = MeshStateHash();
+                const auto archive_stage = [&](u64 key) -> int {
+                    if (key == 0) {
+                        return -2;
+                    }
+                    const auto found = precompiled_programs.find(key ^ state_hash);
+                    return found != precompiled_programs.end() ? static_cast<int>(found->second) : -1;
+                };
+                LOG_INFO(Render_Vulkan,
+                         "LICHII_PRECOMPILE mesh miss: key {:016x}/{:016x}/{:016x}, pixel known in "
+                         "{} entries (e.g. mesh key {:016x}); A={} B={} I={} geometry={}; archive "
+                         "stage of slot1 {} slot3 {} (6 VertexB? 4 Fragment, 8 Mesh; -1 none)",
+                         graphics_key.unique_hashes[1], graphics_key.unique_hashes[3],
+                         graphics_key.unique_hashes[5], pixel_known, known_mesh,
+                         regs.reg_array[Regs::MeshShaderA], regs.reg_array[Regs::MeshShaderB],
+                         regs.reg_array[Regs::MeshInitShader],
+                         regs.IsShaderConfigEnabled(Regs::ShaderType::Geometry),
+                         archive_stage(graphics_key.unique_hashes[1]),
+                         archive_stage(graphics_key.unique_hashes[3]));
+            }
+            return nullptr;
+        }
+        for (const auto& entry : it->second) {
+            // LICHII_PRECOMPILE_NO_GRAPHICS_REUSE: translations from the archive store are not used.
+            static const bool skip_stored =
+                std::getenv("LICHII_PRECOMPILE_NO_GRAPHICS_REUSE") != nullptr;
+            if (skip_stored && (std::ranges::any_of(entry->stored_spirv, [](s32 m) { return m >= 0; }) ||
+                                std::ranges::any_of(entry->spool_spirv, [](s32 m) { return m >= 0; }) ||
+                                std::ranges::any_of(entry->spirv_zstd, [](const auto& z) { return z != nullptr; }))) {
+                continue;
+            }
+            if (entry->unique_hashes != graphics_key.unique_hashes) {
+                continue;
+            }
+            FixedPipelineState masked = state;
+            if (masked.dynamic_vertex_input) {
+                masked.attribute_types &= entry->attribute_mask;
+            }
+            if (SameReuseState(masked, entry->state)) {
+                stages = entry;
+                break;
+            }
+        }
+        if (!stages) {
+            reuse_state_misses.fetch_add(1, std::memory_order::relaxed);
+            if (!it->second.empty() &&
+                logged_misses.fetch_add(1, std::memory_order::relaxed) < 60) {
+                const auto& front = it->second.front();
+                FixedPipelineState shown = state;
+                if (shown.dynamic_vertex_input) {
+                    shown.attribute_types &= front->attribute_mask;
+                }
+                LOG_INFO(Render_Vulkan,
+                         "LICHII_SPIRV_REUSE: known programs, new shader state:{}",
+                         DescribeReuseStateDiff(front->state, shown));
+            }
+            return nullptr;
+        }
+    }
+    const auto envs = environments.Span();
+    const auto reject = [&](const char* reason) {
+        reuse_rejected.fetch_add(1, std::memory_order::relaxed);
+        if (logged_rejections.fetch_add(1, std::memory_order::relaxed) < 60) {
+            LOG_INFO(Render_Vulkan, "LICHII_SPIRV_REUSE: pipeline {:016x} not reused: {}",
+                     graphics_key.Hash(), reason);
+        }
+        return nullptr;
+    };
+    if (envs.size() != stages->queries.size()) {
+        return reject("environment count");
+    }
+    for (size_t index = 0; index < envs.size(); ++index) {
+        // GetGraphicsEnvironments points every entry of the span into environments.envs.
+        auto* const env = static_cast<VideoCommon::GraphicsEnvironment*>(envs[index]);
+        if (const char* reason = env->ReplayQueries(stages->queries[index])) {
+            return reject(reason);
+        }
+    }
+    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+    for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+        if (!stages->infos[stage]) {
+            continue;
+        }
+        const std::vector<u32> spirv = ReusableSpirv(*stages, stage);
+        if (spirv.empty()) {
+            reuse_rejected.fetch_add(1, std::memory_order::relaxed);
+            return nullptr;
+        }
+        modules[stage] = BuildShader(device, spirv);
+        infos[stage] = &*stages->infos[stage];
+    }
+    reused_pipelines.fetch_add(1, std::memory_order::relaxed);
+    return std::make_unique<GraphicsPipeline>(
+        scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, nullptr, device,
+        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, &workers, nullptr,
+        render_pass_cache, graphics_key, std::move(modules), infos,
+        GraphicsPipeline::EmitStagesFunc{});
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const VideoCommon::EvictedPointerSlots::Slots* keep_pointers) {
     const auto begin = std::chrono::steady_clock::now();
@@ -6959,27 +7807,32 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
     };
 
-    std::shared_ptr<ShaderPools> emit_pools;
-    auto reservation = emission_budget.TryAcquire(
-        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::AsyncPipelines),
-        maxwell3d->GetNativeMacroEngine().native_turing);
-    if (reservation) {
-        {
-            std::scoped_lock lock{spare_pools_mutex};
-            if (!spare_pools.empty()) {
-                emit_pools = std::move(spare_pools.back());
-                spare_pools.pop_back();
+    // Kept pointers change the translation: never reused from an earlier one.
+    auto pipeline{keep_pointers ? nullptr : TryReuseGraphicsPipeline(environments)};
+    if (!pipeline) {
+        std::shared_ptr<ShaderPools> emit_pools;
+        auto reservation = emission_budget.TryAcquire(
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::AsyncPipelines),
+            maxwell3d->GetNativeMacroEngine().native_turing);
+        if (reservation) {
+            {
+                std::scoped_lock lock{spare_pools_mutex};
+                if (!spare_pools.empty()) {
+                    emit_pools = std::move(spare_pools.back());
+                    spare_pools.pop_back();
+                }
             }
+            if (!emit_pools) {
+                emit_pools = std::make_shared<ShaderPools>();
+            }
+        } else {
+            main_pools.ReleaseContents();
         }
-        if (!emit_pools) {
-            emit_pools = std::make_shared<ShaderPools>();
-        }
-    } else {
-        main_pools.ReleaseContents();
+        ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
+        pipeline = CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
+                                          std::move(emit_pools), std::move(reservation), false,
+                                          nullptr, EnvKind::Graphics);
     }
-    ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
-    auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
-                                         std::move(emit_pools), std::move(reservation))};
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
@@ -6998,6 +7851,7 @@ void PipelineCache::StoreRuntimeGraphicsPipeline(
         }
         if (!failed_to_load) {
             // In the disk cache already, only not built at boot.
+            runtime_built_kind[1].fetch_add(1, std::memory_order::relaxed);
             QueueVulkanPipelineCacheFlush();
             return;
         }
@@ -7433,6 +8287,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     std::vector<u32> code{EmitSPIRV(profile, program)};
+    if (t_capture_compute) {
+        // LICHII_PRECOMPILE: the archive compute translation is stored with its info.
+        t_capture_compute->first = code;
+        t_capture_compute->second = program.info;
+    }
     if (keep) {
         // The precompiled preparation keeps these (EDEN_NX2_PRECOMPILED_FAST); its audit
         // compares them and stops here.
@@ -7484,7 +8343,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 device, scheduler, warm ? WarmPipelineCache() : PlayPipelineCache(),
                 descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics,
-                warm ? nullptr : &shader_notify, info,
+                warm || t_capture_compute ? nullptr : &shader_notify, info,
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
@@ -7644,6 +8503,2126 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
 
         return create_pipeline_cache(0, nullptr);
     }
+}
+
+void PipelineCache::PrecompileArchives(std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback) {
+    const char* dir = std::getenv("LICHII_PRECOMPILE_DIR");
+    if (dir == nullptr || dir[0] == '\0') {
+        return;
+    }
+    if (!SpirvReuseEnabled()) {
+        LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE_DIR needs LICHII_SPIRV_REUSE=1");
+        return;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    // The template: the most common shader-relevant state among the pipelines built at boot,
+    // every vertex attribute read as a float.
+    std::optional<FixedPipelineState> templ;
+    {
+        std::unordered_map<u64, std::pair<u32, FixedPipelineState>> counts;
+        for (const auto& [key, pipeline] : graphics_cache) {
+            FixedPipelineState reuse = ReuseState(key.state);
+            if (reuse.dynamic_vertex_input) {
+                reuse.attribute_types = 0;
+            }
+            const u64 hash =
+                Common::CityHash64(reinterpret_cast<const char*>(&reuse), reuse.Size());
+            auto& entry = counts[hash];
+            if (entry.first++ == 0) {
+                entry.second = key.state;
+            }
+        }
+        u32 best = 0;
+        for (const auto& [hash, entry] : counts) {
+            if (entry.first > best) {
+                best = entry.first;
+                templ = entry.second;
+            }
+        }
+    }
+    // The template is kept next to the pipeline cache: an emptied cache still has it.
+    const auto template_path =
+        pipeline_cache_filename.parent_path() / "lichii_precompile_state.bin";
+    if (templ) {
+        std::ofstream out{template_path, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(&*templ), sizeof(*templ));
+    } else {
+        std::ifstream in{template_path, std::ios::binary};
+        FixedPipelineState stored{};
+        if (in.read(reinterpret_cast<char*>(&stored), sizeof(stored))) {
+            templ = stored;
+        }
+    }
+    if (!templ) {
+        LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE_DIR: no cached pipeline to take a state from");
+        return;
+    }
+    if (templ->dynamic_vertex_input) {
+        templ->attribute_types = 0x5555555555555555ULL;
+    }
+    // The game draws most of its models with and without the depth test: both are translated.
+    std::vector<FixedPipelineState> templates{*templ};
+    {
+        FixedPipelineState other = *templ;
+        other.depth_enabled.Assign(other.depth_enabled ? 0 : 1);
+        templates.push_back(other);
+    }
+    // Vertex attribute types the game binds (bone indices as integers, packed colors...): which
+    // vertex program was drawn with which types is learned from the pipelines in the disk cache
+    // and kept next to it (lichii_precompile_attributes2.bin). Each pair is translated with float
+    // attributes first; the second phase adds the types its vertex program was seen with, or the
+    // few most common ones for a program the game has not drawn yet.
+    constexpr u64 AllFloatAttributes = 0x5555555555555555ULL;
+    constexpr size_t CommonAttributeSets = 3;
+    std::vector<std::pair<u64, u64>> attribute_uses; ///< Vertex program hash, attribute types
+    std::vector<u64> attribute_sets;                 ///< Distinct, most used first
+    if (templ->dynamic_vertex_input) {
+        const auto attributes_path =
+            pipeline_cache_filename.parent_path() / "lichii_precompile_attributes2.bin";
+        std::unordered_set<u64> seen;
+        const auto remember = [&](u64 vertex, u64 set) {
+            if (seen.insert(Common::CityHash64(reinterpret_cast<const char*>(&vertex), 8) ^ set)
+                    .second) {
+                attribute_uses.emplace_back(vertex, set);
+            }
+        };
+        if (std::ifstream in{attributes_path, std::ios::binary}) {
+            u32 count{};
+            in.read(reinterpret_cast<char*>(&count), sizeof(count));
+            for (u32 i = 0; in && i < count && i < (1u << 20); ++i) {
+                std::pair<u64, u64> use{};
+                if (in.read(reinterpret_cast<char*>(&use), sizeof(use))) {
+                    remember(use.first, use.second);
+                }
+            }
+        }
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (key.state.dynamic_vertex_input && key.state.attribute_types != AllFloatAttributes) {
+                remember(key.unique_hashes[1], key.state.attribute_types);
+            }
+        }
+        std::ofstream out{attributes_path, std::ios::binary};
+        const u32 count = static_cast<u32>(attribute_uses.size());
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        out.write(reinterpret_cast<const char*>(attribute_uses.data()),
+                  static_cast<std::streamsize>(attribute_uses.size() * sizeof(attribute_uses[0])));
+        std::unordered_map<u64, u32> uses_per_set;
+        for (const auto& [vertex, set] : attribute_uses) {
+            ++uses_per_set[set];
+        }
+        for (const auto& [set, uses] : uses_per_set) {
+            attribute_sets.push_back(set);
+        }
+        std::ranges::sort(attribute_sets, [&](u64 a, u64 b) {
+            return uses_per_set[a] != uses_per_set[b] ? uses_per_set[a] > uses_per_set[b] : a < b;
+        });
+        // The stored translations name their template in a byte.
+        if (attribute_sets.size() > 100) {
+            attribute_sets.resize(100);
+        }
+    }
+    // Mesh programs translate with registers and a pass-through header the archive does not
+    // carry: the few combinations the game uses are learned from the disk cache and kept next to
+    // it (lichii_precompile_mesh.bin), with the most common mesh pipeline state.
+    std::vector<std::array<u32, 23>> mesh_states;
+    std::optional<FixedPipelineState> mesh_templ;
+    {
+        const auto mesh_path = pipeline_cache_filename.parent_path() / "lichii_precompile_mesh.bin";
+        if (std::ifstream in{mesh_path, std::ios::binary}) {
+            u32 has_template{}, count{};
+            FixedPipelineState stored{};
+            in.read(reinterpret_cast<char*>(&has_template), sizeof(has_template));
+            in.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+            in.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (in && has_template) {
+                mesh_templ = stored;
+            }
+            for (u32 i = 0; in && i < count && i < 4096; ++i) {
+                std::array<u32, 23> state{};
+                if (in.read(reinterpret_cast<char*>(state.data()), sizeof(state))) {
+                    mesh_states.push_back(state);
+                }
+            }
+        }
+        for (const auto& state : observed_mesh_states) {
+            if (std::ranges::find(mesh_states, state) == mesh_states.end()) {
+                mesh_states.push_back(state);
+            }
+        }
+        u32 best = 0;
+        for (const auto& [hash, entry] : observed_mesh_templates) {
+            if (entry.first > best) {
+                best = entry.first;
+                mesh_templ = entry.second;
+            }
+        }
+        std::ofstream out{mesh_path, std::ios::binary};
+        const u32 has_template = mesh_templ ? 1U : 0U;
+        const FixedPipelineState stored = mesh_templ.value_or(FixedPipelineState{});
+        const u32 count = static_cast<u32>(mesh_states.size());
+        out.write(reinterpret_cast<const char*>(&has_template), sizeof(has_template));
+        out.write(reinterpret_cast<const char*>(&stored), sizeof(stored));
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& state : mesh_states) {
+            out.write(reinterpret_cast<const char*>(state.data()), sizeof(state));
+        }
+    }
+    std::vector<FixedPipelineState> mesh_templates;
+    if (mesh_templ && !mesh_states.empty()) {
+        // Mesh pipelines nearly always keep the depth test of the template (83 of 91 cached).
+        mesh_templates.push_back(*mesh_templ);
+    }
+    // The programs of every BNSH (vertex and pixel; mesh and pixel with the learned mesh states;
+    // task and geometry programs need state the archive does not carry).
+    struct Program {
+        std::vector<u8> bytes;
+        std::vector<u32> bank1;
+        Shader::Stage stage{};
+        std::shared_ptr<const VideoCommon::LoweredNativeCode> lowered;
+        u64 hash{};
+        std::array<u32, 3> workgroup{}; ///< Compute only
+        u32 shared_memory{};            ///< Compute only
+    };
+    std::vector<Program> programs;
+    std::vector<size_t> compute_programs;
+    std::unordered_set<size_t> compute_seen;
+    std::unordered_map<u64, size_t> by_bytes;
+    std::vector<std::pair<size_t, size_t>> pairs;
+    struct MeshSet {
+        size_t task; ///< SIZE_MAX: none
+        size_t mesh;
+        size_t pixel;
+    };
+    std::vector<MeshSet> mesh_pairs;
+    std::unordered_set<std::string> mesh_seen;
+    std::unordered_set<u64> pair_seen;
+    size_t files = 0, variations = 0, skipped_variations = 0;
+    const auto add_program = [&](const std::vector<char>& data, size_t base, u64 code_info,
+                                 Shader::Stage stage) -> std::optional<size_t> {
+        const auto u32_at = [&](size_t o) { u32 v; std::memcpy(&v, data.data() + o, 4); return v; };
+        const auto u64_at = [&](size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
+        const size_t ci = base + code_info;
+        if (ci + 0x20 > data.size()) {
+            return std::nullopt;
+        }
+        const u64 control = u64_at(ci + 0x08);
+        const u64 code = u64_at(ci + 0x10);
+        const u32 size = u32_at(ci + 0x18);
+        if (size < 0x90 || base + code + size > data.size()) {
+            return std::nullopt;
+        }
+        const u8* first = reinterpret_cast<const u8*>(data.data() + base + code);
+        u64 h = 1469598103934665603ULL;
+        for (u32 i = 0; i < size; ++i) {
+            h = (h ^ first[i]) * 1099511628211ULL;
+        }
+        h ^= static_cast<u64>(stage) << 56;
+        if (const auto it = by_bytes.find(h); it != by_bytes.end()) {
+            return it->second;
+        }
+        Program program;
+        if (stage == Shader::Stage::Compute) {
+            // Compute programs start with code: the runtime lowers them with a zeroed header.
+            program.bytes.assign(128, u8{0});
+            program.bytes.insert(program.bytes.end(), first, first + size);
+            // The launch values NVN puts in the dispatch come with the program's control block.
+            if (base + control + 0x68 <= data.size()) {
+                program.workgroup = {u32_at(base + control + 0x58), u32_at(base + control + 0x5c),
+                                     u32_at(base + control + 0x60)};
+                program.shared_memory = u32_at(base + control + 0x64);
+            }
+        } else {
+            program.bytes.assign(first, first + size);
+        }
+        program.stage = stage;
+        if (base + control + 0x48 <= data.size()) {
+            const u32 const_size = u32_at(base + control + 0x3c);
+            const u32 const_offset = u32_at(base + control + 0x40);
+            if (const_size != 0 && const_offset + const_size <= size && const_size < 0x10000) {
+                program.bank1.resize(const_size / 4);
+                std::memcpy(program.bank1.data(), first + const_offset, program.bank1.size() * 4);
+            }
+        }
+        programs.push_back(std::move(program));
+        by_bytes.emplace(h, programs.size() - 1);
+        return programs.size() - 1;
+    };
+    // LICHII_PRECOMPILE_DIR: folders separated by ';' holding the decompressed shader archives
+    // (.bfsha, .sarc) and effect resources (.vsetb, each with its own graphics and compute
+    // shaders).
+    std::vector<std::filesystem::path> archive_files;
+    const bool effect_graphics = [] {
+        const char* value = std::getenv("LICHII_PRECOMPILE_EFFECT_GRAPHICS");
+        return value != nullptr && value[0] == '1';
+    }();
+    {
+        const std::string list{dir};
+        size_t start = 0;
+        while (start <= list.size()) {
+            const size_t end = (std::min)(list.find(';', start), list.size());
+            const std::filesystem::path folder{list.substr(start, end - start)};
+            start = end + 1;
+            std::error_code error;
+            if (folder.empty() || !std::filesystem::is_directory(folder, error)) {
+                continue;
+            }
+            for (const auto& entry : std::filesystem::directory_iterator{folder, error}) {
+                const auto name = entry.path().filename().string();
+                if (entry.is_regular_file() && (name.find(".bfsha") != std::string::npos ||
+                                                name.find(".sarc") != std::string::npos ||
+                                                name.find(".vsetb") != std::string::npos)) {
+                    archive_files.push_back(entry.path());
+                }
+            }
+        }
+    }
+    // The translations are stored next to the pipeline cache (lichii_precompile_translations.bin)
+    // with a fingerprint of what they depend on: archives, the format, the driver. Mesh registers
+    // learned later do not invalidate them (their pipelines translate at runtime until the next
+    // full translation; LICHII_PRECOMPILE_REBUILD=1 forces one).
+    const auto store_path =
+        pipeline_cache_filename.parent_path() / "lichii_precompile_translations_v5.bin";
+    u64 validity = 0;
+    {
+        // The driver and the GPU, not the driver's version: an update changes no translation.
+        std::string archives;
+        for (const auto& path : archive_files) {
+            std::error_code error;
+            const auto size = std::filesystem::file_size(path, error);
+            const auto time = std::filesystem::last_write_time(path, error);
+            archives += fmt::format("|{}:{}:{}", path.filename().string(), size,
+                                    time.time_since_epoch().count());
+        }
+        const std::string fingerprint =
+            fmt::format("store {} | driver {} | gpu {} | effects {}", PrecompileStoreVersion,
+                        static_cast<u32>(device.GetDriverID()), device.GetModelName(),
+                        effect_graphics) +
+            archives;
+        validity = Common::CityHash64(fingerprint.data(), fingerprint.size());
+        // Stores written before named the driver's version: one made with this driver and GPU
+        // is the same, so its header takes the new fingerprint instead of translating again.
+        const std::string legacy =
+            fmt::format("store {} | driver {} {} | effects {}", PrecompileStoreVersion,
+                        static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
+                        effect_graphics) +
+            archives;
+        const u64 legacy_validity = Common::CityHash64(legacy.data(), legacy.size());
+        if (std::fstream file{store_path, std::ios::binary | std::ios::in | std::ios::out}) {
+            u64 stored = 0;
+            file.seekg(8);
+            file.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+            if (file && stored == legacy_validity) {
+                file.seekp(8);
+                file.write(reinterpret_cast<const char*>(&validity), sizeof(validity));
+                LOG_INFO(Render_Vulkan,
+                         "LICHII_PRECOMPILE: stored translations no longer tied to the driver "
+                         "version");
+            }
+        }
+    }
+    // The driver keeps its cache per executable: another one (an LTO build) builds them again.
+    std::string executable;
+#ifdef _MSC_VER
+    if (char* program = nullptr; _get_pgmptr(&program) == 0 && program != nullptr) {
+        executable = std::filesystem::path{program}.filename().string();
+    }
+#endif
+    // LICHII_PRECOMPILE_PIPELINES runs once per store, driver and executable: this file (one per
+    // executable) then names them.
+    const std::filesystem::path prebuild_marker{
+        store_path.string() + (executable.empty() ? "" : "." + executable) + ".prebuilt"};
+    const std::string prebuild_marker_value =
+        fmt::format("{:016x} {}", validity, device.GetDriverVersion());
+    std::vector<FixedPipelineState> store_templates = templates;
+    store_templates.insert(store_templates.end(), mesh_templates.begin(), mesh_templates.end());
+    // The attribute variants (second phase): one template per learned set and depth variant.
+    for (const u64 set : attribute_sets) {
+        for (const FixedPipelineState& base : templates) {
+            FixedPipelineState variant = base;
+            variant.attribute_types = set;
+            store_templates.push_back(variant);
+        }
+    }
+    {
+        std::vector<GraphicsPipelineCacheKey> stored_keys;
+        static const bool rebuild = std::getenv("LICHII_PRECOMPILE_REBUILD") != nullptr;
+        if (!rebuild && LoadPrecompileStore(store_path, validity, stored_keys, callback)) {
+            LOG_INFO(Render_Vulkan, "LICHII_PRECOMPILE: translations read from {} in {:.1f} s",
+                     store_path.string(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
+                         .count());
+            StartBackgroundPrebuild(std::move(stored_keys), prebuild_marker, prebuild_marker_value,
+                                    stop_loading, callback);
+            PrecompileShaderObjects(stop_loading, callback, validity);
+            return;
+        }
+    }
+    // What the translations below add to reusable_stages is what gets stored.
+    std::unordered_set<const ReusableStages*> stores_before;
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        for (const auto& [programs_hash, entries] : reusable_stages) {
+            for (const auto& entry : entries) {
+                stores_before.insert(entry.get());
+            }
+        }
+    }
+    std::vector<StoredCompute> stored_compute;
+    for (const auto& archive_path : archive_files) {
+        std::ifstream file{archive_path, std::ios::binary};
+        const std::vector<char> data{std::istreambuf_iterator<char>(file), {}};
+        ++files;
+        const bool effect = archive_path.filename().string().find(".vsetb") != std::string::npos;
+        const auto u32_at = [&](size_t o) { u32 v; std::memcpy(&v, data.data() + o, 4); return v; };
+        const auto u64_at = [&](size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
+        for (size_t base = 0; base + 0x80 < data.size(); base += 8) {
+            if (std::memcmp(data.data() + base, "BNSH", 4) != 0 || u32_at(base + 4) != 0) {
+                continue;
+            }
+            const size_t grsc = base + (static_cast<u8>(data[base + 0x16]) |
+                                        (static_cast<u8>(data[base + 0x17]) << 8));
+            if (grsc + 0x28 > data.size() || std::memcmp(data.data() + grsc, "grsc", 4) != 0) {
+                continue;
+            }
+            const u32 count = u32_at(grsc + 0x1C);
+            const u64 array = u64_at(grsc + 0x20);
+            for (u32 v = 0; v < count; ++v) {
+                const size_t variation = base + array + size_t{v} * 0x40;
+                if (variation + 0x18 > data.size()) {
+                    break;
+                }
+                const u64 program = u64_at(variation + 0x10);
+                if (program == 0 || base + program + 0x50 > data.size()) {
+                    continue;
+                }
+                ++variations;
+                // Stage slots: vertex, hull, domain, geometry, pixel, compute, -, task, mesh.
+                u64 slots[9];
+                for (int s = 0; s < 9; ++s) {
+                    slots[s] = u64_at(base + program + 0x08 + s * 8);
+                }
+                if (slots[5] != 0 && std::count(std::begin(slots), std::end(slots), u64{0}) == 8) {
+                    // A compute program on its own (effect resources carry these).
+                    if (const auto cs = add_program(data, base, slots[5], Shader::Stage::Compute);
+                        cs && compute_seen.insert(*cs).second) {
+                        compute_programs.push_back(*cs);
+                    }
+                    continue;
+                }
+                if (effect && !effect_graphics) {
+                    // Each effect carries its own graphics programs (~1,300 sets): translating
+                    // them all at once takes more memory than boot can spare, so only on request.
+                    ++skipped_variations;
+                    continue;
+                }
+                bool other = false;
+                for (int s = 0; s < 9; ++s) {
+                    other |= s != 0 && s != 4 && s != 7 && s != 8 && slots[s] != 0;
+                }
+                if (!other && slots[0] == 0 && slots[8] != 0 && slots[4] != 0) {
+                    // (Task +) mesh + pixel.
+                    const auto ms = add_program(data, base, slots[8], Shader::Stage::Mesh);
+                    const auto ps = add_program(data, base, slots[4], Shader::Stage::Fragment);
+                    std::optional<size_t> ts;
+                    if (slots[7] != 0) {
+                        ts = add_program(data, base, slots[7], Shader::Stage::Task);
+                    }
+                    const size_t task_index = ts ? *ts : SIZE_MAX;
+                    if (ms && ps && (slots[7] == 0 || ts) &&
+                        mesh_seen.insert(fmt::format("{}/{}/{}", task_index, *ms, *ps)).second) {
+                        mesh_pairs.push_back({task_index, *ms, *ps});
+                    }
+                    continue;
+                }
+                if (other || slots[7] != 0 || slots[8] != 0 || slots[0] == 0 || slots[4] == 0) {
+                    ++skipped_variations;
+                    continue;
+                }
+                const auto vs = add_program(data, base, slots[0], Shader::Stage::VertexB);
+                const auto ps = add_program(data, base, slots[4], Shader::Stage::Fragment);
+                if (!vs || !ps) {
+                    ++skipped_variations;
+                    continue;
+                }
+                if (pair_seen.insert((u64{*vs} << 32) | *ps).second) {
+                    pairs.emplace_back(*vs, *ps);
+                }
+            }
+        }
+    }
+    // Lower every program as the runtime would (its shader cache key is the hash of the result).
+    for (auto& program : programs) {
+        workers.QueueWork([&program] {
+            try {
+                program.lowered =
+                    VideoCommon::LowerNativeProgramBytes(program.bytes, program.stage);
+            } catch (const std::exception&) {
+                program.lowered = nullptr;
+            }
+            if (program.lowered) {
+                program.hash = VideoCommon::NativeProgramHash(program.lowered->code);
+            }
+        });
+    }
+    workers.WaitForRequests(stop_loading);
+    size_t lowered = 0;
+    for (const auto& program : programs) {
+        lowered += program.lowered ? 1 : 0;
+        if (program.lowered) {
+            precompiled_programs.emplace(program.hash, static_cast<u32>(program.stage));
+        }
+    }
+    // Only the 128-byte headers are read from here on (the lowered code has the rest).
+    for (auto& program : programs) {
+        if (program.bytes.size() > 128) {
+            program.bytes.resize(128);
+            program.bytes.shrink_to_fit();
+        }
+    }
+    // The translated modules go to a temporary file as they are made (LICHII_PRECOMPILE_SPOOL=0
+    // keeps them compressed in memory instead, ~20 GB for the whole game).
+    if (!spirv_spool && !spirv_store) {
+        const char* spool_env = std::getenv("LICHII_PRECOMPILE_SPOOL");
+        if (spool_env == nullptr || spool_env[0] != '0') {
+            auto spool = std::make_unique<SpirvSpool>();
+            spool->path = pipeline_cache_filename.parent_path() / "lichii_precompile_spool.tmp";
+            spool->file.open(spool->path,
+                             std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+            if (spool->file) {
+                spirv_spool = std::move(spool);
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "LICHII_PRECOMPILE: no spool file; translations stay in memory");
+            }
+        }
+    }
+    // Translate every pair for reuse: no Vulkan pipeline.
+    const size_t limit = [] {
+        const char* value = std::getenv("LICHII_PRECOMPILE_MAX");
+        return value ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t{0};
+    }();
+    std::atomic<size_t> translated{};
+    std::atomic<size_t> failed{};
+    size_t queued = 0;
+    // The loading screen counts these translations.
+    size_t total = 0;
+    for (const auto& [vs, ps] : pairs) {
+        total += programs[vs].lowered && programs[ps].lowered ? templates.size() : 0;
+    }
+    for (const auto& [ts, ms, ps] : mesh_pairs) {
+        total += programs[ms].lowered && programs[ps].lowered &&
+                         (ts == SIZE_MAX || programs[ts].lowered)
+                     ? mesh_states.size() * mesh_templates.size()
+                     : 0;
+    }
+    for (const size_t cs : compute_programs) {
+        total += programs[cs].lowered ? 1 : 0;
+    }
+    if (limit != 0) {
+        total = (std::min)(total, limit);
+    }
+    std::mutex progress_mutex;
+    std::atomic<size_t> done{};
+    // One loading bar for both phases: the attribute variants of the second phase are estimated
+    // here (each pair gets one per learned set of its vertex program, or the common sets), and
+    // the total is corrected to the real count once they are queued.
+    size_t phase2_estimate = 0;
+    if (!attribute_sets.empty()) {
+        std::unordered_map<u64, size_t> sets_per_vertex;
+        for (const auto& use : attribute_uses) {
+            ++sets_per_vertex[use.first];
+        }
+        const size_t common = (std::min)(attribute_sets.size(), CommonAttributeSets);
+        for (const auto& [vs, ps] : pairs) {
+            if (!programs[vs].lowered || !programs[ps].lowered) {
+                continue;
+            }
+            const auto it = sets_per_vertex.find(programs[vs].hash);
+            phase2_estimate += (it != sets_per_vertex.end() ? it->second : common) * templates.size();
+        }
+        // The count of the last translation, when there is one, is exact for the same archives.
+        if (std::ifstream hint{pipeline_cache_filename.parent_path() /
+                               "lichii_precompile_phase2.count"}) {
+            size_t last = 0;
+            if (hint >> last && last != 0 && last <= phase2_estimate) {
+                phase2_estimate = last;
+            }
+        }
+    }
+    std::atomic<size_t> pair_total{total + phase2_estimate};
+    total += phase2_estimate;
+    std::vector<GraphicsPipelineCacheKey> prebuild_keys;
+    callback(VideoCore::LoadCallbackStage::Translate, 0, total);
+    const auto queue_pair = [&](const Program& vertex, const Program& pixel,
+                                const FixedPipelineState& state) {
+        GraphicsPipelineCacheKey key{};
+        key.unique_hashes = {0, vertex.hash, 0, 0, 0, pixel.hash};
+        key.state = state;
+        ++queued;
+        prebuild_keys.push_back(key);
+        workers.QueueWork([this, key, &vertex, &pixel, &translated, &failed, &done, &pair_total,
+                           &progress_mutex, &callback] {
+            SCOPE_EXIT {
+                const size_t now = done.fetch_add(1) + 1;
+                const size_t all = pair_total.load(std::memory_order::relaxed);
+                if (now % 64 == 0 || now == all) {
+                    std::scoped_lock lock{progress_mutex};
+                    callback(VideoCore::LoadCallbackStage::Translate, now, all);
+                }
+            };
+            VideoCommon::FileEnvironment envs[2];
+            const auto bound = [](const Program& p, u32 fallback) {
+                return p.lowered->texture_bound != ~0U ? p.lowered->texture_bound : fallback;
+            };
+            Shader::ProgramHeader vertex_header{};
+            Shader::ProgramHeader pixel_header{};
+            std::memcpy(&vertex_header, vertex.bytes.data(), sizeof(vertex_header));
+            std::memcpy(&pixel_header, pixel.bytes.data(), sizeof(pixel_header));
+            envs[0].InitializeFromArchive(vertex.lowered->code, vertex_header,
+                                          Shader::Stage::VertexB, bound(vertex, 0), vertex.bank1);
+            envs[1].InitializeFromArchive(pixel.lowered->code, pixel_header,
+                                          Shader::Stage::Fragment, bound(pixel, 2), pixel.bank1);
+            Shader::Environment* env_ptrs[2]{&envs[0], &envs[1]};
+            ShaderPools pools;
+            t_translate_only = true;
+            (void)CreateGraphicsPipeline(pools, key, std::span<Shader::Environment* const>{env_ptrs},
+                                         nullptr, false, nullptr, nullptr, false, nullptr, EnvKind::File);
+            t_translate_only = false;
+            std::scoped_lock lock{reusable_stages_mutex};
+            const auto it = reusable_stages.find(HashPrograms(key.unique_hashes));
+            (it != reusable_stages.end() ? translated : failed).fetch_add(1);
+        });
+    };
+    for (const auto& [vs, ps] : pairs) {
+        for (const FixedPipelineState& state : templates) {
+            if (limit != 0 && queued >= limit) {
+                break;
+            }
+            const Program& vertex = programs[vs];
+            const Program& pixel = programs[ps];
+            if (vertex.lowered && pixel.lowered) {
+                queue_pair(vertex, pixel, state);
+            }
+        }
+    }
+    // Mesh + pixel, once per learned mesh state: the program key is the hash of the lowered code
+    // with the state's hash folded in, as ShaderCache::RefreshStages does.
+    size_t mesh_queued = 0;
+    for (const auto& [ts, ms, ps] : mesh_pairs) {
+        const Program& mesh = programs[ms];
+        const Program& pixel = programs[ps];
+        const Program* const task = ts != SIZE_MAX ? &programs[ts] : nullptr;
+        if (!mesh.lowered || !pixel.lowered || (task && !task->lowered)) {
+            continue;
+        }
+        for (const auto& mesh_state : mesh_states) {
+            const u64 mesh_hash =
+                Common::CityHash64(reinterpret_cast<const char*>(mesh_state.data()),
+                                   sizeof(mesh_state)) |
+                1;
+            for (const FixedPipelineState& state : mesh_templates) {
+                if (limit != 0 && queued >= limit) {
+                    break;
+                }
+                // With a task program: task in the vertex B slot, mesh in the tessellation slot.
+                GraphicsPipelineCacheKey key{};
+                key.unique_hashes = task ? std::array<u64, Maxwell::MaxShaderProgram>{
+                                               0, task->hash ^ mesh_hash, 0,
+                                               mesh.hash ^ mesh_hash, 0, pixel.hash}
+                                         : std::array<u64, Maxwell::MaxShaderProgram>{
+                                               0, mesh.hash ^ mesh_hash, 0, 0, 0, pixel.hash};
+                key.state = state;
+                ++queued;
+                prebuild_keys.push_back(key);
+                ++mesh_queued;
+                workers.QueueWork([this, key, task, &mesh, &pixel, mesh_state, &translated,
+                                   &failed, &done, total, &progress_mutex, &callback] {
+                    SCOPE_EXIT {
+                        const size_t now = done.fetch_add(1) + 1;
+                        if (now % 64 == 0 || now == total) {
+                            std::scoped_lock lock{progress_mutex};
+                            callback(VideoCore::LoadCallbackStage::Translate, now, total);
+                        }
+                    };
+                    VideoCommon::FileEnvironment envs[3];
+                    Shader::ProgramHeader mesh_header{};
+                    Shader::ProgramHeader pixel_header{};
+                    Shader::ProgramHeader passthrough{};
+                    std::memcpy(&mesh_header, mesh.bytes.data(), sizeof(mesh_header));
+                    std::memcpy(&pixel_header, pixel.bytes.data(), sizeof(pixel_header));
+                    std::memcpy(&passthrough, mesh_state.data() + 3, sizeof(passthrough));
+                    const auto bound = [](const Program& p, u32 fallback) {
+                        return p.lowered->texture_bound != ~0U ? p.lowered->texture_bound
+                                                               : fallback;
+                    };
+                    const std::array<u32, 3> registers{mesh_state[0], mesh_state[1],
+                                                       mesh_state[2]};
+                    size_t count = 0;
+                    if (task) {
+                        Shader::ProgramHeader task_header{};
+                        std::memcpy(&task_header, task->bytes.data(), sizeof(task_header));
+                        envs[count].InitializeFromArchive(task->lowered->code, task_header,
+                                                          Shader::Stage::Task, bound(*task, 0),
+                                                          task->bank1);
+                        // Only mesh programs read the pass-through header.
+                        envs[count].SetMeshState(registers, Shader::ProgramHeader{});
+                        ++count;
+                    }
+                    envs[count].InitializeFromArchive(mesh.lowered->code, mesh_header,
+                                                      Shader::Stage::Mesh, bound(mesh, 0),
+                                                      mesh.bank1);
+                    envs[count].SetMeshState(registers, passthrough);
+                    ++count;
+                    envs[count].InitializeFromArchive(pixel.lowered->code, pixel_header,
+                                                      Shader::Stage::Fragment, bound(pixel, 2),
+                                                      pixel.bank1);
+                    ++count;
+                    Shader::Environment* env_ptrs[3]{&envs[0], &envs[1], &envs[2]};
+                    ShaderPools pools;
+                    t_translate_only = true;
+                    (void)CreateGraphicsPipeline(
+                        pools, key, std::span<Shader::Environment* const>{env_ptrs, count},
+                        nullptr, false, nullptr, nullptr, false, nullptr, EnvKind::File);
+                    t_translate_only = false;
+                    std::scoped_lock lock{reusable_stages_mutex};
+                    const auto it = reusable_stages.find(HashPrograms(key.unique_hashes));
+                    (it != reusable_stages.end() ? translated : failed).fetch_add(1);
+                });
+            }
+        }
+    }
+    // Compute programs: translated and built here (a compute pipeline has no state besides its
+    // key), kept with the answers their translation assumed for the check on first use.
+    std::mutex compute_mutex;
+    std::atomic<size_t> compute_built{};
+    std::atomic<size_t> compute_failed{};
+    size_t compute_known = 0;
+    size_t compute_skipped = 0;
+    for (const size_t cs : compute_programs) {
+        const Program& program = programs[cs];
+        if (!program.lowered) {
+            continue;
+        }
+        const ComputePipelineCacheKey key{
+            .unique_hash = program.hash,
+            .shared_memory_size = program.shared_memory,
+            .workgroup_size = program.workgroup,
+        };
+        precompiled_compute_programs.emplace(program.hash, key);
+        const auto& wg = program.workgroup;
+        if (wg[0] == 0 || wg[1] == 0 || wg[2] == 0 || wg[0] > 1024 || wg[1] > 1024 ||
+            wg[2] > 64 || u64{wg[0]} * wg[1] * wg[2] > 1024 ||
+            program.shared_memory > device.GetMaxComputeSharedMemorySize()) {
+            // Not launch values: this control block is laid out differently.
+            static u32 logged{};
+            if (logged++ < 10) {
+                LOG_WARNING(Render_Vulkan,
+                            "LICHII_PRECOMPILE compute {:016x}: unexpected workgroup {}x{}x{} / "
+                            "shared {}, skipped",
+                            program.hash, wg[0], wg[1], wg[2], program.shared_memory);
+            }
+            ++compute_skipped;
+            continue;
+        }
+        if (compute_cache.find(key) != compute_cache.end()) {
+            // Already built from the disk cache.
+            ++compute_known;
+            continue;
+        }
+        workers.QueueWork([this, key, &program, &compute_mutex, &stored_compute, &compute_built, &compute_failed,
+                           &done, total, &progress_mutex, &callback] {
+            SCOPE_EXIT {
+                const size_t now = done.fetch_add(1) + 1;
+                if (now % 64 == 0 || now == total) {
+                    std::scoped_lock lock{progress_mutex};
+                    callback(VideoCore::LoadCallbackStage::Translate, now, total);
+                }
+            };
+            // Local memory the dispatch reserves is not in the archive: generous here, and the
+            // check on first use rebuilds the pipeline if the game reserves more.
+            constexpr u32 local_memory = 0x2000;
+            try {
+                VideoCommon::FileEnvironment env;
+                env.InitializeFromArchive(program.lowered->code, Shader::ProgramHeader{},
+                                          Shader::Stage::Compute,
+                                          program.lowered->texture_bound != ~0U
+                                              ? program.lowered->texture_bound
+                                              : 2,
+                                          program.bank1);
+                env.SetComputeState(program.workgroup, program.shared_memory, local_memory);
+                ShaderPools pools;
+                std::pair<std::vector<u32>, Shader::Info> captured;
+                t_capture_compute = &captured;
+                SCOPE_EXIT {
+                    t_capture_compute = nullptr;
+                };
+                auto entry = CreateComputePipeline(pools, key, env, nullptr, false);
+                if (!entry.pipeline) {
+                    compute_failed.fetch_add(1);
+                    return;
+                }
+                compute_built.fetch_add(1);
+                std::scoped_lock lock{compute_mutex};
+                compute_cache.emplace(key, std::move(entry));
+                auto queries = env.RecordQueries();
+                stored_compute.push_back({key, local_memory, std::move(captured.first),
+                                          std::move(captured.second), queries});
+                precompiled_compute.emplace(key,
+                                            PrecompiledCompute{std::move(queries), local_memory});
+            } catch (const std::exception& exception) {
+                compute_failed.fetch_add(1);
+                LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE compute {:016x} failed: {}",
+                            key.unique_hash, exception.what());
+            } catch (...) {
+                compute_failed.fetch_add(1);
+                LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE compute {:016x} failed",
+                            key.unique_hash);
+            }
+        });
+    }
+    workers.WaitForRequests(stop_loading);
+    // Second phase: the attribute types each vertex program reads are known now (its translations
+    // keep the mask); the learned sets that differ there give its other variants.
+    size_t attribute_queued = 0;
+    std::unordered_multimap<u64, u64> sets_by_vertex;
+    for (const auto& [vertex_hash, set] : attribute_uses) {
+        sets_by_vertex.emplace(vertex_hash, set);
+    }
+    if (!attribute_sets.empty() && !stop_loading.stop_requested()) {
+        for (const auto& [vs, ps] : pairs) {
+            const Program& vertex = programs[vs];
+            const Program& pixel = programs[ps];
+            if (!vertex.lowered || !pixel.lowered) {
+                continue;
+            }
+            const std::array<u64, Maxwell::MaxShaderProgram> hashes{0, vertex.hash, 0,
+                                                                    0, 0, pixel.hash};
+            std::optional<u64> mask;
+            {
+                std::scoped_lock lock{reusable_stages_mutex};
+                if (const auto it = reusable_stages.find(HashPrograms(hashes));
+                    it != reusable_stages.end()) {
+                    for (const auto& entry : it->second) {
+                        if (entry->unique_hashes == hashes) {
+                            mask = entry->attribute_mask;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!mask || *mask == 0) {
+                continue;
+            }
+            std::vector<u64> candidates;
+            for (auto [it, end] = sets_by_vertex.equal_range(vertex.hash); it != end; ++it) {
+                candidates.push_back(it->second);
+            }
+            if (candidates.empty()) {
+                candidates.assign(attribute_sets.begin(),
+                                  attribute_sets.begin() +
+                                      (std::min)(attribute_sets.size(), CommonAttributeSets));
+            }
+            std::vector<u64> variants;
+            for (const u64 set : candidates) {
+                const u64 read = set & *mask;
+                if (read != (AllFloatAttributes & *mask) &&
+                    std::ranges::find(variants, read) == variants.end()) {
+                    variants.push_back(read);
+                }
+            }
+            for (const u64 read : variants) {
+                for (const FixedPipelineState& base : templates) {
+                    FixedPipelineState variant = base;
+                    variant.attribute_types = (AllFloatAttributes & ~*mask) | read;
+                    queue_pair(vertex, pixel, variant);
+                    ++attribute_queued;
+                }
+            }
+        }
+        // The estimate becomes the real count (the bar may step back a little, never forward).
+        pair_total.store(total - phase2_estimate + attribute_queued, std::memory_order::relaxed);
+        if (std::ofstream hint{pipeline_cache_filename.parent_path() /
+                                   "lichii_precompile_phase2.count",
+                               std::ios::trunc}) {
+            hint << attribute_queued << std::endl;
+        }
+        workers.WaitForRequests(stop_loading);
+    }
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE: {} learned vertex attribute sets ({} program uses): {} attribute "
+             "variants translated",
+             attribute_sets.size(), attribute_uses.size(), attribute_queued);
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE: {} compute programs: {} pipelines built, {} failed, {} skipped, {} already in "
+             "the disk cache",
+             compute_programs.size(), compute_built.load(), compute_failed.load(), compute_skipped,
+             compute_known);
+    LOG_INFO(Render_Vulkan, "LICHII_PRECOMPILE: {} mesh pairs x {} learned mesh states: {} queued",
+             mesh_pairs.size(), mesh_states.size(), mesh_queued);
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE: {} archives, {} variations ({} skipped: task/mesh/geometry), {} "
+             "programs ({} lowered), {} pairs queued: {} translated, {} failed, in {:.1f} s",
+             files, variations, skipped_variations, programs.size(), lowered, queued,
+             translated.load(), failed.load(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+
+    if (!stop_loading.stop_requested()) {
+        SavePrecompileStore(store_path, validity, store_templates, stores_before,
+                            std::move(stored_compute));
+        // The translations just made stay in memory for this session with their SPIR-V
+        // compressed; the next boot reads the store instead.
+    }
+    StartBackgroundPrebuild(std::move(prebuild_keys), prebuild_marker, prebuild_marker_value,
+                            stop_loading, callback);
+    PrecompileShaderObjects(stop_loading, callback, validity);
+}
+
+bool PipelineCache::PrebuildPrecompiledPipelines(std::stop_token stop,
+                                                 std::vector<GraphicsPipelineCacheKey> prebuild_keys,
+                                                 std::vector<FixedPipelineState> extra_states,
+                                                 const std::function<void(size_t, size_t)>& progress) {
+    // LICHII_PRECOMPILE_PIPELINES=1: one Vulkan pipeline per distinct translation, built with the
+    // template's full state on the workers and destroyed right away. The driver keeps what it
+    // compiled in the pipeline cache (and its own disk cache), so the pipeline the game asks for
+    // over the same SPIR-V is a cache hit instead of a driver compile.
+    const auto build_begin = std::chrono::steady_clock::now();
+    std::vector<std::pair<GraphicsPipelineCacheKey, std::shared_ptr<const ReusableStages>>> jobs;
+    {
+        std::unordered_set<const ReusableStages*> seen;
+        std::scoped_lock lock{reusable_stages_mutex};
+        for (const auto& key : prebuild_keys) {
+            const auto it = reusable_stages.find(HashPrograms(key.unique_hashes));
+            if (it == reusable_stages.end()) {
+                continue;
+            }
+            const FixedPipelineState state = ReuseState(key.state);
+            for (const auto& entry : it->second) {
+                if (entry->unique_hashes != key.unique_hashes) {
+                    continue;
+                }
+                FixedPipelineState masked = state;
+                if (masked.dynamic_vertex_input) {
+                    masked.attribute_types &= entry->attribute_mask;
+                }
+                if (SameReuseState(masked, entry->state)) {
+                    if (seen.insert(entry.get()).second) {
+                        jobs.emplace_back(key, entry);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    prebuild_keys.clear();
+    prebuild_keys.shrink_to_fit();
+    // Then the same translations with the game's other common draw states (blending, attachments
+    // and the like, learned from the disk cache), so the pipelines it builds with them are driver
+    // cache hits too. Every translation gets its first pipeline before any of these.
+    std::vector<std::pair<u32, u8>> extras;
+    {
+        std::vector<FixedPipelineState> extra_reuse;
+        extra_reuse.reserve(extra_states.size());
+        for (const auto& state : extra_states) {
+            extra_reuse.push_back(ReuseState(state));
+        }
+        for (size_t base = 0; base < jobs.size(); ++base) {
+            const auto& [key, entry] = jobs[base];
+            for (size_t index = 0; index < extra_states.size() && index < 255; ++index) {
+                // The draw state varies; the vertex attribute types stay the translation's.
+                FixedPipelineState masked = extra_reuse[index];
+                masked.attribute_types = entry->state.attribute_types;
+                if (!SameReuseState(masked, entry->state)) {
+                    continue;
+                }
+                FixedPipelineState state = extra_states[index];
+                state.attribute_types = key.state.attribute_types;
+                if (state == key.state) {
+                    continue;
+                }
+                extras.emplace_back(static_cast<u32>(base), static_cast<u8>(index));
+            }
+        }
+    }
+    const size_t build_total = jobs.size() + extras.size();
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE_PIPELINES: {} translations, then {} more pipelines with {} common "
+             "draw states",
+             jobs.size(), extras.size(), extra_states.size());
+    // Shared with the queued jobs: after a stop the ones still queued return at once, and they
+    // may outlive this function.
+    struct Counters {
+        std::atomic<size_t> built{}, build_failed{};
+        std::atomic<u32> logged_failures{};
+    };
+    const auto counters = std::make_shared<Counters>();
+    auto& built = counters->built;
+    auto& build_failed = counters->build_failed;
+    // In chunks, so a stop (the game closing) ends the work soon.
+    constexpr size_t Chunk = 256;
+    for (size_t chunk = 0; chunk < build_total && !stop.stop_requested(); chunk += Chunk) {
+      for (size_t index = chunk; index < (std::min)(build_total, chunk + Chunk); ++index) {
+        GraphicsPipelineCacheKey job_key;
+        std::shared_ptr<const ReusableStages> job_stages;
+        if (index < jobs.size()) {
+            job_key = jobs[index].first;
+            job_stages = jobs[index].second;
+        } else {
+            const auto& [base, state_index] = extras[index - jobs.size()];
+            job_key = jobs[base].first;
+            job_key.state = extra_states[state_index];
+            job_key.state.attribute_types = jobs[base].first.state.attribute_types;
+            job_stages = jobs[base].second;
+        }
+        prebuild_workers->QueueWork([this, key = job_key, stages = std::move(job_stages), counters,
+                                     stop] {
+            if (stop.stop_requested()) {
+                return;
+            }
+            auto& built = counters->built;
+            auto& build_failed = counters->build_failed;
+            auto& logged_failures = counters->logged_failures;
+            try {
+                std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+                std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+                for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                    if (!stages->infos[stage]) {
+                        continue;
+                    }
+                    const std::vector<u32> spirv = ReusableSpirv(*stages, stage);
+                    if (spirv.empty()) {
+                        build_failed.fetch_add(1);
+                        return;
+                    }
+                    modules[stage] = BuildShader(device, spirv);
+                    infos[stage] = &*stages->infos[stage];
+                }
+                GraphicsPipeline pipeline{scheduler, buffer_cache, texture_cache,
+                                          vulkan_pipeline_cache, nullptr, device, descriptor_pool,
+                                          guest_descriptor_queue, descriptor_buffer_ring, nullptr,
+                                          nullptr, render_pass_cache, key, std::move(modules),
+                                          infos,
+                                          GraphicsPipeline::EmitStagesFunc{}};
+                built.fetch_add(1);
+            } catch (const std::exception& exception) {
+                build_failed.fetch_add(1);
+                if (logged_failures.fetch_add(1) < 20) {
+                    LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE_PIPELINES: {:016x} failed: {}",
+                                key.Hash(), exception.what());
+                }
+            }
+        });
+      }
+      prebuild_workers->WaitForRequests(stop);
+      if (progress) {
+          progress((std::min)(build_total, chunk + Chunk), build_total);
+      }
+    }
+    u64 cache_size = 0;
+    if (use_vulkan_pipeline_cache) {
+        size_t size = 0;
+        vulkan_pipeline_cache.Read(&size, nullptr);
+        cache_size = size;
+    }
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE_PIPELINES: {} distinct translations: {} driver pipelines built, {} "
+             "failed, in {:.1f} s; driver pipeline cache {} MiB",
+             build_total, built.load(), build_failed.load(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - build_begin).count(),
+             cache_size >> 20);
+    return !stop.stop_requested();
+}
+
+void PipelineCache::RunPipelineExperiment(const std::vector<GraphicsPipelineCacheKey>& keys) {
+    // LICHII_PIPELINE_EXPERIMENT=<offset>: how long the driver takes to build a stored translation's
+    // pipeline as stored, then with only the colour formats, only the depth format, only the
+    // blending or only the dynamic-state block of the game's own pipelines changed. Tells which
+    // changes cost a full driver compile (and what a pipeline library could share).
+    const char* env = std::getenv("LICHII_PIPELINE_EXPERIMENT");
+    const size_t offset = env ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) : 0;
+    constexpr size_t Samples = 120;
+    // The game's own render targets, blending and dynamic state, from the disk cache.
+    std::map<std::vector<u8>, u32> targets;
+    std::map<std::vector<u8>, u32> blends;
+    std::map<std::vector<u8>, u32> dynamics;
+    const auto bytes = [](const auto& value) {
+        const auto* data = reinterpret_cast<const u8*>(&value);
+        return std::vector<u8>(data, data + sizeof(value));
+    };
+    for (const auto& [key, pipeline] : graphics_cache) {
+        std::vector<u8> target = bytes(key.state.color_formats);
+        target.push_back(static_cast<u8>(key.state.depth_format.Value()));
+        ++targets[target];
+        ++blends[bytes(key.state.attachments)];
+        ++dynamics[bytes(key.state.dynamic_state)];
+    }
+    const auto ranked = [](const std::map<std::vector<u8>, u32>& counts) {
+        std::vector<std::pair<u32, std::vector<u8>>> list;
+        for (const auto& [value, count] : counts) {
+            list.emplace_back(count, value);
+        }
+        std::ranges::sort(list, [](const auto& a, const auto& b) { return a.first > b.first; });
+        return list;
+    };
+    const auto target_list = ranked(targets);
+    const auto blend_list = ranked(blends);
+    const auto dynamic_list = ranked(dynamics);
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PIPELINE_EXPERIMENT: {} cached pipelines: {} render targets, {} blendings, {} "
+             "dynamic-state blocks",
+             graphics_cache.size(), target_list.size(), blend_list.size(), dynamic_list.size());
+
+    std::vector<std::pair<GraphicsPipelineCacheKey, std::shared_ptr<const ReusableStages>>> jobs;
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        for (size_t index = offset; index < keys.size() && jobs.size() < Samples; index += 97) {
+            const auto& key = keys[index];
+            const auto it = reusable_stages.find(HashPrograms(key.unique_hashes));
+            if (it == reusable_stages.end()) {
+                continue;
+            }
+            FixedPipelineState state = ReuseState(key.state);
+            for (const auto& entry : it->second) {
+                if (entry->unique_hashes != key.unique_hashes) {
+                    continue;
+                }
+                FixedPipelineState masked = state;
+                if (masked.dynamic_vertex_input) {
+                    masked.attribute_types &= entry->attribute_mask;
+                }
+                if (SameReuseState(masked, entry->state)) {
+                    jobs.emplace_back(key, entry);
+                    break;
+                }
+            }
+        }
+    }
+    const auto build = [&](const GraphicsPipelineCacheKey& key,
+                           const std::shared_ptr<const ReusableStages>& stages) -> double {
+        const auto begin = std::chrono::steady_clock::now();
+        try {
+            std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+            std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+            for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                if (!stages->infos[stage]) {
+                    continue;
+                }
+                const std::vector<u32> spirv = ReusableSpirv(*stages, stage);
+                if (spirv.empty()) {
+                    return -1.0;
+                }
+                modules[stage] = BuildShader(device, spirv);
+                infos[stage] = &*stages->infos[stage];
+            }
+            GraphicsPipeline pipeline{scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache,
+                                      nullptr, device, descriptor_pool, guest_descriptor_queue,
+                                      descriptor_buffer_ring, nullptr, nullptr, render_pass_cache,
+                                      key, std::move(modules), infos,
+                                      GraphicsPipeline::EmitStagesFunc{}};
+        } catch (const std::exception&) {
+            return -1.0;
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    };
+    constexpr std::array<const char*, 6> Names{"as stored (driver cache)", "colour formats",
+                                               "depth format", "blending", "dynamic-state block",
+                                               "as stored again"};
+    std::array<std::vector<double>, Names.size()> times;
+    for (const auto& [key, stages] : jobs) {
+        std::array<std::optional<GraphicsPipelineCacheKey>, Names.size()> variants;
+        variants[0] = key;
+        variants[5] = key;
+        std::vector<u8> own_target = bytes(key.state.color_formats);
+        own_target.push_back(static_cast<u8>(key.state.depth_format.Value()));
+        for (const auto& [count, target] : target_list) {
+            if (target == own_target) {
+                continue;
+            }
+            const size_t formats = sizeof(key.state.color_formats);
+            if (!variants[1] && std::memcmp(target.data(), own_target.data(), formats) != 0) {
+                GraphicsPipelineCacheKey variant = key;
+                std::memcpy(&variant.state.color_formats, target.data(), formats);
+                variants[1] = variant;
+            }
+            if (!variants[2] && target[formats] != own_target[formats]) {
+                GraphicsPipelineCacheKey variant = key;
+                variant.state.depth_format.Assign(target[formats]);
+                variants[2] = variant;
+            }
+        }
+        for (const auto& [count, blend] : blend_list) {
+            if (blend != bytes(key.state.attachments)) {
+                GraphicsPipelineCacheKey variant = key;
+                std::memcpy(&variant.state.attachments, blend.data(), blend.size());
+                variants[3] = variant;
+                break;
+            }
+        }
+        for (const auto& [count, dynamic] : dynamic_list) {
+            if (dynamic != bytes(key.state.dynamic_state)) {
+                GraphicsPipelineCacheKey variant = key;
+                std::memcpy(&variant.state.dynamic_state, dynamic.data(), dynamic.size());
+                variants[4] = variant;
+                break;
+            }
+        }
+        for (size_t v = 0; v < Names.size(); ++v) {
+            if (variants[v]) {
+                const double ms = build(*variants[v], stages);
+                if (ms >= 0.0) {
+                    times[v].push_back(ms);
+                }
+            }
+        }
+    }
+    for (size_t v = 0; v < Names.size(); ++v) {
+        auto& list = times[v];
+        if (list.empty()) {
+            LOG_INFO(Render_Vulkan, "LICHII_PIPELINE_EXPERIMENT: {}: no samples", Names[v]);
+            continue;
+        }
+        std::ranges::sort(list);
+        double total = 0;
+        size_t slow = 0;
+        for (const double ms : list) {
+            total += ms;
+            slow += ms > 10.0 ? 1 : 0;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_PIPELINE_EXPERIMENT: {:26}: {:3} builds, median {:6.2f} ms, mean {:6.2f} "
+                 "ms, p90 {:6.2f} ms, {} over 10 ms",
+                 Names[v], list.size(), list[list.size() / 2], total / list.size(),
+                 list[list.size() * 9 / 10], slow);
+    }
+}
+
+void PipelineCache::PrecompileShaderObjects(std::stop_token stop_loading,
+                                            const VideoCore::DiskResourceLoadCallback& callback,
+                                            u64 store_validity) {
+    if (!UseShaderObjects(device)) {
+        return;
+    }
+    ShaderObjectCache& cache = ShaderObjectCache::Instance();
+    if (cache.Path().empty()) {
+        return;
+    }
+    // Done once per store and driver: this file names them.
+    const std::filesystem::path marker{cache.Path().string() + ".precompiled"};
+    const std::string marker_value =
+        fmt::format("{:016x} {:016x}", store_validity, cache.Identity());
+    if (std::ifstream in{marker}; in) {
+        std::string stored;
+        std::getline(in, stored);
+        if (stored == marker_value) {
+            LOG_INFO(Render_Vulkan, "LICHII_SHADER_OBJECTS: translations already precompiled");
+            return;
+        }
+    }
+    std::vector<std::shared_ptr<const ReusableStages>> entries;
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        for (const auto& [hash, list] : reusable_stages) {
+            entries.insert(entries.end(), list.begin(), list.end());
+        }
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    static constexpr std::array<VkShaderStageFlagBits, Maxwell::MaxShaderStage> StageBits{
+        VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+        VK_SHADER_STAGE_FRAGMENT_BIT};
+    using Shader::Backend::SPIRV::RenderAreaLayout;
+    using Shader::Backend::SPIRV::RescalingLayout;
+    const VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+        .offset = 0,
+        .size = static_cast<u32>(sizeof(RescalingLayout) + sizeof(RenderAreaLayout)),
+    };
+    // One set layout per distinct layout, kept while precompiling.
+    std::mutex layouts_mutex;
+    std::unordered_map<u64, vk::DescriptorSetLayout> layouts;
+    std::atomic<size_t> done{}, compiled{};
+    const unsigned cores = std::thread::hardware_concurrency();
+    Common::ThreadWorker precompile_workers(cores > 1 ? cores - 1 : 1, "VkShaderObjects");
+    const size_t total = entries.size();
+    if (callback) {
+        callback(VideoCore::LoadCallbackStage::Pipelines, 0, total);
+    }
+    constexpr size_t Chunk = 64;
+    for (size_t first = 0; first < total; first += Chunk) {
+        precompile_workers.QueueWork([&, first] {
+            for (size_t index = first; index < (std::min)(total, first + Chunk); ++index) {
+                SCOPE_EXIT {
+                    done.fetch_add(1, std::memory_order_relaxed);
+                };
+                if (stop_loading.stop_requested()) {
+                    continue;
+                }
+                const ReusableStages& stages = *entries[index];
+                std::array<Shader::Info, Maxwell::MaxShaderStage> infos{};
+                bool skip = false;
+                for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                    if (stages.infos[stage]) {
+                        infos[stage] = *stages.infos[stage];
+                        skip |= infos[stage].is_mesh || infos[stage].is_task;
+                    }
+                }
+                if (skip || !stages.infos[0]) {
+                    continue;
+                }
+                // As GraphicsPipeline builds its layout (MakeBuilder).
+                DescriptorLayoutBuilder builder{device};
+                for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                    builder.Add(infos[stage], StageBits[stage]);
+                }
+                const bool push_descriptor = builder.CanUsePushDescriptor();
+                if (builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid()) {
+                    continue; // such a pipeline stays a pipeline
+                }
+                const u64 layout_hash = builder.LayoutHash(push_descriptor);
+                VkDescriptorSetLayout set_layout{};
+                {
+                    std::scoped_lock lock{layouts_mutex};
+                    auto [it, inserted] = layouts.try_emplace(layout_hash);
+                    if (inserted) {
+                        it->second = builder.CreateDescriptorSetLayout(push_descriptor);
+                    }
+                    set_layout = it->second ? *it->second : VK_NULL_HANDLE;
+                }
+                std::array<std::vector<u32>, Maxwell::MaxShaderStage> code;
+                for (size_t stage = 0; stage < Maxwell::MaxShaderStage && !skip; ++stage) {
+                    if (stages.infos[stage]) {
+                        code[stage] = ReusableSpirv(stages, stage);
+                        skip |= code[stage].empty();
+                    }
+                }
+                if (skip) {
+                    continue;
+                }
+                for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                    if (code[stage].empty()) {
+                        continue;
+                    }
+                    VkShaderStageFlags next_stage = 0;
+                    for (size_t next = stage + 1; next < Maxwell::MaxShaderStage; ++next) {
+                        if (!code[next].empty()) {
+                            next_stage = StageBits[next];
+                            break;
+                        }
+                    }
+                    const VkShaderCreateInfoEXT ci{
+                        .sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .stage = StageBits[stage],
+                        .nextStage = next_stage,
+                        .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+                        .codeSize = code[stage].size() * sizeof(u32),
+                        .pCode = code[stage].data(),
+                        .pName = "main",
+                        .setLayoutCount = set_layout != VK_NULL_HANDLE ? 1U : 0U,
+                        .pSetLayouts = set_layout != VK_NULL_HANDLE ? &set_layout : nullptr,
+                        .pushConstantRangeCount = 1,
+                        .pPushConstantRanges = &push_range,
+                        .pSpecializationInfo = nullptr,
+                    };
+                    if (cache.Precompile(device, ci, layout_hash)) {
+                        compiled.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+    // The bar, from this thread while the workers compile.
+    size_t shown = 0;
+    while (done.load() < total) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        const size_t now = done.load();
+        if (callback && now != shown) {
+            shown = now;
+            callback(VideoCore::LoadCallbackStage::Pipelines, now, total);
+        }
+    }
+    precompile_workers.WaitForRequests();
+    const bool complete = !stop_loading.stop_requested();
+    if (complete) {
+        std::ofstream out{marker, std::ios::trunc};
+        out << marker_value << std::endl;
+    }
+    std::error_code error;
+    LOG_INFO(Render_Vulkan,
+             "LICHII_SHADER_OBJECTS: {} translations precompiled: {} new shader binaries, {} set "
+             "layouts, in {:.1f} s ({} MiB file){}",
+             total, compiled.load(), layouts.size(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(),
+             std::filesystem::file_size(cache.Path(), error) >> 20,
+             complete ? "" : " (stopped)");
+}
+
+void PipelineCache::RunShaderObjectExperiment(const std::vector<GraphicsPipelineCacheKey>& keys) {
+    // LICHII_SHADER_OBJECT_EXPERIMENT=<offset>: VK_EXT_shader_object compiles each stage of a stored
+    // translation on its own, with every draw state dynamic. Times that compile, the size of the
+    // driver's binary, and creating the shader again from that binary (what a store of binaries
+    // on the SSD would cost per shader).
+    if (!device.IsExtShaderObjectSupported()) {
+        LOG_INFO(Render_Vulkan, "LICHII_SHADER_OBJECT_EXPERIMENT: VK_EXT_shader_object unavailable");
+        return;
+    }
+    const char* env = std::getenv("LICHII_SHADER_OBJECT_EXPERIMENT");
+    const size_t offset = env ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) : 0;
+    constexpr size_t Samples = 120;
+    std::vector<std::shared_ptr<const ReusableStages>> jobs;
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        std::unordered_set<const ReusableStages*> seen;
+        for (size_t index = offset; index < keys.size() && jobs.size() < Samples; index += 89) {
+            const auto it = reusable_stages.find(HashPrograms(keys[index].unique_hashes));
+            if (it == reusable_stages.end() || it->second.empty()) {
+                continue;
+            }
+            const auto& entry = it->second.front();
+            bool mesh = false;
+            for (const auto& info : entry->infos) {
+                mesh |= info && (info->is_mesh || info->is_task);
+            }
+            if (!mesh && seen.insert(entry.get()).second) {
+                jobs.push_back(entry);
+            }
+        }
+    }
+    static constexpr std::array<VkShaderStageFlagBits, Maxwell::MaxShaderStage> StageBits{
+        VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+        VK_SHADER_STAGE_FRAGMENT_BIT};
+    static constexpr std::array<VkShaderStageFlags, Maxwell::MaxShaderStage> NextStages{
+        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+        VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
+        0};
+    using Shader::Backend::SPIRV::RenderAreaLayout;
+    using Shader::Backend::SPIRV::RescalingLayout;
+    const VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+        .offset = 0,
+        .size = static_cast<u32>(sizeof(RescalingLayout) + sizeof(RenderAreaLayout)),
+    };
+    const vk::Device& logical = device.GetLogical();
+    std::vector<double> compile_vertex, compile_fragment, reload, sizes;
+    size_t failures = 0;
+    for (const auto& stages : jobs) {
+        std::array<Shader::Info, Maxwell::MaxShaderStage> infos{};
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            if (stages->infos[stage]) {
+                infos[stage] = *stages->infos[stage];
+            }
+        }
+        DescriptorLayoutBuilder builder{device};
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            builder.Add(infos[stage], StageBits[stage]);
+        }
+        const vk::DescriptorSetLayout set_layout =
+            builder.CreateDescriptorSetLayout(builder.CanUsePushDescriptor());
+        const VkDescriptorSetLayout set_layout_handle = *set_layout;
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            if (!stages->infos[stage]) {
+                continue;
+            }
+            const std::vector<u32> spirv = ReusableSpirv(*stages, stage);
+            if (spirv.empty()) {
+                continue;
+            }
+            VkShaderCreateInfoEXT ci{
+                .sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+                .pNext = nullptr,
+                .flags = 0,
+                .stage = StageBits[stage],
+                .nextStage = NextStages[stage],
+                .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+                .codeSize = spirv.size() * sizeof(u32),
+                .pCode = spirv.data(),
+                .pName = "main",
+                .setLayoutCount = set_layout_handle != VK_NULL_HANDLE ? 1U : 0U,
+                .pSetLayouts = set_layout_handle != VK_NULL_HANDLE ? &set_layout_handle : nullptr,
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &push_range,
+                .pSpecializationInfo = nullptr,
+            };
+            VkShaderEXT shader{};
+            auto begin = std::chrono::steady_clock::now();
+            if (logical.CreateShaderEXT(ci, &shader) != VK_SUCCESS) {
+                ++failures;
+                continue;
+            }
+            const double compile_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                    .count();
+            (stage == 0 ? compile_vertex : compile_fragment).push_back(compile_ms);
+            size_t size = 0;
+            std::vector<u8> binary;
+            if (logical.GetShaderBinaryDataEXT(shader, &size, nullptr) == VK_SUCCESS && size != 0) {
+                binary.resize(size);
+                if (logical.GetShaderBinaryDataEXT(shader, &size, binary.data()) != VK_SUCCESS) {
+                    binary.clear();
+                }
+            }
+            logical.DestroyShaderEXT(shader);
+            if (binary.empty()) {
+                ++failures;
+                continue;
+            }
+            sizes.push_back(static_cast<double>(binary.size()));
+            ci.codeType = VK_SHADER_CODE_TYPE_BINARY_EXT;
+            ci.codeSize = binary.size();
+            ci.pCode = binary.data();
+            begin = std::chrono::steady_clock::now();
+            if (logical.CreateShaderEXT(ci, &shader) != VK_SUCCESS) {
+                ++failures;
+                continue;
+            }
+            reload.push_back(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                    .count());
+            logical.DestroyShaderEXT(shader);
+        }
+    }
+    const auto report = [](const char* name, std::vector<double>& list, const char* unit) {
+        if (list.empty()) {
+            LOG_INFO(Render_Vulkan, "LICHII_SHADER_OBJECT_EXPERIMENT: {}: no samples", name);
+            return;
+        }
+        std::ranges::sort(list);
+        double total = 0;
+        for (const double value : list) {
+            total += value;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_SHADER_OBJECT_EXPERIMENT: {:28}: {:4} samples, median {:9.2f} {}, mean "
+                 "{:9.2f} {}, p90 {:9.2f} {}",
+                 name, list.size(), list[list.size() / 2], unit, total / list.size(), unit,
+                 list[list.size() * 9 / 10], unit);
+    };
+    LOG_INFO(Render_Vulkan, "LICHII_SHADER_OBJECT_EXPERIMENT: {} translations, {} failures",
+             jobs.size(), failures);
+    report("vertex compile (SPIR-V)", compile_vertex, "ms");
+    report("other stages compile (SPIR-V)", compile_fragment, "ms");
+    report("create from binary", reload, "ms");
+    report("binary size", sizes, "B");
+}
+
+void PipelineCache::StartBackgroundPrebuild(std::vector<GraphicsPipelineCacheKey> prebuild_keys,
+                                            std::filesystem::path marker,
+                                            std::string marker_value,
+                                            std::stop_token stop_loading,
+                                            const VideoCore::DiskResourceLoadCallback& callback) {
+    if (std::getenv("LICHII_PIPELINE_EXPERIMENT") != nullptr) {
+        RunPipelineExperiment(prebuild_keys);
+    }
+    if (std::getenv("LICHII_SHADER_OBJECT_EXPERIMENT") != nullptr) {
+        RunShaderObjectExperiment(prebuild_keys);
+    }
+    const char* pipelines_env = std::getenv("LICHII_PRECOMPILE_PIPELINES");
+    if (pipelines_env == nullptr || pipelines_env[0] == '\0' || pipelines_env[0] == '0') {
+        return;
+    }
+    // The game's common draw states, from the pipelines in the disk cache: grouped by what reaches
+    // the shaders, the three most used variations of each group (twelve at most), with the vertex
+    // input left out (dynamic). Their set is part of the marker: newly learned ones build again.
+    std::vector<FixedPipelineState> extra_states;
+    // LICHII_PRECOMPILE_EXTRA_STATES=1: also these (many more pipelines the first time).
+    if (std::getenv("LICHII_PRECOMPILE_EXTRA_STATES") != nullptr) {
+        struct Variation {
+            u32 uses{};
+            FixedPipelineState state{};
+        };
+        std::unordered_map<u64, std::unordered_map<u64, Variation>> groups;
+        for (const auto& [key, pipeline] : graphics_cache) {
+            FixedPipelineState state = key.state;
+            state.attribute_types = 0;
+            state.attributes = {};
+            state.binding_divisors = {};
+            state.vertex_strides = {};
+            state.enabled_divisors = 0;
+            FixedPipelineState reuse = ReuseState(state);
+            const u64 group = Common::CityHash64(reinterpret_cast<const char*>(&reuse), reuse.Size());
+            const u64 variation =
+                Common::CityHash64(reinterpret_cast<const char*>(&state), state.Size());
+            auto& entry = groups[group][variation];
+            if (entry.uses++ == 0) {
+                entry.state = state;
+            }
+        }
+        std::vector<std::pair<u32, std::vector<Variation>>> ranked;
+        for (auto& [group, variations] : groups) {
+            std::vector<Variation> list;
+            u32 total = 0;
+            for (auto& [hash, variation] : variations) {
+                total += variation.uses;
+                list.push_back(variation);
+            }
+            std::ranges::sort(list, [](const Variation& a, const Variation& b) { return a.uses > b.uses; });
+            if (list.size() > 3) {
+                list.resize(3);
+            }
+            ranked.emplace_back(total, std::move(list));
+        }
+        std::ranges::sort(ranked, [](const auto& a, const auto& b) { return a.first > b.first; });
+        u64 states_hash = 0;
+        for (const auto& [total, list] : ranked) {
+            for (const auto& variation : list) {
+                if (extra_states.size() < 12) {
+                    extra_states.push_back(variation.state);
+                    states_hash ^= Common::CityHash64(reinterpret_cast<const char*>(&variation.state),
+                                                      variation.state.Size()) +
+                                   extra_states.size();
+                }
+            }
+        }
+        marker_value += fmt::format(" states {:016x}", states_hash);
+    }
+    // Built once for these translations and this driver: its cache has them since.
+    if (std::ifstream in{marker}; in) {
+        std::string stored;
+        std::getline(in, stored);
+        if (stored == marker_value) {
+            LOG_INFO(Render_Vulkan, "LICHII_PRECOMPILE_PIPELINES: already built for this store "
+                                    "and driver ({})", marker.filename().string());
+            return;
+        }
+    }
+    // The first boot builds them behind the loading screen, on every core but one: one long wait
+    // once instead of hitches while playing (and a busy CPU while playing makes some spots
+    // flicker). LICHII_PREBUILD_BACKGROUND=1: after boot instead, while the game runs.
+    if (std::getenv("LICHII_PREBUILD_BACKGROUND") == nullptr) {
+        const unsigned cores = std::thread::hardware_concurrency();
+        const size_t threads = cores > 1 ? cores - 1 : 1;
+        prebuild_workers.reset(new Common::ThreadWorker(threads, "VkPrebuild"));
+        if (callback) {
+            callback(VideoCore::LoadCallbackStage::Pipelines, 0, 1);
+        }
+        const bool complete = PrebuildPrecompiledPipelines(
+            stop_loading, std::move(prebuild_keys), std::move(extra_states),
+            [&callback](size_t done, size_t total) {
+                if (callback) {
+                    callback(VideoCore::LoadCallbackStage::Pipelines, done, total);
+                }
+            });
+        prebuild_workers->WaitForRequests({});
+        prebuild_workers.reset();
+        if (complete) {
+            std::ofstream out{marker, std::ios::trunc};
+            out << marker_value << '\n';
+        }
+        return;
+    }
+    // After boot, on low-priority threads of their own: the game does not wait, and the
+    // pipelines it asks for meanwhile keep the main builders to themselves.
+    // One thread by default (LICHII_PREBUILD_THREADS): with more, the game loses CPU while it
+    // runs and timing-sensitive spots can flicker.
+    static const size_t prebuild_threads = [] {
+        const char* value = std::getenv("LICHII_PREBUILD_THREADS");
+        const int count = value ? std::atoi(value) : 1;
+        return static_cast<size_t>(std::clamp(count, 1, 8));
+    }();
+    prebuild_workers.reset(new Common::ThreadWorker(prebuild_threads, "VkPrebuild", {},
+                                                    Common::ThreadPlacement::Background));
+    prebuild_thread = std::jthread([this, keys = std::move(prebuild_keys), marker, marker_value,
+                                    extra_states = std::move(extra_states)](std::stop_token stop) mutable {
+        Common::SetCurrentThreadName("VkPrebuildFeed");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        if (PrebuildPrecompiledPipelines(stop, std::move(keys), std::move(extra_states))) {
+            std::ofstream out{marker, std::ios::trunc};
+            out << marker_value << '\n';
+        }
+    });
+}
+
+
+namespace {
+constexpr u32 PrecompileStoreMagic = 0x3154504C; // "LPT1"
+
+/// Indexes equal values once (SPIR-V modules, serialized shader infos).
+template <typename T>
+class Deduplicator {
+public:
+    s32 Add(const T& value, std::span<const u8> bytes) {
+        const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()),
+                                            bytes.size());
+        auto& candidates = index[hash];
+        for (const s32 candidate : candidates) {
+            if (values[candidate] == value) {
+                return candidate;
+            }
+        }
+        values.push_back(value);
+        candidates.push_back(static_cast<s32>(values.size() - 1));
+        return candidates.back();
+    }
+    std::vector<T> values;
+
+private:
+    std::unordered_map<u64, std::vector<s32>> index;
+};
+} // Anonymous namespace
+
+std::vector<u32> PipelineCache::ReadStoredSpirv(s32 module) {
+    if (module < 0 || !spirv_store || static_cast<size_t>(module) >= spirv_store->modules.size()) {
+        return {};
+    }
+    const SpirvStore::Module& where = spirv_store->modules[module];
+    std::vector<u8> compressed(where.compressed_size);
+    {
+        std::scoped_lock lock{spirv_store->mutex};
+        auto& file = spirv_store->file;
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(where.offset));
+        file.read(reinterpret_cast<char*>(compressed.data()),
+                  static_cast<std::streamsize>(compressed.size()));
+        if (!file) {
+            LOG_ERROR(Render_Vulkan, "LICHII_PRECOMPILE: could not read SPIR-V module {}", module);
+            return {};
+        }
+    }
+    std::vector<u32> spirv(where.words);
+    const std::span<u8> output{reinterpret_cast<u8*>(spirv.data()), spirv.size() * sizeof(u32)};
+    if (Common::Compression::DecompressDataZSTD(compressed, output) != output.size()) {
+        LOG_ERROR(Render_Vulkan, "LICHII_PRECOMPILE: SPIR-V module {} is damaged", module);
+        return {};
+    }
+    return spirv;
+}
+
+std::vector<u32> PipelineCache::ReusableSpirv(const ReusableStages& stages, size_t stage) {
+    if (!stages.spirv[stage].empty()) {
+        return stages.spirv[stage];
+    }
+    if (stages.spirv_zstd[stage]) {
+        std::vector<u32> spirv(stages.spirv_words[stage]);
+        const std::span<u8> output{reinterpret_cast<u8*>(spirv.data()),
+                                   spirv.size() * sizeof(u32)};
+        if (Common::Compression::DecompressDataZSTD(*stages.spirv_zstd[stage], output) !=
+            output.size()) {
+            return {};
+        }
+        return spirv;
+    }
+    if (stages.spool_spirv[stage] >= 0) {
+        const std::vector<u8> frame = ReadSpoolFrame(stages.spool_spirv[stage]);
+        std::vector<u32> spirv(stages.spirv_words[stage]);
+        const std::span<u8> output{reinterpret_cast<u8*>(spirv.data()),
+                                   spirv.size() * sizeof(u32)};
+        if (frame.empty() || Common::Compression::DecompressDataZSTD(frame, output) !=
+                                 output.size()) {
+            return {};
+        }
+        return spirv;
+    }
+    return ReadStoredSpirv(stages.stored_spirv[stage]);
+}
+
+void PipelineCache::SavePrecompileStore(const std::filesystem::path& path, u64 validity,
+                                        const std::vector<FixedPipelineState>& templates,
+                                        const std::unordered_set<const ReusableStages*>& stores_before,
+                                        std::vector<StoredCompute> compute) try {
+    const auto begin = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<const ReusableStages>> entries;
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        for (const auto& [programs_hash, list] : reusable_stages) {
+            for (const auto& entry : list) {
+                if (!stores_before.contains(entry.get())) {
+                    entries.push_back(entry);
+                }
+            }
+        }
+    }
+    // SPIR-V modules as the zstd frames written to the file: the shared compressed copies made at
+    // translation go in as they are (one per distinct module), anything else is compressed here.
+    // A frame is either in memory or a module of the first boot's spool file (copied from there
+    // while the store is written, one at a time).
+    std::vector<std::shared_ptr<const std::vector<u8>>> frames;
+    std::vector<u32> frame_words;
+    std::vector<s32> frame_spool;
+    std::vector<u32> frame_sizes;
+    std::unordered_map<const void*, s32> frame_by_copy;
+    std::unordered_map<u64, s32> frame_by_hash;
+    std::unordered_map<s32, s32> frame_by_spool;
+    const auto add_frame = [&](std::shared_ptr<const std::vector<u8>> frame, u32 words) {
+        frame_sizes.push_back(static_cast<u32>(frame->size()));
+        frames.push_back(std::move(frame));
+        frame_words.push_back(words);
+        frame_spool.push_back(-1);
+        return static_cast<s32>(frames.size() - 1);
+    };
+    const auto add_blob = [&](const std::vector<u32>& spirv) -> s32 {
+        if (spirv.empty()) {
+            return -1;
+        }
+        const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(spirv.data()),
+                                            spirv.size() * sizeof(u32)) ^
+                         (u64{spirv.size()} << 40);
+        if (const auto it = frame_by_hash.find(hash); it != frame_by_hash.end()) {
+            return it->second;
+        }
+        const std::vector<u8> compressed = Common::Compression::CompressDataZSTD(
+            reinterpret_cast<const u8*>(spirv.data()), spirv.size() * sizeof(u32), 1);
+        const s32 index = add_frame(
+            std::make_shared<const std::vector<u8>>(compressed.begin(), compressed.end()),
+            static_cast<u32>(spirv.size()));
+        frame_by_hash.emplace(hash, index);
+        return index;
+    };
+    const auto add_stage = [&](const ReusableStages& entry, size_t stage) -> s32 {
+        if (const s32 spooled = entry.spool_spirv[stage]; spooled >= 0 && spirv_spool) {
+            const auto [it, inserted] =
+                frame_by_spool.try_emplace(spooled, static_cast<s32>(frames.size()));
+            if (inserted) {
+                frames.push_back(nullptr);
+                frame_words.push_back(spirv_spool->modules[spooled].words);
+                frame_spool.push_back(spooled);
+                frame_sizes.push_back(spirv_spool->modules[spooled].compressed_size);
+            }
+            return it->second;
+        }
+        if (const auto& copy = entry.spirv_zstd[stage]) {
+            const auto [it, inserted] =
+                frame_by_copy.try_emplace(copy.get(), static_cast<s32>(frames.size()));
+            if (inserted) {
+                add_frame(copy, entry.spirv_words[stage]);
+            }
+            return it->second;
+        }
+        return add_blob(ReusableSpirv(entry, stage));
+    };
+    Deduplicator<std::vector<u8>> infos;
+    const auto add_info = [&](const Shader::Info& info) -> s32 {
+        LichiiIO::Writer w;
+        LichiiIO::PutInfo(w, info);
+        return infos.Add(w.buffer, w.buffer);
+    };
+    // A packed info goes in as its serialization, without expanding it.
+    const auto add_packed_info = [&](const InfoRef& info) -> s32 {
+        return infos.Add(info.Bytes(), info.Bytes());
+    };
+    // Which template each translation was made with: the pipeline LICHII_PRECOMPILE_PIPELINES
+    // builds for it after a stored boot.
+    const auto template_of = [&](const ReusableStages& entry) -> u8 {
+        for (size_t i = 0; i < templates.size() && i < 0xFF; ++i) {
+            FixedPipelineState masked = ReuseState(templates[i]);
+            if (masked.dynamic_vertex_input) {
+                masked.attribute_types &= entry.attribute_mask;
+            }
+            if (SameReuseState(masked, entry.state)) {
+                return static_cast<u8>(i);
+            }
+        }
+        return 0xFF;
+    };
+
+    LichiiIO::Writer graphics;
+    graphics.Put(static_cast<u32>(entries.size()));
+    for (const auto& entry : entries) {
+        graphics.Put(entry->unique_hashes);
+        graphics.Put(entry->state);
+        graphics.Put(entry->attribute_mask);
+        graphics.Put(template_of(*entry));
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            graphics.Put(add_stage(*entry, stage));
+            graphics.Put(entry->infos[stage] ? add_packed_info(entry->infos[stage]) : s32{-1});
+        }
+        graphics.Put(static_cast<u32>(entry->queries.size()));
+        for (const auto& queries : entry->queries) {
+            LichiiIO::PutQueries(graphics, queries);
+        }
+    }
+    graphics.Put(static_cast<u32>(compute.size()));
+    for (const auto& stored : compute) {
+        graphics.Put(stored.key);
+        graphics.Put(stored.local_memory_size);
+        graphics.Put(add_blob(stored.spirv));
+        graphics.Put(add_info(stored.info));
+        LichiiIO::PutQueries(graphics, stored.queries);
+    }
+    std::vector<std::pair<u64, u32>> program_stages(precompiled_programs.begin(),
+                                                    precompiled_programs.end());
+    graphics.PutRange(program_stages);
+
+    // The index (everything but the SPIR-V) is one zstd frame read at boot; each SPIR-V module is
+    // a frame of its own, read when a pipeline needs it, so the modules stay on disk.
+    LichiiIO::Writer index;
+    index.PutRange(templates);
+    index.Put(static_cast<u32>(infos.values.size()));
+    for (const auto& info : infos.values) {
+        index.PutBytes(info.data(), info.size());
+    }
+    index.PutBytes(graphics.buffer.data(), graphics.buffer.size());
+    graphics.buffer = {};
+    const std::vector<u8> compressed_index =
+        Common::Compression::CompressDataZSTD(index.buffer.data(), index.buffer.size(), 1);
+
+    u64 modules_bytes = 0;
+    u64 spirv_bytes = 0;
+    std::vector<SpirvStore::Module> table(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        table[i] = {modules_bytes, frame_sizes[i], frame_words[i]};
+        modules_bytes += frame_sizes[i];
+        spirv_bytes += u64{frame_words[i]} * sizeof(u32);
+    }
+
+    const auto temp_path = path.string() + ".tmp";
+    {
+        std::ofstream out{temp_path, std::ios::binary | std::ios::trunc};
+        const u32 magic = PrecompileStoreMagic;
+        const u32 version = PrecompileStoreVersion;
+        const u64 index_size = index.buffer.size();
+        const u64 index_compressed = compressed_index.size();
+        const u32 module_count = static_cast<u32>(table.size());
+        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        out.write(reinterpret_cast<const char*>(&validity), sizeof(validity));
+        out.write(reinterpret_cast<const char*>(&index_size), sizeof(index_size));
+        out.write(reinterpret_cast<const char*>(&index_compressed), sizeof(index_compressed));
+        out.write(reinterpret_cast<const char*>(compressed_index.data()),
+                  static_cast<std::streamsize>(compressed_index.size()));
+        out.write(reinterpret_cast<const char*>(&module_count), sizeof(module_count));
+        out.write(reinterpret_cast<const char*>(table.data()),
+                  static_cast<std::streamsize>(table.size() * sizeof(SpirvStore::Module)));
+        for (size_t i = 0; i < frames.size(); ++i) {
+            if (frame_spool[i] >= 0) {
+                const std::vector<u8> frame = ReadSpoolFrame(frame_spool[i]);
+                if (frame.size() != frame_sizes[i]) {
+                    throw std::runtime_error("spool read failed");
+                }
+                out.write(reinterpret_cast<const char*>(frame.data()),
+                          static_cast<std::streamsize>(frame.size()));
+            } else {
+                out.write(reinterpret_cast<const char*>(frames[i]->data()),
+                          static_cast<std::streamsize>(frames[i]->size()));
+            }
+        }
+        if (!out) {
+            throw std::runtime_error("write failed");
+        }
+    }
+    {
+        // A store read earlier this session keeps the old file open.
+        std::unique_ptr<SpirvStore> old = std::move(spirv_store);
+    }
+    std::filesystem::rename(temp_path, path);
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE: stored {} translations and {} compute pipelines: index {} MiB "
+             "({} infos), {} distinct SPIR-V modules {} MiB ({} MiB compressed), in {:.1f} s",
+             entries.size(), compute.size(), compressed_index.size() >> 20, infos.values.size(),
+             frames.size(), spirv_bytes >> 20, modules_bytes >> 20,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+} catch (const std::exception& exception) {
+    LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE: could not store the translations: {}",
+                exception.what());
+}
+
+bool PipelineCache::LoadPrecompileStore(const std::filesystem::path& path, u64 validity,
+                                        std::vector<GraphicsPipelineCacheKey>& prebuild_keys,
+                                        const VideoCore::DiskResourceLoadCallback& callback) try {
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        return false;
+    }
+    u32 magic{}, version{};
+    u64 stored_validity{}, index_size{}, index_compressed{};
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&stored_validity), sizeof(stored_validity));
+    in.read(reinterpret_cast<char*>(&index_size), sizeof(index_size));
+    in.read(reinterpret_cast<char*>(&index_compressed), sizeof(index_compressed));
+    if (!in || magic != PrecompileStoreMagic || version != PrecompileStoreVersion ||
+        stored_validity != validity || index_size > (u64{8} << 30) ||
+        index_compressed > (u64{8} << 30)) {
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_PRECOMPILE: stored translations are outdated (archives, mesh states, "
+                 "driver or this build changed): translating again");
+        return false;
+    }
+    std::vector<u8> compressed(index_compressed);
+    in.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
+    std::vector<u8> raw(index_size);
+    if (!in || Common::Compression::DecompressDataZSTD(compressed, raw) != index_size) {
+        throw std::runtime_error("index decompression failed");
+    }
+    compressed = {};
+    // The SPIR-V module table; the modules follow it and stay in the file.
+    u32 module_count{};
+    in.read(reinterpret_cast<char*>(&module_count), sizeof(module_count));
+    if (!in || module_count > (1u << 24)) {
+        throw std::runtime_error("bad module table");
+    }
+    auto store = std::make_unique<SpirvStore>();
+    store->modules.resize(module_count);
+    in.read(reinterpret_cast<char*>(store->modules.data()),
+            static_cast<std::streamsize>(module_count * sizeof(SpirvStore::Module)));
+    if (!in) {
+        throw std::runtime_error("truncated module table");
+    }
+    const u64 modules_base = static_cast<u64>(in.tellg());
+    for (auto& module : store->modules) {
+        module.offset += modules_base;
+    }
+    in.close();
+    store->path = path;
+    store->file.open(path, std::ios::binary);
+    if (!store->file) {
+        throw std::runtime_error("cannot reopen the store");
+    }
+
+    LichiiIO::Reader r{raw};
+    std::vector<FixedPipelineState> templates;
+    r.GetRange(templates, 256);
+    // Each distinct info once, shared by every entry that uses it.
+    std::vector<InfoRef> infos(r.Get<u32>());
+    for (auto& info : infos) {
+        // Kept packed: expanded when a pipeline first needs it.
+        const size_t start = r.Offset();
+        LichiiIO::SkipInfo(r);
+        const auto bytes = r.Since(start);
+        auto packed = std::make_shared<PackedInfo>();
+        packed->bytes.assign(bytes.begin(), bytes.end());
+        info = InfoRef{std::move(packed)};
+    }
+    const auto module_at = [&](s32 index) -> s32 {
+        if (index >= 0 && static_cast<size_t>(index) >= module_count) {
+            throw std::runtime_error("bad SPIR-V index");
+        }
+        return index;
+    };
+    const auto info_at = [&](s32 index) -> InfoRef {
+        if (index < 0) {
+            return InfoRef{};
+        }
+        if (static_cast<size_t>(index) >= infos.size()) {
+            throw std::runtime_error("bad info index");
+        }
+        return infos[index];
+    };
+    std::vector<std::shared_ptr<ReusableStages>> entries(r.Get<u32>());
+    for (auto& entry : entries) {
+        entry = std::make_shared<ReusableStages>();
+        entry->unique_hashes = r.Get<std::array<u64, Maxwell::MaxShaderProgram>>();
+        entry->state = r.Get<FixedPipelineState>();
+        entry->state.driver_version = 0; // stores written before ReuseState cleared it
+        entry->attribute_mask = r.Get<u64>();
+        const u8 templ = r.Get<u8>();
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            entry->stored_spirv[stage] = module_at(r.Get<s32>());
+            entry->infos[stage] = info_at(r.Get<s32>());
+        }
+        const u32 query_count = r.Get<u32>();
+        if (query_count > Maxwell::MaxShaderProgram) {
+            throw std::runtime_error("bad query count");
+        }
+        for (u32 i = 0; i < query_count; ++i) {
+            entry->queries.push_back(LichiiIO::GetQueries(r));
+        }
+        if (templ < templates.size()) {
+            GraphicsPipelineCacheKey key{};
+            key.unique_hashes = entry->unique_hashes;
+            key.state = templates[templ];
+            key.state.driver_version = device.GetDriverVersion();
+            prebuild_keys.push_back(key);
+        }
+    }
+    std::vector<StoredCompute> compute(r.Get<u32>());
+    std::vector<s32> compute_modules(compute.size());
+    for (size_t i = 0; i < compute.size(); ++i) {
+        auto& stored = compute[i];
+        stored.key = r.Get<ComputePipelineCacheKey>();
+        stored.local_memory_size = r.Get<u32>();
+        compute_modules[i] = module_at(r.Get<s32>());
+        const auto info = info_at(r.Get<s32>());
+        if (compute_modules[i] < 0 || !info) {
+            throw std::runtime_error("compute entry without SPIR-V");
+        }
+        stored.info = *info;
+        stored.queries = LichiiIO::GetQueries(r);
+    }
+    std::vector<std::pair<u64, u32>> program_stages;
+    r.GetRange(program_stages);
+    if (!r.AtEnd()) {
+        throw std::runtime_error("trailing data");
+    }
+    raw = {};
+    spirv_store = std::move(store);
+
+    const size_t graphics_count = entries.size();
+    {
+        std::scoped_lock lock{reusable_stages_mutex};
+        for (auto& entry : entries) {
+            reusable_stages[HashPrograms(entry->unique_hashes)].push_back(std::move(entry));
+        }
+    }
+    precompiled_programs.insert(program_stages.begin(), program_stages.end());
+
+    // Compute pipelines are built from the stored SPIR-V (the driver's cache has them).
+    std::mutex compute_mutex;
+    std::atomic<size_t> done{};
+    // Usually a second or two, but a minute with a cold driver cache (a new executable): the
+    // same loading bar shows how far it is.
+    const size_t compute_total = compute.size();
+    if (std::ofstream hint{path.parent_path() / "lichii_precompile_effects.count", std::ios::trunc}) {
+        hint << compute_total << std::endl;
+    }
+    if (callback && compute_total != 0) {
+        callback(VideoCore::LoadCallbackStage::Build, loading_base, loading_base + compute_total);
+    }
+    for (size_t i = 0; i < compute.size(); ++i) {
+        auto& stored = compute[i];
+        const s32 module = compute_modules[i];
+        precompiled_compute_programs.emplace(stored.key.unique_hash, stored.key);
+        if (compute_cache.find(stored.key) != compute_cache.end()) {
+            done.fetch_add(1);
+            continue;
+        }
+        workers.QueueWork([this, &stored, module, &compute_mutex, &done] {
+            SCOPE_EXIT {
+                done.fetch_add(1);
+            };
+            try {
+                auto pipeline = std::make_unique<ComputePipeline>(
+                    device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                    guest_descriptor_queue, descriptor_buffer_ring, nullptr, nullptr,
+                    nullptr, stored.info, BuildShader(device, ReadStoredSpirv(module)),
+                    stored.key.unique_hash);
+                std::scoped_lock lock{compute_mutex};
+                compute_cache.emplace(stored.key,
+                                      ComputePipelineCacheEntry{.pipeline = std::move(pipeline)});
+                precompiled_compute.emplace(
+                    stored.key, PrecompiledCompute{std::move(stored.queries),
+                                                   stored.local_memory_size});
+            } catch (const std::exception& exception) {
+                LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE compute {:016x} failed: {}",
+                            stored.key.unique_hash, exception.what());
+            }
+        });
+    }
+    if (callback && compute_total != 0) {
+        size_t shown = 0;
+        while (done.load() < compute_total) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            const size_t now = done.load();
+            if (now != shown) {
+                shown = now;
+                callback(VideoCore::LoadCallbackStage::Build, loading_base + now,
+                         loading_base + compute_total);
+            }
+        }
+    }
+    workers.WaitForRequests({});
+    LOG_INFO(Render_Vulkan,
+             "LICHII_PRECOMPILE: read {} translations and {} compute pipelines ({} infos)",
+             graphics_count, compute.size(), infos.size());
+    return true;
+} catch (const std::exception& exception) {
+    LOG_WARNING(Render_Vulkan, "LICHII_PRECOMPILE: could not read the stored translations: {}",
+                exception.what());
+    return false;
 }
 
 } // namespace Vulkan

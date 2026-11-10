@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "common/frame_gen_stats.h"
 #include "core/perf_stats.h"
 #include "performance_overlay.h"
 #include "ui_performance_overlay.h"
@@ -102,6 +103,15 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
 
         QString fpsText = tr("%1 fps").arg(std::round(fps), 0, 'f', 0);
         // if (!m_fpsSuffix.isEmpty()) fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
+        // DLSS Frame Generation: what reaches the screen, generated frames included.
+        if (const double shown = Common::FrameGenStats::shown_fps.load(std::memory_order_relaxed);
+            Common::FrameGenStats::active.load(std::memory_order_relaxed) &&
+            Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed) &&
+            shown > fps * 1.2) {
+            fpsText = tr("%1 fps (%2 real)")
+                          .arg(std::round(shown), 0, 'f', 0)
+                          .arg(std::round(fps), 0, 'f', 0);
+        }
         ui->fps->setText(fpsText);
 
         // sampling

@@ -30,7 +30,7 @@ namespace FritchiiUi {
 /// when the Fritchii UI is off.
 bool ApplyTheme();
 
-/// Settings the Fritchii settings pages leave out (frame generation and its dev options).
+/// Settings the Fritchii settings pages leave out (frame generation's dev options).
 [[nodiscard]] bool HidesSetting(const std::string& label);
 
 /// A bundled line icon (fritchii/icons/<name>.svg): grey, and violet when checked.
@@ -51,9 +51,16 @@ struct GraphicsHooks {
     std::function<bool()> renderer_locked;  ///< the renderer can't change while a game runs
     std::function<void()> open_settings;
     std::function<void()> open_effects;     ///< empty without ReShade-style effects
+    std::function<bool()> game_running;     ///< Lichii mod: DLSS changes need a game restart
+    std::function<void()> restart_game;
 };
-/// The status bar's one "Graphics" button: renderer, accuracy, filter, anti-aliasing, effects.
+/// The status bar's one "Graphics" button: renderer, accuracy, filter, anti-aliasing, NVIDIA
+/// DLSS (Lichii mod), effects.
 [[nodiscard]] QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks);
+
+/// Lichii mod: the status bar's "Frame Gen 2x" switch (DLSS Frame Generation). At once when the
+/// running game was started with it, else for the next start.
+[[nodiscard]] QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks);
 
 /// A settings page as the settings dialog shows it: inside a scroll area in Fritchii builds, so
 /// the window keeps a normal size with the larger type; the page itself otherwise.
