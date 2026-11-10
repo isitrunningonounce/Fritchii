@@ -145,6 +145,9 @@ struct Nx2VideoDecoder::Impl {
     std::unique_ptr<FFmpeg::HardwareContext> hardware;
     std::unique_ptr<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
+    /// The source matrix and range the scaler was set up for (-1: none yet).
+    int scaler_space{-1};
+    bool scaler_full_range{};
     bool open{};
     bool ever_open{};
     bool using_hardware{};
@@ -450,16 +453,6 @@ void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureForma
         }
         return;
     }
-    impl->scaler = sws_getCachedContext(impl->scaler, f->width, f->height,
-                                        static_cast<AVPixelFormat>(f->format),
-                                        static_cast<int>(width), static_cast<int>(height), target,
-                                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (impl->scaler == nullptr) {
-        LOG_ERROR(HW_GPU, "nx2 video: cannot convert {} to {}",
-                  av_get_pix_fmt_name(static_cast<AVPixelFormat>(f->format)),
-                  av_get_pix_fmt_name(target));
-        return;
-    }
     // The stream's matrix and range; untagged HD video is BT.709.
     int space = SWS_CS_ITU601;
     if (f->colorspace == AVCOL_SPC_BT709 ||
@@ -474,6 +467,25 @@ void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureForma
                                   f->format == AV_PIX_FMT_YUVJ444P ||
                                   f->format == AV_PIX_FMT_YUVJ440P ||
                                   f->format == AV_PIX_FMT_YUVJ411P;
+    // A cached scaler moved from limited back to full range keeps converting as limited, so a
+    // change of matrix or range builds a new one.
+    if (impl->scaler != nullptr &&
+        (impl->scaler_space != space || impl->scaler_full_range != full_range_source)) {
+        sws_freeContext(impl->scaler);
+        impl->scaler = nullptr;
+    }
+    impl->scaler = sws_getCachedContext(impl->scaler, f->width, f->height,
+                                        static_cast<AVPixelFormat>(f->format),
+                                        static_cast<int>(width), static_cast<int>(height), target,
+                                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (impl->scaler == nullptr) {
+        LOG_ERROR(HW_GPU, "nx2 video: cannot convert {} to {}",
+                  av_get_pix_fmt_name(static_cast<AVPixelFormat>(f->format)),
+                  av_get_pix_fmt_name(target));
+        return;
+    }
+    impl->scaler_space = space;
+    impl->scaler_full_range = full_range_source;
     const int* coefficients = sws_getCoefficients(space);
     sws_setColorspaceDetails(impl->scaler, coefficients, full_range_source, coefficients,
                              format != Nx2PictureFormat::Nv12, 0, 1 << 16, 1 << 16);

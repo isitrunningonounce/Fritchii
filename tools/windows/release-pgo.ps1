@@ -4,8 +4,11 @@
 <#
 Builds the Windows release of a build-N tag and adds it to that tag's GitHub release.
 
-Start the release-binaries workflow first: it creates the tag, builds Linux and leaves a draft
-release. While it runs, check out the tag and build from the repository root:
+tools/release-local.ps1 makes the whole release on this PC and runs this script with -BuildOnly:
+the tag must then exist here at HEAD, and the script stops after the zip.
+
+Without it, start the release-binaries workflow first: it creates the tag, builds Linux and leaves
+a draft release. While it runs, check out the tag and build from the repository root:
 
     git fetch origin refs/tags/build-12:refs/tags/build-12
     git switch --detach build-12
@@ -20,6 +23,7 @@ Without -Publish it stays a draft.
 param(
     [Parameter(Mandatory)][ValidatePattern('^build-[1-9][0-9]*$')][string]$Tag,
     [switch]$Publish,
+    [switch]$BuildOnly,
     [string]$Repo = 'isitrunningonounce/Fritchii',
     [string]$PgoProfile = 'build/lto-pgo/fritchii.profdata',
     [string]$InitialCache = 'build/lto-pgo/baseline-options.cmake',
@@ -37,18 +41,20 @@ function Invoke-Native([string]$What, [scriptblock]$Command) {
     if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
 }
 
-$root = (git rev-parse --show-toplevel).Trim()
+$root = (git -C $PSScriptRoot rev-parse --show-toplevel).Trim()
 $build = (Join-Path $root $BuildDir) -replace '\\', '/'
 $package = Join-Path $root "out/Fritchii-$Tag"
 $zip = "$build/release/$Asset"
 
-# Releases are made as the repository owner only, never from another signed-in account.
-$owner = $Repo.Split('/')[0]
-$login = (gh api user --jq .login).Trim()
-if ($login -ne $owner) { throw "gh is signed in as '$login'. Run: gh auth switch -u $owner" }
+if (-not $BuildOnly) {
+    # Releases are made as the repository owner only, never from another signed-in account.
+    $owner = $Repo.Split('/')[0]
+    $login = (gh api user --jq .login).Trim()
+    if ($login -ne $owner) { throw "gh is signed in as '$login'. Run: gh auth switch -u $owner" }
+    Invoke-Native 'Fetching the tag' { git -C $root fetch --quiet origin "refs/tags/${Tag}:refs/tags/${Tag}" }
+}
 
 # The zip has to be the tagged commit: the tag is what the update checker compares.
-Invoke-Native 'Fetching the tag' { git -C $root fetch --quiet origin "refs/tags/${Tag}:refs/tags/${Tag}" }
 $tagCommit = (git -C $root rev-parse "$Tag^{commit}").Trim()
 $head = (git -C $root rev-parse HEAD).Trim()
 if ($tagCommit -ne $head) { throw "HEAD is $head, but $Tag is $tagCommit. Run: git switch --detach $Tag" }
@@ -106,6 +112,9 @@ Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -CompressionLevel Optimal
 Write-Host "Package: $package"
 Write-Host "Zip: $zip ($([math]::Round((Get-Item $zip).Length / 1MB)) MiB)"
+if ($BuildOnly) {
+    return
+}
 
 # The workflow creates the draft after the Linux build, which can still be running.
 $number = [int]$Tag.Substring('build-'.Length)

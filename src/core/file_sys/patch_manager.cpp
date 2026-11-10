@@ -93,6 +93,27 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
 };
 
+// Yoshi and the Mysterious Book's gameplay render mode (3) sets r.ScreenPercentage 50 with TSR
+// (960x540 docked), and its menu mode (2) enables dynamic resolution, which settles near 1400x788
+// under emulated GPU timing. Gameplay now uses 100, and the menu mode leaves dynamic resolution off.
+constexpr std::array<u8, 4> MOV_W8_100{0x88, 0x0C, 0x80, 0x52};
+constexpr std::array<u8, 4> MOV_W1_100{0x81, 0x0C, 0x80, 0x52};
+constexpr std::array<u8, 4> MOV_W1_0{0x01, 0x00, 0x80, 0x52};
+constexpr std::array YOSHI_MAX_RESOLUTION_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x582D65C,
+                       .bytes = MOV_W8_100,
+                       .checked = true,
+                       .original = 0x52800648}, // mov w8, #50 (stored screen percentage)
+    BuiltinPatchRecord{.module_offset = 0x582D670,
+                       .bytes = MOV_W1_100,
+                       .checked = true,
+                       .original = 0x52800641}, // mov w1, #50 ("r.ScreenPercentage %d")
+    BuiltinPatchRecord{.module_offset = 0x582D5F0,
+                       .bytes = MOV_W1_0,
+                       .checked = true,
+                       .original = 0x52800021}, // mov w1, #1 (r.DynamicRes.OperationMode)
+};
+
 // Dynamic FPS by Dark (Eglantine Dev), bundled with his permission: the game's frame step follows
 // the time measured with the system counter instead of assuming 30 fps, so it runs at full speed
 // at any frame rate. A call (bl 0x3c46200) to a routine in unused space after the code.
@@ -303,6 +324,14 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = POLL_BACKOFF_RECORDS,
         .enable_env = "EDEN_NX2_OOT_POLL_BACKOFF",
+    },
+    BuiltinPatch{
+        .name = "Max Resolution (built-in)",
+        .title_id = 0x0400245021D2C000,
+        .module = "main",
+        .build_id = "893C30E75521AFB8B23326EB6AA0E2DC",
+        .records = YOSHI_MAX_RESOLUTION_RECORDS,
+        .disable_env = "EDEN_NX2_NO_MAX_RES",
     },
 };
 

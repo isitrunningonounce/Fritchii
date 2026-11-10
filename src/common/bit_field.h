@@ -84,11 +84,23 @@
  * sizeof(StorageType).
  * TODO(neobrain): Confirm that this is a proper fix and not just masking
  * symptoms.
+ *
+ * 3)
+ * Each BitField of a union is its own type, and GCC's type-based alias analysis
+ * assumes a store through one cannot change another: assigning a field could
+ * then read the word as it was before its neighbours were assigned and drop
+ * their bits. may_alias lets BitField accesses alias anything, as a union of
+ * them needs. MSVC and clang-cl do no type-based alias analysis.
  */
+#if defined(__GNUC__) || defined(__clang__)
+#define COMMON_BIT_FIELD_MAY_ALIAS [[gnu::may_alias]]
+#else
+#define COMMON_BIT_FIELD_MAY_ALIAS
+#endif
 #pragma pack(1)
 template <std::size_t Position, std::size_t Bits, typename T, typename EndianTag = LETag>
     requires std::is_trivially_copyable_v<T>
-struct BitField {
+struct COMMON_BIT_FIELD_MAY_ALIAS BitField {
 private:
     // UnderlyingType is T for non-enum types and the underlying type of T if
     // T is an enumeration. Note that T is wrapped within an enable_if in the
@@ -165,6 +177,7 @@ private:
     static_assert(bits > 0, "Invalid number of bits");
 };
 #pragma pack()
+#undef COMMON_BIT_FIELD_MAY_ALIAS
 
 template <std::size_t Position, std::size_t Bits, typename T>
 using BitFieldBE = BitField<Position, Bits, T, BETag>;

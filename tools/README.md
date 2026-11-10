@@ -30,6 +30,9 @@ Tools for Eden and other subprojects. When adding new scripts please use `#!/bin
 - `find-unused-strings.sh`: Find any unused strings in the Android app (XML -> Kotlin).
 - `cpp-lint.sh`: Homemade dumb C++ linter.
 - `fuzzsettings.cpp`: Fuzz settings files.
+- `release-local.ps1`: Builds a Fritchii release on the Windows release PC: the PGO zip, then the Linux tar.gz and AppImage in WSL. Tags it build-N and, with `-Draft` or `-Publish`, uploads it to GitHub.
+- `windows/release-pgo.ps1`: The Windows clang-cl LTO + PGO release build.
+- `linux/release-build.sh`: The Linux x86_64 release build (Ubuntu 24.04 or WSL).
 
 ## Android
 

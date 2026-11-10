@@ -1,16 +1,24 @@
 <!--
-Fritchii's "What's new" notes for this build: paste the release notes (the GitHub release body,
-e.g. E:\OotRemakeEmulation\release\fritchii-vX\notes.md) here before the release build. The
-download instructions at the top are dropped in the app. While this file holds only this comment,
-no "What's new" window pops up after an update (Help > What's New says there are no notes yet).
+Fritchii's "What's new" notes for this build. The app shows them after an update, and
+tools/release-local.ps1 publishes them as the GitHub release notes under the download links, so
+write them before the release build. Keep a "---" line out of the first 20 lines: the app drops
+whatever is above one when it mentions downloads. While this file holds only this comment, no
+"What's new" window pops up after an update (Help > What's New says there are no notes yet).
 -->
-## ⬇️ Download this file: **`Fritchii-v5.6-Windows-x64.zip`**
+This build is Fritchii v5.6 with this fork's fixes for Yoshi and the Mysterious Book, Mario Kart World and Star Fox. Expect one full "Preparing shaders" run after updating (see v5.6 below).
 
-On Fritchii v4 to v5.5 you don't need to download anything: it offers this update when you open it. Otherwise unzip it anywhere and run `Fritchii-v5.6\lichii.exe`. Don't download "Source code (zip)" or "Source code (tar.gz)": they contain no emulator.
+### Fixed in this build
+- **Yoshi and the Mysterious Book renders at full resolution.** The game draws gameplay at a fixed 50% (960x540 docked) and drops its menus to dynamic resolution (about 1400x788); both now render at your full output resolution. It's built in and on by default, so the "Full Resolution" mod isn't needed any more. Turn "Max Resolution (built-in)" off in the game's Add-Ons to go back.
+- **Yoshi and the Mysterious Book: gameplay shaders the emulator couldn't translate now run**: the colour lookup pass, texture gathers through bindless handles and several compute shaders (ported from Eglantine #762 and upstream nx2).
+- **Mario Kart World: characters are no longer dark.** The lighting probes the game reads were cut off by an 8 MiB limit on GPU storage buffers.
+- **Star Fox runs the game's own upscaler** instead of a stand-in: the images it writes now reach the buffers it reads them back from. **Its opening cinematic is back to 30 fps** (it had dropped to 19).
+- **Videos keep the right colours** after one switches from limited back to full colour range. Its frames were still converted as limited, which crushed blacks and blew out whites.
 
----
+### New in this build
+- **Updates come from this fork:** builds are named build-N and check this repository's releases for the next one.
+- **Linux:** an AppImage that uses Wayland when it's available (X11 otherwise), and a tar.gz that uses your system's libraries.
 
-Fritchii v5.6.
+### Fritchii v5.6
 
 **Heads up: "Preparing shaders" runs once more** (around 15 minutes on an 8-core CPU), on every GPU, because of the AMD horizon fix below and a new detail Fritchii now stores about each shader. After that it's straight into the game again. The first minute or two after it can also be a bit slower while the driver settles.
 
@@ -45,71 +53,3 @@ Fritchii v5.6.
 - **Fewer dips in busy spots:** a depth buffer that the game clears right away is no longer copied in from game memory first (7.5 MB every frame in Castle Town, the cause of an NVIDIA player's dips). About +2.5 fps in Castle Town.
 - **Texture memory on 10 GB and bigger cards** can fill further before the cleanup starts (zortos293/Lichii#1129 by Liomar Oliveira).
 - **FXAA is off by default.** OoT's own anti-aliasing (or DLSS) already smooths edges, FXAA on top only blurred the picture. Fritchii's tuned settings are applied once more with this update; you can change anything afterwards.
-
-### In v5.5
-
-- **No more flickering camera for players who had frame generation on before v5.** Fritchii has no frame generation, but an old setting kept it running in the background (and turned off Fritchii's frame pacing). It can't run anymore.
-- **Extended Dynamic State is set back to EDS2 once.** Players who set it to Disabled or EDS3 (often an old AMD crash tip) had "Preparing shaders" skip almost every shader. EDS2 is what the shaders are recorded with, and the AMD crash that tip avoided is fixed since v5.3. You can still change it afterwards.
-- **NVIDIA: the shader cache size is set by Fritchii itself.** Newer drivers no longer show "Shader Cache Size" in the NVIDIA Control Panel. Fritchii now tells the driver to keep a large cache for Fritchii only, nothing else on your PC changes.
-- **DLSS fixes:** the "Use NVIDIA DLSS" checkbox could be overridden by an old per-game value and show unchecked in game; it's a global setting now. New **DLSS preset** option (Default, J, K recommended, L, M) in Graphics.
-- Graphics > Extensions now says it: GPU thread pinning is built in and on automatically.
-- The old "Prepare Shaders" window says it's the optional quick warm-up (the full preparation runs by itself when you start the game).
-
-### In v5.4
-
-- **AMD: "Preparing shaders" now prepares the whole game.** Until now it skipped 116,373 of OoT's 120,461 shaders on AMD (it finished in seconds) because they were recorded on an NVIDIA card, which handles one GPU setting (the dynamic logic operation) differently. Fritchii now converts them for AMD's driver: all of them get prepared, so new areas play like you've been there before, as on NVIDIA. Thanks to koriko for the log that pinned it.
-- **AMD: expect a full "Preparing shaders" screen once** (around 15 minutes on an 8-core CPU), even if you went through it on v5.x. After that it's straight into the game.
-- Nothing changes on NVIDIA.
-
-### In v5.3
-
-- **AMD: Shader libraries are really off by default now.** v5.2 meant to turn them off on AMD's Windows driver but its check never matched, so RX 5000/6000 cards kept crashing while loading shaders. If you unticked the setting yourself, nothing changes for you.
-- **Updates retry by themselves.** When GitHub's file server answers with an error like 504 or the connection drops, Fritchii now tries again a couple of times before giving up (from the next update on).
-
-### In v5.2
-
-- **GTX 10 series and older: invisible geometry is drawn again.** Objects the game draws with mesh shaders, which these cards lack, now go through a compute fallback (zortos's prototype, zortos293/Lichii#569, #642, #841). Some foliage or walls may still be missing or flicker.
-- **AMD: textures no longer write into other textures' memory.** Images whose size isn't a multiple of their block size wrote past their edge while being decoded. NVIDIA ignores that, AMD put it in other textures: black blocks, a crosshatch, and in the end a GPU crash. From CheezerWheezer's AMD fork.
-- **AMD (Windows driver): Shader libraries are off by default.** RX 5000 and 6000 cards crashed building them; unticking the setting was the workaround, now it's automatic. NVIDIA keeps them.
-- **The full right-click menu is back on the home screen** (Open Mod Data Location, Dump RomFS, Remove, Verify Integrity, Start Game without Custom Configuration...), for modders.
-- **No more crash when the PC's memory budget is reached** during long sessions (seen in Castle Town after half an hour). Buffers in system memory may now go over Windows' budget, like textures already could. Also from CheezerWheezer's AMD fork.
-
-### In v5.1
-
-- **Dialogue text no longer turns into scraps of other textures.** Each new text box size could show garbage the first time it appeared.
-- **Delete Shader Cache** in the Help menu (and when you right-click the game on the home screen), with a confirmation. Only for a cache that went bad: the shaders are prepared again on the next start.
-- **AMD: likely fix for a crash right after pressing Play** (seen on an RX 6600 with a shader cache from v4). v5's change for the red line in the Royal Family's Tomb is taken back for now, so that line can show again on AMD until it's redone and tested on AMD hardware.
-- One v5 change to how GPU memory is refreshed after small writes is taken back too: in this emulator it could bring back stale data.
-- **4K and scaled displays:** Fritchii follows the scale set in Windows, as far as your screen leaves room for its windows. 150% on a 4K screen used to become 200% (windows too big, dialogs cut off) and 125% became 100% (tiny text).
-- **Game Settings fits the screen:** long tabs scroll, the window resizes, and OK / Apply are always reachable.
-
-### Everything new in v5
-
-Windows x64. Tested with The Legend of Zelda: Ocarina of Time (0400486024DEC000) on a Ryzen 7 7800X3D + RTX 4080: stable 60 fps in a lot of places, rarely under 45 even in the heaviest ones (Water Temple included), no shader stutter after the preparation.
-
-#### New
-- **Shaders are prepared once, before you play.** The first time you start OoT, a "Preparing shaders" screen builds the game's shaders at full speed (about 15 minutes on an 8-core CPU, once). After that, places you visit for the first time play like you've been there before: walking into a new area used to freeze for ~0.7 s per new shader, now it's 40-70 ms, and loads are shorter. A new driver or GPU prepares them again. Built on zortos's precompile work (zortos293/Lichii#895, #896).
-- **New look.** Graphite theme, a home screen, an in-app "What's new", and Help > Export Log for bug reports.
-- **In-game controls.** Move the mouse to the top of the game for Pause, Restart, Stop, Fullscreen and the menus.
-- **New performance graph** (View > Performance Overlay): big fps, frame time, the lowest recent fps and a line against 60 (or 30). Loading screens leave a gap instead of a dip.
-
-#### Faster
-- **Moving NPCs and crowds no longer drag the frame rate down.** About +3 fps in Castle Town from each of the fixes behind it (render target relocation, image pool, an exact frame clock, cleanup of stale copies), and ~2.4 GB less video memory (8.8 to 6.4 GB in Castle Town).
-- **~2.3 GB less RAM**, so 16 GB PCs have more room.
-- **Windows 11: a precise game clock** built in. Players who got big gains from the GlobalTimerResolutionRequests registry tweak get it without the tweak.
-- Shader translation moved off the GPU thread.
-- Retrained profile-guided build on the new code.
-
-#### Fixed
-- **New players: "Press Start", chat bubbles and lighting** are right on an empty shader cache (they were missing or wrong while shaders were still building).
-- **Objects that could vanish for a whole session** in some games (clip distances, zortos293/Lichii#902).
-- **Fastmem kept on PCs with little free memory** instead of silently running 20-25% slower (zortos293/Lichii#645).
-- Less RAM while shaders are prepared (#878), a rare channel deadlock (#609), mods folders that don't exist (#686), Windows long paths (#576), and a few smaller ones (#918, #727, #610).
-
-#### Shader cache
-- The cache moves to version 54 (zortos's numbering), so caches from zortos's builds and Fritchii's are shared. The first start copies your old cache once (about +1.2 GB for OoT). The old `v52` file stays so you can roll back to v4; you can delete it later if you don't plan to.
-
-#### Known
-- AMD and Intel changes could not be tested on that hardware here: please report problems with your GPU model and the log (Help > Export Log).
-
-Dynamic FPS by Dark (built-in). Thanks to zortos293 and every Lichii contributor whose work is in here, and to the **Ocarina of Forks** Discord for the moral support, the novel ideas and the debugging help.

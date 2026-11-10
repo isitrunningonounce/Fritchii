@@ -2,7 +2,9 @@ name: release-binaries
 
 # Started by hand from the Actions tab. It tags the commit build-<run number>, builds Linux x86_64
 # and leaves a draft release. tools/windows/release-pgo.ps1 then builds the Windows zip on the
-# owner's PC from that tag, uploads it and publishes the release.
+# owner's PC from that tag, uploads it and publishes the release. tools/release-local.ps1 makes a
+# whole release on that PC instead; its tags take build numbers too, and a run whose number is
+# already a tag on another commit stops at "Prepare release tag".
 on:
   workflow_dispatch:
     inputs:
@@ -417,9 +419,20 @@ jobs:
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
           # Qt 6's Wayland client plugin and an AppRun that prefers it under Wayland, from
-          # Frizti/Fritchii#37.
+          # Frizti/Fritchii#37. That PR names libqwayland.so, which Qt 6.8.3 doesn't have (it ships
+          # libqwayland-egl.so and libqwayland-generic.so), so deploy whichever this Qt has.
           export EXTRA_QT_MODULES=waylandclient
-          export EXTRA_PLATFORM_PLUGINS='libqwayland.so'
+          ls "$QT_ROOT_DIR/plugins/platforms"
+          wayland=()
+          for plugin in libqwayland.so libqwayland-egl.so libqwayland-generic.so; do
+            if [ -f "$QT_ROOT_DIR/plugins/platforms/$plugin" ]; then wayland+=("$plugin"); fi
+          done
+          if [ ${#wayland[@]} -eq 0 ]; then
+            echo "No Qt Wayland platform plugin in $QT_ROOT_DIR/plugins/platforms"
+            exit 1
+          fi
+          EXTRA_PLATFORM_PLUGINS=$(IFS=';'; echo "${wayland[*]}")
+          export EXTRA_PLATFORM_PLUGINS
           # Embedded in the AppImage metadata; matches the release tag (build-N) plus the commit.
           export LINUXDEPLOY_OUTPUT_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           export LDAI_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"

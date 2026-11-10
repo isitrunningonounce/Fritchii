@@ -39,6 +39,22 @@ constexpr u32 TbzInstruction = 0x360041E8;
 constexpr u32 BranchInstruction = 0x1400020F;
 constexpr u32 NopInstruction = 0xD503201F;
 
+constexpr u64 YoshiTitleId = 0x0400245021D2C000;
+constexpr FileSys::PatchManager::BuildID YoshiBuildId{
+    0x89, 0x3C, 0x30, 0xE7, 0x55, 0x21, 0xAF, 0xB8,
+    0xB2, 0x33, 0x26, 0xEB, 0x6A, 0xA0, 0xE2, 0xDC,
+};
+struct YoshiWord {
+    size_t module_offset;
+    u32 original;
+    u32 patched;
+};
+constexpr std::array<YoshiWord, 3> YoshiWords{{
+    {0x582D65C, 0x52800648, 0x52800C88}, // mov w8, #50 -> #100
+    {0x582D670, 0x52800641, 0x52800C81}, // mov w1, #50 -> #100
+    {0x582D5F0, 0x52800021, 0x52800001}, // mov w1, #1 -> #0
+}};
+
 constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 6> TestDirectories{{
     {Common::FS::EdenPath::NANDDir, "nand"},
     {Common::FS::EdenPath::SDMCDir, "sdmc"},
@@ -294,6 +310,40 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
 
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
     REQUIRE_FALSE(builtin_enabled());
+}
+
+TEST_CASE("Built-in Max Resolution patch sets Yoshi's gameplay screen percentage to 100",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    std::vector<u8> nso(sizeof(Loader::NSOHeader) + 0x582D680);
+    Loader::NSOHeader header{};
+    header.magic = Common::MakeMagic('N', 'S', 'O', '0');
+    header.build_id = YoshiBuildId;
+    std::memcpy(nso.data(), &header, sizeof(header));
+    for (const auto& word : YoshiWords) {
+        std::memcpy(nso.data() + sizeof(header) + word.module_offset, &word.original,
+                    sizeof(word.original));
+    }
+    const auto word_at = [](const std::vector<u8>& image, size_t module_offset) {
+        u32 word;
+        std::memcpy(&word, image.data() + sizeof(Loader::NSOHeader) + module_offset, sizeof(word));
+        return word;
+    };
+
+    SECTION("Matching originals apply every record") {
+        const auto out = context.Manager(YoshiTitleId).PatchNSO(nso, "main");
+        for (const auto& word : YoshiWords) {
+            REQUIRE(word_at(out, word.module_offset) == word.patched);
+        }
+    }
+
+    SECTION("One wrong original skips every record") {
+        std::memcpy(nso.data() + sizeof(header) + YoshiWords[1].module_offset, &NopInstruction,
+                    sizeof(NopInstruction));
+        const auto out = context.Manager(YoshiTitleId).PatchNSO(nso, "main");
+        REQUIRE(word_at(out, YoshiWords[0].module_offset) == YoshiWords[0].original);
+        REQUIRE(word_at(out, YoshiWords[2].module_offset) == YoshiWords[2].original);
+    }
 }
 
 TEST_CASE("Built-in patches preserve user overrides on already-patched input", "[patch_manager]") {
