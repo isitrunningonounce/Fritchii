@@ -94,13 +94,14 @@ std::optional<std::vector<u8>> ReadWholeFile(const std::filesystem::path& path) 
     return bytes;
 }
 
-std::filesystem::path RecipeDirectory() {
+/// The "recipes" folder shipped next to the executable.
+std::filesystem::path RecipesDir() {
 #ifdef _WIN32
     return Common::FS::GetExeDirectory() / "recipes";
 #else
     std::error_code error;
     const auto exe = std::filesystem::read_symlink("/proc/self/exe", error);
-    return error ? std::filesystem::path{} : exe.parent_path() / "recipes";
+    return error ? std::filesystem::path{"recipes"} : exe.parent_path() / "recipes";
 #endif
 }
 
@@ -161,7 +162,7 @@ std::optional<Recipe> FindRecipe(u64 title_id, const std::filesystem::path& titl
         forced != nullptr && *forced != '\0') {
         candidates.emplace_back(forced);
     }
-    for (const auto& folder : {title_dir, RecipeDirectory()}) {
+    for (const auto& folder : {title_dir, RecipesDir()}) {
         std::error_code error;
         std::vector<std::filesystem::path> found;
         for (std::filesystem::directory_iterator it{folder, error}, end; !error && it != end;
@@ -211,7 +212,7 @@ std::filesystem::path EnsurePrecompiledFile(u64 title_id, const std::filesystem:
                      "Precompiled pipelines: no {} and no recipe for {:016X} (looked in {} and {})",
                      precompiled.filename().string(), title_id,
                      Common::FS::PathToUTF8String(title_dir),
-                     Common::FS::PathToUTF8String(RecipeDirectory()));
+                     Common::FS::PathToUTF8String(RecipesDir()));
             return {};
         }
         return precompiled;
