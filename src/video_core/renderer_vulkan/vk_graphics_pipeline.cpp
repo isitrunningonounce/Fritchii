@@ -22,6 +22,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/color_feedback.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/lichii_dynamic_rendering.h"
 #include "video_core/renderer_vulkan/lichii_shader_object_cache.h"
@@ -969,6 +970,7 @@ bool GraphicsPipeline::VerifyTextureMemo(std::span<const VideoCommon::ImageViewI
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     zero_texture_handles = 0;
+    const bool native_color_feedback = gpu_memory->UsesNativeTiling();
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -1180,6 +1182,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     bool memo_hit = false;
     bool memo_verify = false;
     TextureCache::TextureMemoState memo_state{};
+    if (native_color_feedback) {
+        texture_cache.UpdateRenderTargets(false);
+    }
     {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         if (texture_memo_on) {
@@ -1216,6 +1221,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     ASSERT(samplers.size() == num_textures);
+    const auto prepare_render_targets = [&] {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        // Image preparation can change aliases or scaling after the initial target update.
+        texture_cache.UpdateRenderTargets(false);
+        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+        texture_cache.CheckFeedbackLoop(view_span);
+        if (scheduler.HasFragmentBarrier() &&
+            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+        }
+    };
+    if (native_color_feedback) {
+        prepare_render_targets();
+        texture_cache.BeginColorFeedbackDraw();
+    }
     mark();
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         u64 textures = 0;
@@ -1392,6 +1412,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 // Libraries: the fragment stage's rescaling bits start at fixed indices.
                 rescaling.Seek(GPL_FRAGMENT_TEXTURE_SCALING_BASE, GPL_FRAGMENT_IMAGE_SCALING_BASE);
             }
+            const Shader::Info& stage_info{stage_infos[stage]};
+            const auto* stage_views = views_it;
+            const size_t first_texture = guest_descriptor_queue.UpdateCount();
             if (memo_hit) {
                 // The stage's textures as the pipeline's previous draw pushed them (only sampled
                 // textures: no image descriptors to mark modified).
@@ -1416,6 +1439,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             } else {
                 PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                      rescaling, samplers_it, views_it);
+            }
+            const size_t texture_count = Shader::NumDescriptors(stage_info.texture_descriptors);
+            if (native_color_feedback && texture_count != 0) {
+                const auto* sampled_views =
+                    stage_views + Shader::NumDescriptors(stage_info.texture_buffer_descriptors) +
+                    Shader::NumDescriptors(stage_info.image_buffer_descriptors);
+                ApplyColorFeedbackCopies(
+                    stage_info.texture_descriptors, std::span{sampled_views, texture_count},
+                    std::span{guest_descriptor_queue.UpdateData() + first_texture, texture_count},
+                    [&](VideoCommon::ImageViewId view) -> VkImageView {
+                        const auto copied = texture_cache.CopyColorFeedbackView(view);
+                        return copied ? texture_cache.GetImageView(copied).Handle(
+                                            Shader::TextureType::Color2D)
+                                      : VK_NULL_HANDLE;
+                    });
             }
         }
         const auto& info{stage_infos[stage]};
@@ -1481,15 +1519,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.any_buffer_uploaded = false;
     }
     mark();
-    {
-        Profile::Scope scope{Profile::Zone::RenderTargets};
-        texture_cache.UpdateRenderTargets(false);
-        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
-        texture_cache.CheckFeedbackLoop(view_span);
-        if (scheduler.HasFragmentBarrier() &&
-            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
-            scheduler.RequestOutsideRenderPassOperationContext();
-        }
+    if (!native_color_feedback) {
+        prepare_render_targets();
     }
     if (IsBuilt() && ((!pipeline && !uses_shader_objects) || build->Failed())) {
         return false;
@@ -1511,8 +1542,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (total > 4.0 && logged.fetch_add(1, std::memory_order_relaxed) < 300) {
             LOG_WARNING(Render_Vulkan,
                         "Slow configure {:.2f} ms (shaders {:016x}/{:016x}): sync {:.2f}, handles "
-                        "{:.2f}, image views {:.2f}, texture buffers {:.2f}, update buffers {:.2f}, "
-                        "descriptors {:.2f}, stage buffers+push {:.2f}, render targets {:.2f}, "
+                        "{:.2f}, image views+targets {:.2f}, texture buffers {:.2f}, update "
+                        "buffers {:.2f}, "
+                        "descriptors {:.2f}, stage buffers+push {:.2f}, late targets {:.2f}, "
                         "configure draw {:.2f}",
                         total, key.unique_hashes[1], key.unique_hashes[5], ms(0), ms(1), ms(2),
                         ms(3), ms(4), ms(5), ms(6), ms(7), ms(8));
