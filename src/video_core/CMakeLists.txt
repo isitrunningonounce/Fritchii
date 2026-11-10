@@ -194,6 +194,7 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/color_feedback.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
@@ -323,6 +324,7 @@ add_library(video_core STATIC
     surface.h
     texture_cache/accelerated_swizzle.cpp
     texture_cache/accelerated_swizzle.h
+    texture_cache/color_feedback.h
     texture_cache/decode_bc.cpp
     texture_cache/decode_bc.h
     texture_cache/descriptor_table.h

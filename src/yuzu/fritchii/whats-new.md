@@ -8,6 +8,7 @@ whatever is above one when it mentions downloads. While this file holds only thi
 This build is Fritchii v5.6 with this fork's fixes for Yoshi and the Mysterious Book, Mario Kart World and Star Fox. Expect one full "Preparing shaders" run after updating (see v5.6 below).
 
 ### Fixed in this build
+- **Donkey Kong Bananza's tutorial videos render correctly** instead of black panels with coloured blocks. The video conversion now reads a stable copy of its input, including at higher resolution scales (adapted from Eglantine #720, commit a2cefedfc4).
 - **Yoshi and the Mysterious Book renders at full resolution.** The game draws gameplay at a fixed 50% (960x540 docked) and drops its menus to dynamic resolution (about 1400x788); both now render at your full output resolution. It's built in and on by default, so the "Full Resolution" mod isn't needed any more. Turn "Max Resolution (built-in)" off in the game's Add-Ons to go back.
 - **Yoshi and the Mysterious Book: gameplay shaders the emulator couldn't translate now run**: the colour lookup pass, texture gathers through bindless handles and several compute shaders (ported from Eglantine #762 and upstream nx2).
 - **Mario Kart World: characters are no longer dark.** The lighting probes the game reads were cut off by an 8 MiB limit on GPU storage buffers.
