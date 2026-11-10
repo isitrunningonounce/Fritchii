@@ -387,8 +387,6 @@ TEST_CASE("Global fallback backends address sparse guest slots through compact b
 
 TEST_CASE("SPIR-V global memory helpers are DontInline only with EDEN_NX2_SPIRV_INLINE_GLOBALS=0",
           "[video_core][spirv][global_memory]") {
-    const char* const inline_globals = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
-    const bool dont_inline = inline_globals != nullptr && inline_globals[0] == '0';
     Program fixture;
     auto& info = fixture.program.info;
     info.used_storage_buffer_types = IR::Type::U32;
@@ -427,6 +425,9 @@ TEST_CASE("SPIR-V global memory helpers are DontInline only with EDEN_NX2_SPIRV_
         callees.insert(op[2]);
     }
     REQUIRE(callees.size() == 2);
+    // Inlinable by default: DontInline cost ~2.6 fps in Hyrule Field (151c77c85e).
+    const char* inline_globals = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
+    const bool dont_inline = inline_globals != nullptr && inline_globals[0] == '0';
     for (const u32 callee : callees) {
         CAPTURE(callee);
         REQUIRE(controls.contains(callee));

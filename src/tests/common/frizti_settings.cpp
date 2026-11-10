@@ -24,7 +24,7 @@ void SetOtherBuildValues(Settings::Values& values) {
     values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Accurate);
     values.use_disk_shader_cache.SetValue(false);
     values.use_vulkan_driver_pipeline_cache.SetValue(false);
-    values.dyna_state.SetValue(Settings::ExtendedDynamicState::Disabled);
+    values.dyna_state.SetValue(Settings::ExtendedDynamicState::EDS1);
     values.vertex_input_dynamic_state.SetValue(false);
 }
 

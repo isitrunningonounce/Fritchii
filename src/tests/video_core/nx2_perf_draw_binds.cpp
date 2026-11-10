@@ -62,6 +62,7 @@ public:
     std::vector<u64> pages;
 
 private:
+    // The masks of e8be5d3d59: nothing for an empty range, else every 64-byte block it touches.
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
         if (size == 0) {
             return;
