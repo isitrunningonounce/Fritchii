@@ -901,6 +901,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     TrackOcarinaCamera();
     TrackMarioKartCamera();
+    if (BananzaTemporalEnabled()) {
+        TrackBananzaCamera();
+        if (pipeline->ShaderHashes()[5] == VideoCommon::MarioKartBlendFragment) {
+            TrackBananzaBlend(*pipeline, is_indexed, is_indirect, instance_count);
+        }
+    }
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
@@ -2211,6 +2217,9 @@ void RasterizerVulkan::DispatchCompute() {
             flash_watch.NoteDispatch(pipeline->ShaderHash(), written);
         }
     };
+    if (pipeline->ShaderHash() == VideoCommon::BananzaUpscaleShader && BananzaTemporalEnabled()) {
+        TrackBananzaUpscale(*pipeline, indirect_address.has_value());
+    }
     TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
     if (frame_dump.CapturingSampled()) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
@@ -3217,6 +3226,193 @@ void RasterizerVulkan::TrackMarioKartCamera() {
     });
 }
 
+namespace {
+
+bool ValidBananzaImage(const ImageView& view) {
+    return view.BackingImage() && view.size.depth == 1 && !view.IsRescaled() &&
+           view.Samples() == VK_SAMPLE_COUNT_1_BIT &&
+           view.range == VideoCommon::SubresourceRange{};
+}
+
+VideoCommon::MarioKartBlendImage DescribeBananzaImage(const ImageView& view) {
+    return {view.gpu_addr, view.format, view.size.width, view.size.height};
+}
+
+} // namespace
+
+bool RasterizerVulkan::BananzaTemporalEnabled() {
+    if (program_id != Settings::DonkeyKongBananzaProgramId) {
+        return false;
+    }
+    if (!bananza_backend) {
+        bool dlss_available = false;
+#ifdef EGLANTINE_STREAMLINE
+        dlss_available = Streamline::IsDlssAvailable();
+#endif
+        const char* override = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        bananza_backend = VideoCommon::SelectBananzaUpscaler(
+            Settings::NvidiaDlssEnabled(), dlss_available, override ? override : "");
+        if (*bananza_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+            !Fsr3Upscaler::IsSupported(device)) {
+            bananza_backend = VideoCommon::OcarinaUpscaleBackend::Native;
+        }
+    }
+    return *bananza_backend != VideoCommon::OcarinaUpscaleBackend::Native &&
+           Settings::IsDockedMode();
+}
+
+void RasterizerVulkan::LogBananzaFallback(const char* reason) {
+    if (!bananza_fallback_reason || std::string_view{bananza_fallback_reason} != reason) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: the game's pass draws frame {} ({})",
+                 render_trace_frame, reason);
+        bananza_fallback_reason = reason;
+    }
+}
+
+void RasterizerVulkan::TrackBananzaCamera() {
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0] || !targets.depth_buffer_id ||
+        bananza_scene.blend_frame == render_trace_frame) {
+        return;
+    }
+    using VideoCore::Surface::PixelFormat;
+    const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+    if (color.format != PixelFormat::B10G11R11_FLOAT || depth.format != PixelFormat::D32_FLOAT ||
+        !ValidBananzaImage(color) || !ValidBananzaImage(depth)) {
+        return;
+    }
+    const bool has_camera = bananza_scene.camera_frame == render_trace_frame;
+    const auto scene = bananza_scene.camera.extent;
+    const u64 area = has_camera ? u64{scene.width} * scene.height : 0;
+    if (u64{color.size.width} * color.size.height <= area) {
+        return;
+    }
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                const auto& binding, u32 bound_size,
+                                                const auto*, u32) {
+        std::array<f32, 0x1c0 / sizeof(f32)> block;
+        if (stage != 4 || storage || index != 3 || bound_size < sizeof(block) ||
+            buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(block))) {
+            return;
+        }
+        device_memory.ReadBlockUnsafe(binding.device_addr, block.data(), sizeof(block));
+        const auto camera = VideoCommon::ReadBananzaCamera(
+            block, {color.size.width, color.size.height}, false);
+        if (!camera || u64{camera->extent.width} * camera->extent.height <= area ||
+            depth.size.width < camera->extent.width || depth.size.height < camera->extent.height) {
+            return;
+        }
+        bananza_scene.channel = gpu_memory;
+        bananza_scene.camera_frame = render_trace_frame;
+        bananza_scene.camera = *camera;
+        bananza_scene.depth_extent = {depth.size.width, depth.size.height};
+        bananza_scene.depth_address = depth.gpu_addr;
+    });
+}
+
+void RasterizerVulkan::TrackBananzaBlend(const GraphicsPipeline& pipeline, bool indexed,
+                                        bool indirect, u32 instances) {
+    auto& scene = bananza_scene;
+    if (scene.camera_frame != render_trace_frame || scene.channel != gpu_memory) {
+        LogBananzaFallback("no scene camera and depth this frame");
+        return;
+    }
+    if (scene.blend_frame == render_trace_frame) {
+        LogBananzaFallback("more than one blend draw this frame");
+        return;
+    }
+    const auto& targets = texture_cache.GetRenderTargets();
+    const auto sampled = pipeline.SampledImages();
+    if (!targets.color_buffer_ids[0] ||
+        std::ranges::any_of(targets.color_buffer_ids | std::views::drop(1),
+                           [](auto id) { return static_cast<bool>(id); }) ||
+        sampled.size() != 2 || !sampled[0].id || !sampled[1].id ||
+        sampled[0].stage != 4 || sampled[1].stage != 4) {
+        LogBananzaFallback("unexpected blend bindings");
+        return;
+    }
+    const auto& first = texture_cache.GetImageView(sampled[0].id);
+    const auto& second = texture_cache.GetImageView(sampled[1].id);
+    const auto& target = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    const auto extent = scene.camera.extent;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const std::array inputs{DescribeBananzaImage(first), DescribeBananzaImage(second)};
+    const auto shape = VideoCommon::RecognizeBananzaBlend(
+        pipeline.ShaderHashes()[5], indexed, indirect, draw.vertex_buffer.count, instances,
+        inputs, DescribeBananzaImage(target), extent);
+    if (!shape || mesh_draw || !ValidBananzaImage(first) || !ValidBananzaImage(second) ||
+        !ValidBananzaImage(target)) {
+        LogBananzaFallback("unexpected blend structure");
+        return;
+    }
+    using VideoCore::Surface::PixelFormat;
+    const size_t color_index = first.format == PixelFormat::B10G11R11_FLOAT ? 0 : 1;
+    scene.blend_frame = render_trace_frame;
+    scene.shape = *shape;
+    scene.tonemapped_address = inputs[color_index].identity;
+    scene.blend_address = target.gpu_addr;
+    if (*shape == VideoCommon::BananzaFrameShape::NativeSize) {
+        bananza_fallback_reason = nullptr;
+    } else if (!bananza_depth_logged) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: D32_FLOAT reduced scene depth allocation {}x{}",
+                 scene.depth_extent.width, scene.depth_extent.height);
+        bananza_depth_logged = true;
+    }
+    if (bananza_last_scene != extent) {
+        bananza_scene_changes += bananza_last_scene.width != 0;
+        bananza_last_scene = extent;
+    }
+    if (bananza_logged_scene != extent && bananza_scene_rate.Ready(std::chrono::steady_clock::now())) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: scene {}x{} (frame {})",
+                 extent.width, extent.height, render_trace_frame);
+        bananza_logged_scene = extent;
+    }
+}
+
+void RasterizerVulkan::TrackBananzaUpscale(const ComputePipeline& pipeline, bool indirect) {
+    const auto& scene = bananza_scene;
+    if (scene.blend_frame != render_trace_frame || scene.channel != gpu_memory ||
+        scene.shape != VideoCommon::BananzaFrameShape::Upscale) {
+        LogBananzaFallback("no reduced scene blend this frame");
+        return;
+    }
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
+        LogBananzaFallback("unexpected upscale bindings");
+        return;
+    }
+    const auto& source = texture_cache.GetImageView(sampled[0].id);
+    const auto& target = texture_cache.GetImageView(written[0]);
+    std::array<u32, 12> words{};
+    bool read_constants = false;
+    buffer_cache.ForEachBoundBuffer(true, [&](u32, bool storage, u32 index, bool,
+                                               const auto& binding, u32 bound_size,
+                                               const auto*, u32) {
+        if (!storage && index == 0 && bound_size >= sizeof(words) &&
+            !buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(words))) {
+            device_memory.ReadBlockUnsafe(binding.device_addr, words.data(), sizeof(words));
+            read_constants = true;
+        }
+    });
+    if (!read_constants || !ValidBananzaImage(source) || !ValidBananzaImage(target) ||
+        !VideoCommon::IsBananzaUpscaleDispatch(
+            pipeline.ShaderHash(), indirect, scene.camera.extent, scene.blend_address,
+            scene.tonemapped_address, scene.depth_address, std::array{DescribeBananzaImage(source)},
+            std::array{DescribeBananzaImage(target)}, words)) {
+        LogBananzaFallback("unexpected upscale images or constants");
+        return;
+    }
+    if (!bananza_dispatch_logged) {
+        LOG_INFO(Render_Vulkan,
+                 "Bananza temporal: recognized upscale {:016x} with constants {}x{} -> {}x{}",
+                 pipeline.ShaderHash(), words[6] + 1, words[7] + 1, words[10] + 1, words[11] + 1);
+        bananza_dispatch_logged = true;
+    }
+    bananza_fallback_reason = nullptr;
+}
+
 void RasterizerVulkan::UpdateMarioKartJitter() {
     std::array<f32, 2> want{};
     const bool jittered_backend = mkw_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
@@ -3857,6 +4053,11 @@ void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
     flash_watch.TickFrame();
     ++render_trace_frame;
+    if (bananza_last_scene.width && render_trace_frame % 600 == 0) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: {} scene size changes in 600 frames (frame {})",
+                 bananza_scene_changes, render_trace_frame);
+        bananza_scene_changes = 0;
+    }
     render_trace_draws = 0;
     render_trace_clears = 0;
     if (Common::DkbFrameTrace::Enabled()) {

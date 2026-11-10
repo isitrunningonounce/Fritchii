@@ -14,6 +14,8 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "common/game_presets.h"
+#include "video_core/dkb_upscale.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -514,7 +516,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
-    if (record_sampled || deferred_bind) {
+    const bool bananza_upscale = shader_hash == VideoCommon::BananzaUpscaleShader &&
+        Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId;
+    if (record_sampled || deferred_bind || bananza_upscale) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);

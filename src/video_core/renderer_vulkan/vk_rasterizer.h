@@ -16,6 +16,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/dkb_upscale.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/oot_network.h"
@@ -264,6 +265,12 @@ private:
     void FrameDumpPass(const Framebuffer* framebuffer);
     bool MarioKartTemporalEnabled();
     void TrackMarioKartCamera();
+    bool BananzaTemporalEnabled();
+    void TrackBananzaCamera();
+    void TrackBananzaBlend(const GraphicsPipeline& pipeline, bool indexed, bool indirect,
+                           u32 instances);
+    void TrackBananzaUpscale(const ComputePipeline& pipeline, bool indirect);
+    void LogBananzaFallback(const char* reason);
     bool MarioKartHudlessEnabled() const;
     void TrackMarioKartPresent(const GraphicsPipeline& pipeline, bool indexed, bool indirect, u32 instances);
     void UpdateMarioKartJitter();
@@ -344,6 +351,26 @@ private:
         GPUVAddr depth_address{};
         VkExtent2D extent{};
     } mkw_jitter_scene;
+
+    struct BananzaScene {
+        const Tegra::MemoryManager* channel{};
+        std::optional<u64> camera_frame;
+        VideoCommon::BananzaCamera camera{};
+        VideoCommon::Extent2D depth_extent{};
+        GPUVAddr depth_address{};
+        std::optional<u64> blend_frame;
+        VideoCommon::BananzaFrameShape shape{};
+        GPUVAddr tonemapped_address{};
+        GPUVAddr blend_address{};
+    } bananza_scene;
+    std::optional<VideoCommon::OcarinaUpscaleBackend> bananza_backend;
+    const char* bananza_fallback_reason{};
+    bool bananza_depth_logged{};
+    bool bananza_dispatch_logged{};
+    VideoCommon::Extent2D bananza_last_scene{};
+    VideoCommon::Extent2D bananza_logged_scene{};
+    Common::DkbFrameTrace::RateLimit bananza_scene_rate;
+    u32 bananza_scene_changes{};
 
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
