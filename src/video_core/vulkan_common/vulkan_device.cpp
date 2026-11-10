@@ -647,6 +647,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         const auto arch = GetNvidiaArch();
         if (arch >= NvidiaArchitecture::Arch_AmpereOrNewer) {
             LOG_WARNING(Render_Vulkan, "Ampere and newer have broken float16 math");
+            host_float16_supported = features.shader_float16_int8.shaderFloat16;
             features.shader_float16_int8.shaderFloat16 = false;
         }
 
@@ -819,6 +820,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // AMD FSR 4 runs AMD's own shaders inside AMD's runtime, which need float16 on the device.
     // Guest shaders still follow float16_math, so the AMD float16 workaround above stays in force.
     if (device_float16 && WantsAmdFsr4(driver_id)) {
+        features.shader_float16_int8.shaderFloat16 = VK_TRUE;
+    }
+    // The Ampere workaround above only concerns guest shaders: enable float16 on the device so
+    // host-only shaders (frame generation) may use it. The AMD and Intel workarounds turn it off
+    // for every shader, host ones included. From zortos293/Lichii#587 (95df0bc79d).
+    host_float16_supported |= float16_math;
+    if (host_float16_supported) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
