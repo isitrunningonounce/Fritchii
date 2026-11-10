@@ -204,6 +204,12 @@ TEST_CASE("Bananza camera captures preserve scene extent and clip planes", "[vid
     CHECK(reduced->extent == ReducedScene);
     CHECK(reduced->near_plane == 1.0f);
     CHECK(reduced->far_plane == 5000.0f);
+    const auto tunnel_constants = VideoCommon::MakeBananzaTemporalCamera(*second);
+    const auto town_constants = VideoCommon::MakeBananzaTemporalCamera(*reduced);
+    REQUIRE(tunnel_constants);
+    REQUIRE(town_constants);
+    CHECK(tunnel_constants->far_plane == 10000.0f);
+    CHECK(town_constants->far_plane == 5000.0f);
     CHECK_FALSE(ReadBananzaCamera(Camera2940, {2880, 1179}, false));
     CHECK_FALSE(ReadBananzaCamera(Camera2940, {2094, 1179}, false));
     CHECK_FALSE(ReadBananzaCamera(Camera2940, {2096, 1180}, false));

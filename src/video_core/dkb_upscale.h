@@ -60,6 +60,16 @@ inline std::optional<BananzaCamera> ReadBananzaCamera(std::span<const f32> block
     return BananzaCamera{*matrices, scene, near_plane, far_plane};
 }
 
+inline std::optional<TemporalCameraConstants> MakeBananzaTemporalCamera(const BananzaCamera& camera) {
+    auto constants = MakeMarioKartTemporalCamera(camera.matrices, camera.extent.width,
+                                                 camera.extent.height);
+    if (constants) {
+        constants->near_plane = camera.near_plane;
+        constants->far_plane = camera.far_plane;
+    }
+    return constants;
+}
+
 enum class BananzaFrameShape { Upscale, NativeSize };
 
 constexpr std::optional<BananzaFrameShape> ClassifyBananzaBlend(Extent2D scene, Extent2D target) {

@@ -26,6 +26,7 @@ class StagingBufferPool;
 /// DLSS availability, and native when FSR 3.1 is unsupported on the device.
 [[nodiscard]] VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device);
 [[nodiscard]] VideoCommon::OcarinaUpscaleBackend ResolveMarioKartUpscaler(const Device& device);
+[[nodiscard]] VideoCommon::OcarinaUpscaleBackend ResolveBananzaUpscaler(const Device& device);
 
 struct OcarinaActorMesh {
     std::vector<u8> vertices;
@@ -38,10 +39,12 @@ struct OcarinaActorMesh {
 
 class OcarinaUpscaler {
 public:
+    enum class Profile { Ocarina, MarioKart, Bananza };
+
     OcarinaUpscaler(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
                    ComputePassDescriptorQueue& queue, MemoryAllocator& allocator,
                    StagingBufferPool& staging, VideoCommon::OcarinaUpscaleBackend backend,
-                   bool mario_kart = false);
+                   Profile profile = Profile::Ocarina);
     ~OcarinaUpscaler();
 
     [[nodiscard]] bool EvaluationFailed() const;
@@ -69,7 +72,8 @@ public:
                 const std::array<f32, 16>& previous, const OcarinaActorMesh& mesh,
                 VkImage depth_image, u64 frame, std::array<f32, 2> jitter = {},
                 VkFormat depth_format = VK_FORMAT_D32_SFLOAT,
-                std::optional<VideoCommon::TemporalCameraConstants> camera = std::nullopt);
+                std::optional<VideoCommon::TemporalCameraConstants> camera = std::nullopt,
+                VkExtent2D depth_allocation_size = {});
 
 private:
     struct Impl;

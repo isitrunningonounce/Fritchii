@@ -28,6 +28,16 @@ constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+constexpr VkFormat EXPOSURE_FORMAT = VK_FORMAT_R32_SFLOAT;
+constexpr VkImageUsageFlags EXPOSURE_USAGE =
+    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+constexpr VkExtent2D EXPOSURE_SIZE{1, 1};
+
+bool InRenderRange(VkExtent2D size, VkExtent2D minimum, VkExtent2D maximum) {
+    return minimum.width && minimum.height && minimum.width <= size.width &&
+           minimum.height <= size.height && size.width <= maximum.width &&
+           size.height <= maximum.height;
+}
 
 int EnvInt(const char* name, int fallback) {
     const char* const value = std::getenv(name);
@@ -294,26 +304,77 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     });
 }
 
+void StreamlineDlssUpscaler::CreateBananzaExposure() {
+    bananza_exposure = memory_allocator.CreateImage(VkImageCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = EXPOSURE_FORMAT,
+        .extent = {EXPOSURE_SIZE.width, EXPOSURE_SIZE.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = EXPOSURE_USAGE,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    });
+    constexpr VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    bananza_exposure_view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .image = *bananza_exposure,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = EXPOSURE_FORMAT,
+        .components{},
+        .subresourceRange = range,
+    });
+    const Image exposure{*bananza_exposure_view, *bananza_exposure, EXPOSURE_FORMAT, range,
+                         VK_IMAGE_ASPECT_COLOR_BIT};
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([exposure](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            Barrier(exposure, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+        constexpr VkClearColorValue neutral{.float32 = {1.0f, 0.0f, 0.0f, 0.0f}};
+        cmdbuf.ClearColorImage(exposure.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, neutral,
+                               exposure.range);
+        cmdbuf.PipelineBarrier(
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+            Barrier(exposure, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    });
+}
+
 bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
-                                in.render_size.height != render_extent.height ||
-                                in.upscale_size.width != upscale_extent.width ||
-                                in.upscale_size.height != upscale_extent.height;
+    const bool render_changed = in.render_size.width != render_extent.width ||
+                                in.render_size.height != render_extent.height;
+    const bool extent_changed = !output_image || in.upscale_size.width != upscale_extent.width ||
+                                in.upscale_size.height != upscale_extent.height ||
+                                (!in.bananza_dynamic && render_changed);
     const bool options_changed = extent_changed || in.hdr != hdr_input;
     const bool reset = in.reset || options_changed;
     if (extent_changed) {
         CreateOutput(in.upscale_size);
-        render_extent = in.render_size;
         upscale_extent = in.upscale_size;
     }
+    render_extent = in.render_size;
     hdr_input = in.hdr;
+    if (in.bananza_dynamic && !bananza_exposure) {
+        CreateBananzaExposure();
+    }
 
-    // DLSS Frame Generation's inputs, copied into the next slot of the ring.
+    // Bananza lets Streamline own the copies of its changing depth and motion regions.
     const FrameGenCopy* fg_copy = nullptr;
-    if (Streamline::IsFrameGenAvailable() && FrameGenOwnCopies() &&
+    if (!in.bananza_dynamic && Streamline::IsFrameGenAvailable() && FrameGenOwnCopies() &&
         Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed)) {
         if (!fg_copies[0].depth || fg_copy_extent.width != in.render_size.width ||
             fg_copy_extent.height != in.render_size.height ||
@@ -340,7 +401,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     options.performancePreset = preset;
     options.ultraPerformancePreset = preset;
     options.ultraQualityPreset = preset;
-    if (options_changed) {
+    if (!in.bananza_dynamic && options_changed) {
         LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
                  in.render_size.width, in.render_size.height, in.upscale_size.width,
                  in.upscale_size.height, static_cast<int>(options.mode), static_cast<int>(preset),
@@ -348,8 +409,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, reset, options, options_changed, index = frame_index++, fg_copy,
-                      output_image_handle = *output_image,
+    scheduler.Record([this, in, reset, initial_options = options, options_changed, render_changed,
+                      index = frame_index++, fg_copy, output_image_handle = *output_image,
                       output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
         const Streamline::Api& api = Streamline::GetApi();
         const sl::ViewportHandle viewport{0u};
@@ -387,6 +448,69 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                 barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
         };
+        auto frame_options = initial_options;
+        if (in.bananza_dynamic) {
+            if (failed.load()) {
+                return;
+            }
+            if (!bananza_mode) {
+                void* address{};
+                const auto result = api.get_feature_function(
+                    sl::kFeatureDLSS, "slDLSSGetOptimalSettings", address);
+                if (result == sl::Result::eOk && address) {
+                    const auto get = reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(address);
+                    constexpr std::array modes{
+                        sl::DLSSMode::eMaxQuality, sl::DLSSMode::eBalanced,
+                        sl::DLSSMode::eMaxPerformance, sl::DLSSMode::eUltraQuality,
+                        sl::DLSSMode::eUltraPerformance, sl::DLSSMode::eDLAA,
+                    };
+                    constexpr VkExtent2D captured_minimum{2095, 1179};
+                    for (const auto mode : modes) {
+                        frame_options.mode = mode;
+                        sl::DLSSOptimalSettings settings{};
+                        if (get(frame_options, settings) != sl::Result::eOk) {
+                            continue;
+                        }
+                        const VkExtent2D minimum{settings.renderWidthMin, settings.renderHeightMin};
+                        const VkExtent2D maximum{settings.renderWidthMax, settings.renderHeightMax};
+                        if (InRenderRange(captured_minimum, minimum, maximum) &&
+                            InRenderRange(in.upscale_size, minimum, maximum) &&
+                            InRenderRange(in.render_size, minimum, maximum)) {
+                            bananza_mode = DynamicMode{static_cast<u32>(mode), minimum, maximum};
+                            LOG_INFO(Render_Vulkan,
+                                     "Bananza temporal: DLSS mode {} render range {}x{} to {}x{}",
+                                     bananza_mode->mode, minimum.width, minimum.height,
+                                     maximum.width, maximum.height);
+                            break;
+                        }
+                    }
+                }
+                if (!bananza_mode) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Bananza temporal: no DLSS mode covers 2095x1179 through {}x{} "
+                                "and the current {}x{} scene (optimal settings result {})",
+                                in.upscale_size.width, in.upscale_size.height, in.render_size.width,
+                                in.render_size.height, static_cast<int>(result));
+                    failed.store(true);
+                    return;
+                }
+            }
+            const auto& mode = *bananza_mode;
+            if (!InRenderRange(in.render_size, mode.minimum, mode.maximum)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Bananza temporal: scene {}x{} falls outside the DLSS render range",
+                            in.render_size.width, in.render_size.height);
+                failed.store(true);
+                return;
+            }
+            frame_options.mode = static_cast<sl::DLSSMode>(mode.mode);
+            if (options_changed || render_changed) {
+                LOG_INFO(Render_Vulkan,
+                         "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, LDR",
+                         in.render_size.width, in.render_size.height, in.upscale_size.width,
+                         in.upscale_size.height, mode.mode, static_cast<int>(frame_options.qualityPreset));
+            }
+        }
         sl::FrameToken* frame{};
 
         constexpr VkAccessFlags WRITES =
@@ -457,10 +581,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
             if (trace || index == 0 || reset || index % 120 == 0) {
                 LOG_INFO(Render_Vulkan,
-                         "Mario Kart World temporal: FG camera frame={} render={}x{} "
+                         "{} temporal: FG camera frame={} render={}x{} "
                          "near={} far={} fov={} aspect={} position=({},{},{}) "
                          "projection={:g} clip_to_previous={:g} "
                          "jitter=({},{}) mv_scale=({},{}) depth_inverted={}",
+                         in.bananza_dynamic ? "Bananza" : "Mario Kart World",
                          index, in.render_size.width, in.render_size.height,
                          camera.near_plane, camera.far_plane, camera.vertical_fov, camera.aspect_ratio,
                          camera.position[0], camera.position[1], camera.position[2],
@@ -474,13 +599,17 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
                                       VK_IMAGE_USAGE_SAMPLED_BIT);
+        const VkExtent2D depth_size = in.bananza_dynamic ? in.depth_allocation_size : in.render_size;
+        const VkImageUsageFlags scene_usage = in.bananza_dynamic
+                                                 ? VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                                 : VK_IMAGE_USAGE_SAMPLED_BIT;
         sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, depth_size,
+                                      scene_usage);
         sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
                                        in.motion_vectors.format,
                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                       VK_IMAGE_USAGE_SAMPLED_BIT);
+                                       scene_usage);
         sl::Resource output = Resource(output_image_handle, output_view_handle, OUTPUT_FORMAT,
                                        VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, OUTPUT_USAGE);
         const sl::Extent render_area{0, 0, in.render_size.width, in.render_size.height};
@@ -494,8 +623,19 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                    sl::ResourceLifecycle::eValidUntilEvaluate, &render_area};
         sl::ResourceTag output_tag{&output, sl::kBufferTypeScalingOutputColor,
                                    sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
+        sl::Resource exposure{};
+        if (in.bananza_dynamic) {
+            exposure = Resource(*bananza_exposure, *bananza_exposure_view, EXPOSURE_FORMAT,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, EXPOSURE_SIZE,
+                                EXPOSURE_USAGE);
+        }
+        const sl::Extent exposure_area{0, 0, EXPOSURE_SIZE.width, EXPOSURE_SIZE.height};
+        const sl::ResourceTag exposure_tag{&exposure, sl::kBufferTypeExposure,
+                                           sl::ResourceLifecycle::eValidUntilEvaluate,
+                                           &exposure_area};
         const sl::BaseStructure* inputs[] = {&viewport, &color_tag, &depth_tag, &motion_tag,
-                                             &output_tag};
+                                             &output_tag, &exposure_tag};
+        const auto input_count = std::size(inputs) - (in.bananza_dynamic ? 0u : 1u);
         const std::array to_general{
             Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
@@ -517,7 +657,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                     return true;
                 }
                 const auto set = reinterpret_cast<PFun_slDLSSSetOptions*>(set_options);
-                api_result = set(viewport, options);
+                api_result = set(viewport, frame_options);
                 return api_result == sl::Result::eOk;
             },
             [&] {
@@ -532,6 +672,9 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 api_result = api.set_constants(constants, *frame, viewport);
                 if (api_result != sl::Result::eOk) {
                     return false;
+                }
+                if (in.bananza_dynamic) {
+                    return true;
                 }
                 // DLSS Frame Generation (when on) presents from this frame's depth and motion.
                 if (!fg_copy) {
@@ -604,8 +747,14 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 return true;
             },
             [&] {
-                api_result = api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, std::size(inputs),
+                api_result = api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, input_count,
                                                   reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
+                const bool evaluated = api_result == sl::Result::eOk ||
+                                       api_result == sl::Result::eWarnOutOfVRAM;
+                if (evaluated && in.bananza_dynamic) {
+                    Streamline::TagFrameGen(*frame, depth, motion, render_area, *cmdbuf,
+                                            sl::ResourceLifecycle::eOnlyValidNow);
+                }
                 // eWarnOutOfVRAM is a warning: the evaluation was recorded. Treating it as a
                 // failure turned DLSS off for the session on an 8 GB card with other apps open.
                 if (api_result == sl::Result::eWarnOutOfVRAM) {
@@ -625,10 +774,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             });
         if (result != VideoCommon::DlssEvaluationResult::Succeeded && !failed.exchange(true)) {
             LOG_ERROR(Render_Vulkan,
-                      "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using FSR 3.1",
-                      static_cast<int>(result), static_cast<int>(api_result));
+                      "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using {}",
+                      static_cast<int>(result), static_cast<int>(api_result),
+                      in.bananza_dynamic ? "the game's pass" : "FSR 3.1");
         }
-        if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
+        if (!in.bananza_dynamic && result != VideoCommon::DlssEvaluationResult::Succeeded) {
             clear_output();
         }
     });

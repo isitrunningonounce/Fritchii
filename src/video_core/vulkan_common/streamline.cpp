@@ -83,6 +83,7 @@ struct State {
     std::chrono::steady_clock::time_point fg_last_present{};
     bool fg_on{};         ///< Present thread from here on
     u32 fg_frames{};      ///< Generated frames per rendered one while on
+    bool fg_dynamic_resolution{};
     std::optional<std::array<u32, 12>> fg_mkw_geometry;
     FrameGenUiOptionsState fg_ui;
     std::optional<std::array<s32, 4>> fg_ui_log;
@@ -907,9 +908,13 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     const bool want_on = token != nullptr;
     const u32 multiplier = Common::FrameGenStats::multiplier.load(std::memory_order_relaxed);
     const u32 frames = want_on ? std::clamp<u32>(multiplier, 2, state.fg_max_frames + 1) - 1 : 0;
-    const bool mario_kart = Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId;
+    const u64 program_id = Settings::GetCurrentProgramID();
+    const bool mario_kart = program_id == Settings::MarioKartWorldProgramId;
+    const bool bananza = program_id == Settings::DonkeyKongBananzaProgramId;
+    const bool dynamic_resolution = want_on && bananza;
     const auto update_options = [&](bool recompose) {
         if (want_on == state.fg_on && frames == state.fg_frames &&
+            dynamic_resolution == state.fg_dynamic_resolution &&
             (!mario_kart || !state.fg_ui.NeedsUpdate(recompose))) {
             return;
         }
@@ -918,6 +923,11 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         options.mode = want_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
         options.numFramesToGenerate = (std::max)(frames, 1u);
         options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        if (dynamic_resolution) {
+            options.flags |= sl::DLSSGFlags::eDynamicResolutionEnabled;
+            options.dynamicResWidth = 2400;
+            options.dynamicResHeight = 1350;
+        }
         // The default blocks the presenting queue (the emulator's only graphics queue) until
         // frame generation finishes: the real frame rate halved (50 -> 26 fps). LICHII_DLSS_FG_BLOCK=1
         // goes back to it.
@@ -959,8 +969,12 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
             LOG_INFO(Render_Vulkan, "DLSS Frame Generation off (result {})",
                      static_cast<int>(result));
         }
+        if (bananza && result != sl::Result::eOk) {
+            return;
+        }
         state.fg_on = want_on;
         state.fg_frames = frames;
+        state.fg_dynamic_resolution = dynamic_resolution;
         Common::FrameGenStats::active.store(want_on, std::memory_order_relaxed);
         state.fg_window_begin = {};
         state.fg_window_shown = 0;
@@ -1186,6 +1200,7 @@ void Stop() {
     state.fg_reflex_set = false;
     state.fg_on = false;
     state.fg_frames = 0;
+    state.fg_dynamic_resolution = false;
     state.fg_tagged.store(nullptr, std::memory_order_relaxed);
     state.fg_inputs_fence.store(VK_NULL_HANDLE, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline stopped (result {})", static_cast<int>(result));
