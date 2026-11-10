@@ -6,8 +6,9 @@
 #include <span>
 
 #include "shader_recompiler/shader_info.h"
-#include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+
+#include "video_core/renderer_vulkan/vk_update_descriptor.h"
 
 namespace Vulkan {
 
