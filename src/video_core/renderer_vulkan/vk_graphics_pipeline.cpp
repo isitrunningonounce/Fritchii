@@ -2258,7 +2258,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
                                       const Shader::Info* info) {
-            const bool uses_warp_ops{info && info->UsesWarpOps()};
+            const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
+                                              info->uses_subgroup_invocation_id ||
+                                              info->uses_subgroup_shuffles ||
+                                              info->uses_subgroup_mask ||
+                                              info->uses_quad_shuffles || info->uses_fswzadd)};
             const bool force_warp_size{uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
                                        device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
             return device.GetLogical().CreateComputePipeline(
@@ -2296,7 +2300,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     PipelineStates states;
     FillStates(states);
     const bool is_mesh{states.is_mesh};
-    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .pNext = nullptr,
         .requiredSubgroupSize = GuestWarpSize,
@@ -2311,7 +2315,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
         const bool emulated_vertex{mesh_emulation && stage == 0};
-        auto& stage_ci =
+        [[maybe_unused]] auto& stage_ci =
             shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .pNext = nullptr,
@@ -2324,12 +2328,6 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .pName = "main",
                 .pSpecializationInfo = nullptr,
             });
-        if ((stage_ci.stage == VK_SHADER_STAGE_MESH_BIT_EXT ||
-             stage_ci.stage == VK_SHADER_STAGE_TASK_BIT_EXT) &&
-            stage_infos[stage].UsesWarpOps() && device.IsExtSubgroupSizeControlSupported() &&
-            device.IsGuestWarpSizeSupported(stage_ci.stage)) {
-            stage_ci.pNext = &subgroup_size_ci;
-        }
     }
     // Mesh emulation draws a plain triangle list without vertex attributes.
     const VkPipelineVertexInputStateCreateInfo emulation_vertex_input{
@@ -2521,11 +2519,6 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
     // The library's own set layouts, identically defined to the linked pipeline's (same
     // signature in the key), so the library outlives the pipeline that built it.
     std::array<VkDescriptorSetLayout, NUM_STAGES> set_layouts{};
-    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-        .pNext = nullptr,
-        .requiredSubgroupSize = GuestWarpSize,
-    };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!InPart(part, stage)) {
@@ -2540,7 +2533,7 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
         if (!spv_modules[stage]) {
             continue;
         }
-        // Match the monolithic pipeline's task/mesh subgroup requirement.
+        // Same stage info as the monolithic pipeline (MakePipeline), which sets no subgroup size.
         shader_stages.push_back({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .pNext = nullptr,
@@ -2551,13 +2544,6 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
             .pName = "main",
             .pSpecializationInfo = nullptr,
         });
-        auto& stage_ci = shader_stages.back();
-        if ((stage_ci.stage == VK_SHADER_STAGE_MESH_BIT_EXT ||
-             stage_ci.stage == VK_SHADER_STAGE_TASK_BIT_EXT) &&
-            stage_infos[stage].UsesWarpOps() && device.IsExtSubgroupSizeControlSupported() &&
-            device.IsGuestWarpSizeSupported(stage_ci.stage)) {
-            stage_ci.pNext = &subgroup_size_ci;
-        }
     }
     library.layout =
         DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, true);

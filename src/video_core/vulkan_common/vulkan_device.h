@@ -380,11 +380,6 @@ public:
                id != VK_DRIVER_ID_MESA_RADV;
     }
 
-    /// Intel's Windows driver cannot read its pipeline cache while shaders build into it.
-    bool CanReadPipelineCacheDuringBuilds() const {
-        return GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
-    }
-
     /// Whether pipelines linked from graphics pipeline libraries without link time optimization
     /// draw correctly. On AMD's Windows driver such links draw white fringes around alpha blended
     /// effects (clouds, particles and glows in a test title, RX 7800 XT), while optimized links

@@ -28,8 +28,8 @@ namespace {
 // A new layout, or a Shader::Info field the serializer learns (info_serialize.cpp), needs a new
 // magic: kept files written before are then prepared again. 2: the precompiled record offsets
 // (the boot check reads each sampled record's key from them). 4: Shader::Info's
-// storage_read_extents. 5: removed conditional-barrier subgroup requirement.
-constexpr std::string_view Magic{"NX2KEPT5"};
+// storage_read_extents.
+constexpr std::string_view Magic{"NX2KEPT4"};
 constexpr std::string_view EndMagic{"NX2KEPTE"};
 constexpr u8 EntryInfo = 1;
 constexpr u8 EntrySpirv = 2;

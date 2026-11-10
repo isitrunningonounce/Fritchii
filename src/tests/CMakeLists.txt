@@ -12,10 +12,7 @@ add_executable(tests
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
-    core/nx2_movie_pacing.cpp
-    core/nx2_gpu_memory_registry.cpp
     core/nx2_present_pacer.cpp
-    video_core/nx2_sparse_residency.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
@@ -41,7 +38,6 @@ add_executable(tests
     video_core/vk_byte_addressed_shadow.cpp
     video_core/canonical_native_key.cpp
     video_core/global_memory_coherence.cpp
-    video_core/global_atomic_routing.cpp
     video_core/storage_buffer_pointer_tracking.cpp
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp

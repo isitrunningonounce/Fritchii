@@ -342,10 +342,6 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
     item_model->sort(tree_view->header()->sortIndicatorSection(),
                      tree_view->header()->sortIndicatorOrder());
 
-    if (!search_field->filterText().isEmpty()) {
-        OnTextChanged(search_field->filterText());
-    }
-
     emit PopulatingCompleted();
 }
 

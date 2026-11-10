@@ -131,7 +131,7 @@ public:
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
-    void SignalFence(std::function<void()>&& func, bool force_completion = false) override;
+    void SignalFence(std::function<void()>&& func) override;
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
@@ -281,7 +281,6 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
-    s32 bound_channel_id{-1};
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;

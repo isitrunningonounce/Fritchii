@@ -221,21 +221,18 @@ public:
         device_ranges[cpu_address] = {size, device_address};
     }
 
-    std::optional<u64> DeviceAddressOf(u64 cpu_address, u64 size = 1) {
+    std::optional<u64> DeviceAddressOf(u64 cpu_address) {
         std::scoped_lock lk{device_mutex};
-        if (size == 0) {
+        auto it = device_ranges.upper_bound(cpu_address);
+        if (it == device_ranges.begin()) {
             return std::nullopt;
         }
-        auto it = device_ranges.upper_bound(cpu_address);
-        while (it != device_ranges.begin()) {
-            --it;
-            const auto& [start, range] = *it;
-            const u64 offset = cpu_address - start;
-            if (offset < range.first && size <= range.first - offset) {
-                return range.second + offset;
-            }
+        --it;
+        const auto& [start, range] = *it;
+        if (cpu_address - start >= range.first) {
+            return std::nullopt;
         }
-        return std::nullopt;
+        return range.second + (cpu_address - start);
     }
 
     std::optional<u64> GpuAddressOf(u32 handle, u64 offset) {

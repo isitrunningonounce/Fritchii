@@ -73,7 +73,6 @@ private:
                                           Out<bool> out_fonts_are_loaded, Out<u32> out_font_count,
                                           Set::LanguageCode language_code);
 
-    void RequestLoadNxFont(HLERequestContext& ctx);
     void GetBuiltInFontSharedMemory(HLERequestContext& ctx);
     void GetBuiltInFontData(HLERequestContext& ctx);
 

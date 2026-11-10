@@ -336,7 +336,6 @@ struct Info {
     bool uses_sparse_residency{};
     bool uses_demote_to_helper_invocation{};
     bool uses_subgroup_vote{};
-    bool removed_conditional_barrier{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
     bool uses_derivatives{};
@@ -398,12 +397,6 @@ struct Info {
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
-
-    /// Whether subgroup operations require a whole guest warp to run together.
-    [[nodiscard]] bool UsesWarpOps() const noexcept {
-        return removed_conditional_barrier || uses_subgroup_vote || uses_subgroup_invocation_id ||
-               uses_subgroup_shuffles || uses_subgroup_mask || uses_quad_shuffles || uses_fswzadd;
-    }
 };
 
 template <typename Descriptors>

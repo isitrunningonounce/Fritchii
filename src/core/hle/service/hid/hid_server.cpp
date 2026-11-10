@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <mutex>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -122,8 +121,8 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {135, C<&IHidServer::SetNpadCaptureButtonAssignment>, "SetNpadCaptureButtonAssignment"},
         {136, C<&IHidServer::ClearNpadCaptureButtonAssignment>, "ClearNpadCaptureButtonAssignment"},
         {137, &IHidServer::StubReplyZeroed, "Unknown137"},
-        {138, C<&IHidServer::SetSceneIdForPrivateApp>, "SetSceneIdForPrivateApp"},
-        {139, C<&IHidServer::GetSceneIdForPrivateApp>, "GetSceneIdForPrivateApp"},
+        {138, &IHidServer::StubReplyZeroed, "Unknown138"},
+        {139, &IHidServer::StubReplyZeroed, "Unknown139"},
         {140, &IHidServer::StubReplyZeroed, "Unknown140"},
         {150, &IHidServer::StubReplyZeroed, "Unknown150"},
         {151, &IHidServer::StubReplyZeroed, "Unknown151"},
@@ -141,9 +140,9 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {210, C<&IHidServer::EndPermitVibrationSession>, "EndPermitVibrationSession"},
         {211, C<&IHidServer::IsVibrationDeviceMounted>, "IsVibrationDeviceMounted"},
         {212, C<&IHidServer::SendVibrationValueInBool>, "SendVibrationValueInBool"},
-        {213, &IHidServer::SendVibrationValueInMode, "SendVibrationValueInMode"},
+        {213, C<&IHidServer::Unknown213>, "Unknown213"},
         {214, C<&IHidServer::SendNx2VibrationValues>, "SendNx2VibrationValues (guessed)"},
-        {220, C<&IHidServer::IsOunceVibrationDeviceMounted>, "IsOunceVibrationDeviceMounted"},
+        {220, C<&IHidServer::Unknown220>, "Unknown220"},
         {300, C<&IHidServer::ActivateConsoleSixAxisSensor>, "ActivateConsoleSixAxisSensor"},
         {301, C<&IHidServer::StartConsoleSixAxisSensor>, "StartConsoleSixAxisSensor"},
         {302, C<&IHidServer::StopConsoleSixAxisSensor>, "StopConsoleSixAxisSensor"},
@@ -263,14 +262,14 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {3114, &IHidServer::StubReplyZeroed, "Unknown3114"},
         {3130, &IHidServer::StubReplyZeroed, "Unknown3130"},
         {3131, &IHidServer::StubReplyZeroed, "Unknown3131"},
-        {3132, C<&IHidServer::SetNmousePointerRanges>, "SetNmousePointerRanges"},
-        {3133, C<&IHidServer::GetNmousePointerRanges>, "GetNmousePointerRanges"},
+        {3132, &IHidServer::StubReplyZeroed, "Unknown3132"},
+        {3133, &IHidServer::StubReplyZeroed, "Unknown3133"},
         {3134, &IHidServer::StubReplyZeroed, "Unknown3134"},
         {3135, &IHidServer::StubReplyZeroed, "Unknown3135"},
         {3136, &IHidServer::StubReplyZeroed, "Unknown3136"},
         {3137, &IHidServer::StubReplyZeroed, "Unknown3137"},
         {3138, &IHidServer::StubReplyZeroed, "Unknown3138"},
-        {3139, C<&IHidServer::InitializeNmouse2>, "InitializeNmouse2"},
+        {3139, &IHidServer::StubReplyZeroed, "Unknown3139"},
         {3140, &IHidServer::StubReplyZeroed, "Unknown3140"},
         {3141, &IHidServer::StubReplyZeroed, "Unknown3141"},
         {3142, &IHidServer::StubReplyZeroed, "Unknown3142"},
@@ -1135,84 +1134,14 @@ Result IHidServer::SendNx2VibrationValues(
     R_SUCCEED();
 }
 
-void IHidServer::SendVibrationValueInMode(HLERequestContext& ctx) {
-    // Switchbrew names 213 but gives no layout, and two fit its 32 bytes (the mode before the
-    // handle, or after the value as in 206's padding). Log the first request so a run shows which.
-    static std::once_flag logged;
-    std::call_once(logged, [&ctx] {
-        IPC::RequestParser rp{ctx};
-        const auto w = rp.PopRaw<std::array<u32, 8>>();
-        LOG_INFO(Service_HID,
-                 "(STUBBED) first request: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-    });
-    IPC::ResponseBuilder rb{ctx, 2};
-    rb.Push(ResultSuccess);
-}
-
-Result IHidServer::IsOunceVibrationDeviceMounted(
-    Out<bool> out_is_mounted, Core::HID::VibrationDeviceHandle vibration_device_handle,
-    ClientAppletResourceUserId aruid) {
-    LOG_DEBUG(Service_HID,
-              "called, npad_type={}, npad_id={}, device_index={}, applet_resource_user_id={}",
-              vibration_device_handle.npad_type, vibration_device_handle.npad_id,
-              vibration_device_handle.device_index, aruid.pid);
-
-    // Like IsVibrationDeviceMounted, but a handle this doesn't recognise reads as not mounted
-    // instead of failing: the Switch 2 handle layout is only known from captures (see 214).
-    *out_is_mounted = false;
-    if (IsVibrationHandleValid(vibration_device_handle).IsSuccess()) {
-        const NpadVibrationBase* device =
-            GetResourceManager()->GetVibrationDevice(vibration_device_handle);
-        if (device != nullptr) {
-            *out_is_mounted = device->IsVibrationMounted();
-        }
-    }
-
+Result IHidServer::Unknown213() {
+    LOG_DEBUG(Service_HID, "(STUBBED) called");
     R_SUCCEED();
 }
 
-Result IHidServer::SetSceneIdForPrivateApp(ClientAppletResourceUserId aruid, u64 scene_id) {
-    LOG_DEBUG(Service_HID, "called, scene_id={:#x}, applet_resource_user_id={}", scene_id, aruid.pid);
-    scene_ids_for_private_app[aruid.pid] = scene_id;
-    R_SUCCEED();
-}
-
-Result IHidServer::GetSceneIdForPrivateApp(Out<u64> out_scene_id,
-                                           ClientAppletResourceUserId aruid) {
-    LOG_DEBUG(Service_HID, "called, applet_resource_user_id={}", aruid.pid);
-    const auto it = scene_ids_for_private_app.find(aruid.pid);
-    *out_scene_id = it != scene_ids_for_private_app.end() ? it->second : 0;
-    R_SUCCEED();
-}
-
-Result IHidServer::InitializeNmouse2(u32 pointer_type, s32 width, s32 height, u32 unknown,
-                                     ClientAppletResourceUserId aruid, u64 t_mem_size,
-                                     InCopyHandle<Kernel::KTransferMemory> t_mem) {
-    LOG_WARNING(Service_HID,
-                "(STUBBED) called, pointer_type={}, width={}, height={}, unknown={:#x}, "
-                "applet_resource_user_id={}, t_mem_size={:#x}",
-                pointer_type, width, height, unknown, aruid.pid, t_mem_size);
-    nmouse_pointer_ranges[aruid.pid] = {width, height};
-    R_SUCCEED();
-}
-
-Result IHidServer::SetNmousePointerRanges(s32 width, s32 height,
-                                          ClientAppletResourceUserId aruid) {
-    LOG_DEBUG(Service_HID, "called, width={}, height={}, applet_resource_user_id={}", width,
-              height, aruid.pid);
-    nmouse_pointer_ranges[aruid.pid] = {width, height};
-    R_SUCCEED();
-}
-
-Result IHidServer::GetNmousePointerRanges(Out<s32> out_width, Out<s32> out_height,
-                                          ClientAppletResourceUserId aruid) {
-    LOG_DEBUG(Service_HID, "called, applet_resource_user_id={}", aruid.pid);
-    const auto it = nmouse_pointer_ranges.find(aruid.pid);
-    const NmousePointerRanges ranges =
-        it != nmouse_pointer_ranges.end() ? it->second : NmousePointerRanges{};
-    *out_width = ranges.width;
-    *out_height = ranges.height;
+Result IHidServer::Unknown220(Out<u8> out) {
+    LOG_DEBUG(Service_HID, "(STUBBED) called");
+    *out = 0;
     R_SUCCEED();
 }
 

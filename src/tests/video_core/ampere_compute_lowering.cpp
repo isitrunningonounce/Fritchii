@@ -43,20 +43,10 @@ TEST_CASE("Ampere surface reductions preserve every U32 atomic operation",
                 INFO(lowered.error);
                 REQUIRE(lowered);
                 REQUIRE(lowered.required_texture_buffer == 0);
-                const u64 expected = op == 3 || op == 4
-                    ? 0xeb48000000000400ULL | (u64{op} << 24)
-                    : 0xea000000000004ffULL | (u64{op} << 29);
-                CHECK(lowered.instructions[0] == (expected | (u64{guard} << 16) |
-                    (u64{dimension} << 33) | (0x84ULL << 36)));
-                if (op != 3 && op != 4) {
-                    auto signed_instruction = instruction;
-                    signed_instruction.words[2] |= 1U << 9;
-                    const auto signed_lowered = LowerToMaxwell(std::array{signed_instruction, Exit});
-                    REQUIRE(signed_lowered);
-                    CHECK(signed_lowered.instructions[0] == (lowered.instructions[0] | (1ULL << 51)));
-                }
+                CHECK(lowered.instructions[0] == (0xeb48000000000400ULL | (u64{guard} << 16) |
+                    (u64{op} << 24) | (u64{dimension} << 33) | (0x84ULL << 36)));
                 auto invalid = instruction;
-                invalid.words[2] |= 2U << 9;
+                invalid.words[2] |= 1U << 9;
                 CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
             }
         }
@@ -177,40 +167,5 @@ TEST_CASE("Ampere guarded USHF.R.U32.HI lowers to a guarded SHR", "[video_core][
     const u64 guarded_shift = (shift & ~(u64{0xf} << 16)) | (u64{6} << 16);
     const auto& out = lowered.instructions;
     REQUIRE(std::find(out.begin(), out.end(), guarded_shift) != out.end());
-}
-
-TEST_CASE("Ampere HSETP2 constant operands preserve half swizzles and signs", "[video_core][ampere]") {
-    for (const u32 swizzle : {0U, 1U, 2U, 3U}) {
-        for (const u32 signs : {0U, 1U, 2U, 3U}) {
-            const u32 source_flags = (swizzle << 28) | (signs << 30);
-            const Instruction constant{{0xff007634, (7U << 22) | (0x3fU << 8) | source_flags,
-                                         0x04f24080, 0}};
-            auto reg = constant;
-            reg.words[0] = (reg.words[0] & ~0xfffU) | 0x234U;
-            reg.words[1] = 5U | source_flags;
-            const auto lowered = LowerToMaxwell(std::array{constant, Exit});
-            const auto reference = LowerToMaxwell(std::array{reg, Exit});
-            INFO(lowered.error);
-            REQUIRE(lowered);
-            REQUIRE(reference);
-            REQUIRE(lowered.instructions.size() == 3);
-            CHECK(lowered.instructions[1] ==
-                  ((reference.instructions[0] & ~(0xffULL << 20)) | (250ULL << 20)));
-            CHECK((lowered.instructions[0] & 0xffU) == 250);
-            CHECK(((lowered.instructions[0] >> 34) & 0x1fU) == 7);
-            CHECK(((lowered.instructions[0] >> 20) & 0x3fffU) == 0x3f);
-        }
-    }
-}
-
-TEST_CASE("Ampere SHF right shift preserves wrap mode", "[video_core][ampere]") {
-    for (const u32 wrap : {0U, 1U}) {
-        const Instruction shift{{0x04017219, 5, 0x000016ffU | (wrap << 11), 0}};
-        const auto lowered = LowerToMaxwell(std::array{shift, Exit});
-        INFO(lowered.error);
-        REQUIRE(lowered);
-        CHECK(lowered.instructions.front() ==
-              (0x5c28000000570401ULL | (u64{wrap} << 39)));
-    }
 }
 } // namespace

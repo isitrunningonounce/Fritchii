@@ -57,13 +57,15 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     BUTTON(QCheckBox, clear_shaders, QObject::tr("Clear Shader Cache"), MigrationTooltipClearShader,
            true)
 
-#define RADIO(name, text, tooltip, checkState, strategy)                                           \
-    BUTTON(QRadioButton, name, text, tooltip, checkState)                                          \
-    group->addButton(name, static_cast<int>(MigrationWorker::MigrationStrategy::strategy));
+    u32 id = 0;
 
-    RADIO(keep_old, QObject::tr("Keep Old Data"), MigrationTooltipKeepOld, true, Copy)
-    RADIO(clear_old, QObject::tr("Clear Old Data"), MigrationTooltipClearOld, false, Move)
-    RADIO(link_old, QObject::tr("Link Old Directory"), MigrationTooltipLinkOld, false, Link)
+#define RADIO(name, text, tooltip, checkState)                                                     \
+    BUTTON(QRadioButton, name, text, tooltip, checkState)                                          \
+    group->addButton(name, ++id);
+
+    RADIO(keep_old, QObject::tr("Keep Old Data"), MigrationTooltipKeepOld, true)
+    RADIO(clear_old, QObject::tr("Clear Old Data"), MigrationTooltipClearOld, false)
+    RADIO(link_old, QObject::tr("Link Old Directory"), MigrationTooltipLinkOld, false)
 
 #undef RADIO
 #undef BUTTON

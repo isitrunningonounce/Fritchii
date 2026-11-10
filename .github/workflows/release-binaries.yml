@@ -246,7 +246,6 @@ jobs:
             -DYUZU_USE_BUNDLED_SDL3=ON
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-            -DENABLE_QT_TRANSLATION=ON
             -DENABLE_UPDATE_CHECKER=ON
             -DLICHII_BUILD_TAG=build-${{ github.run_number }}
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
@@ -280,7 +279,6 @@ jobs:
           -DYUZU_ROOM_STANDALONE=OFF
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
-          -DENABLE_QT_TRANSLATION=ON
           -DENABLE_UPDATE_CHECKER=ON
           -DLICHII_BUILD_TAG=build-${{ github.run_number }}
           -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
@@ -305,7 +303,6 @@ jobs:
             "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
-            -DENABLE_QT_TRANSLATION=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
@@ -333,7 +330,6 @@ jobs:
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
-            -DENABLE_QT_TRANSLATION=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \

@@ -77,7 +77,6 @@
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_video_input_queue.h"
-#include "core/hle/service/nx2_movie_pacing.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/sm/sm.h"
@@ -606,23 +605,9 @@ private:
 
     // Signals a job slot's event once the GPU thread has run everything queued so far, as the
     // console's graphics server completes unmap jobs behind the submitted work.
-    void SignalAfterGpu(u32 slot, bool release_memory = false) {
+    void SignalAfterGpu(u32 slot) {
         auto* const event = EventFor(slot);
-        system.GPU().RunInOrder([this, event, release_memory] {
-            if (release_memory) {
-                system.GPU().Renderer().ReadRasterizer()->SignalFence(
-                    [this, event] { event->Signal(system.Kernel()); }, true);
-            } else {
-                event->Signal(system.Kernel());
-            }
-        });
-    }
-
-    void QueueBackingRelease(std::shared_ptr<std::atomic<bool>> done) {
-        system.GPU().RunInOrder([this, done] {
-            system.GPU().Renderer().ReadRasterizer()->SignalFence(
-                [done] { done->store(true, std::memory_order_release); }, true);
-        });
+        system.GPU().RunInOrder([this, event] { event->Signal(system.Kernel()); });
     }
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
@@ -645,7 +630,7 @@ private:
         } else {
             LOG_WARNING(Service, "nx2:gpu 102 destroy of unknown handle {}", handle);
         }
-        SignalAfterGpu(w[3], true);
+        SignalAfterGpu(w[3]);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -750,12 +735,10 @@ private:
                     region->second.cpu_address, region->second.size);
                 if (!done) {
                     done = std::make_shared<std::atomic<bool>>(false);
+                    system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
                 }
                 m_released_regions.push_back({std::move(region->second), done});
                 region = m_gpu_only_regions.erase(region);
-            }
-            if (done) {
-                QueueBackingRelease(done);
             }
         }
         SignalAfterGpu(w[8]);
@@ -921,7 +904,7 @@ private:
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
                                                                         it->second.size);
             auto done = std::make_shared<std::atomic<bool>>(false);
-            QueueBackingRelease(done);
+            system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
             m_gpu_only_bytes -= it->second.size;
             m_released_regions.push_back({std::move(it->second), done});
             m_gpu_only_regions.erase(it);
@@ -1170,8 +1153,7 @@ private:
                 region = &it->second;
             }
         }
-        if (const auto gpu_only = GpuOnlyRegionOf(gpu_address, size);
-            gpu_only && region == nullptr) {
+        if (const auto gpu_only = GpuOnlyRegionOf(gpu_address, size)) {
             ApplyGpuOnlyRequest(*gpu_only, request);
             return;
         }
@@ -1367,7 +1349,6 @@ private:
     // tile was mapped, which the console would have dropped) go back.
     void StartTiles(u64 start, SparseRegion& region) {
         using Core::Memory::YUZU_PAGESIZE;
-        Tegra::Nx2SparseRegionTiled(start, region.size, SparseBlockSize);
         region.tiles = true;
         region.tile_pages.assign(Common::DivCeil(region.size, YUZU_PAGESIZE), false);
         std::shared_ptr<std::atomic<bool>> done;
@@ -1384,17 +1365,13 @@ private:
             }
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(block_address, 0,
                                                                         backing->second.size);
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(
-                backing->second.cpu_address, backing->second.size);
             if (!done) {
                 done = std::make_shared<std::atomic<bool>>(false);
+                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
             }
             released += backing->second.size;
             m_released_regions.push_back({std::move(backing->second), done});
             m_gpu_only_regions.erase(backing);
-        }
-        if (done) {
-            QueueBackingRelease(done);
         }
         m_sparse_released_bytes += released;
         LOG_INFO(Service, "nx2:gpu sparse region at {:#x}: the game maps its tiles, {} MiB of blocks "
@@ -1556,7 +1533,6 @@ inline std::chrono::milliseconds Nx2VideoReleaseWaitLimit() {
 // shared with the vi2 session so presents can find an image's memory. Command meanings follow
 // the shared changes.patch (IGraphicsSupervisor), re-checked against title 4's SDK.
 struct Nx2NativeObjects {
-    MkwMovieActivity mkw_movie_activity;
     struct VideoTrace {
         u32 syncpoint{};
         u64 decoded_frames{};
@@ -2099,14 +2075,6 @@ private:
             SetVsyncInterval(DefaultVblankInterval());
         }
         if (!Settings::SpeedLimitEnabled() || Settings::SpeedLimit() == 0) {
-            VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
-            return;
-        }
-        if (m_objects->mkw_movie_activity.Active(std::chrono::steady_clock::now())) {
-            // MKW's movie player recycles its two decoder images from the presenting thread.
-            // The extra guest wait slows the movie while audio continues in real time.
-            m_present_pacer = {};
-            m_phase = {};
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2903,7 +2871,6 @@ public:
             m_cv.notify_all();
             m_worker.join();
         }
-        ResetMoviePacing();
         // The ready timer runs on the HostTiming thread: clear its event under its lock first.
         {
             std::scoped_lock lk{m_ready->mutex};
@@ -2934,7 +2901,6 @@ private:
         u64 pts;
         bool end;
         std::chrono::steady_clock::time_point ready{}; ///< When it was written (trace)
-        u64 movie_generation{};
     };
     /// A frame converted for its output image, waiting to be copied in (PrepareImage).
     struct PreparedImage {
@@ -3048,10 +3014,6 @@ private:
         if (Nx2VideoTraceEnabled()) {
             LOG_INFO(Service, "nx2:vdec trace start syncpoint={}", m_syncpoint);
         }
-        {
-            std::scoped_lock lk{m_mutex};
-            m_movie_pacing_enabled = true;
-        }
         m_ready->SetRunning(system.Kernel(), true);
         m_ready->Signal(system.Kernel());
         TipcReplyWords(ctx, {});
@@ -3091,9 +3053,6 @@ private:
                  w[6], w[7]);
         {
             std::scoped_lock lk{m_mutex};
-            ResetMoviePacing();
-            const auto* process = ctx.GetThread().GetOwnerProcess();
-            m_movie_program_id = process ? process->GetProgramId() : 0;
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
@@ -3221,7 +3180,6 @@ private:
         {
             std::scoped_lock lk{m_mutex};
             m_inputs.Push(std::move(input));
-            m_movie_pacing_enabled = true;
             m_stream_ended = false;
             m_end_queued |= end;
             m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
@@ -3258,7 +3216,6 @@ private:
             if (Nx2VideoSyncTraceEnabled()) {
                 TraceEnd(ctx.GetCommand() == 8 ? ", flush" : ", stop");
             }
-            ResetMoviePacing();
             m_inputs.Clear();
             m_clock.started = false;
             m_flush = true;
@@ -3290,20 +3247,9 @@ private:
             if (Nx2VideoSyncTraceEnabled()) {
                 TraceEnd(", finalize");
             }
-            ResetMoviePacing();
             CompleteHandedFences();
         }
         TipcReplyWords(ctx, {});
-    }
-
-    // m_mutex held, or the worker has joined. A copy already in flight must not reactivate it.
-    void ResetMoviePacing() {
-        ++m_movie_generation;
-        m_movie_pacing_enabled = false;
-        if (m_movie_activity_recorded) {
-            m_objects->mkw_movie_activity.Reset();
-            m_movie_activity_recorded = false;
-        }
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -3346,9 +3292,6 @@ private:
                 }
                 if (Nx2VideoSyncTraceEnabled()) {
                     TraceAcquired(*output);
-                }
-                if (output->end && output->movie_generation == m_movie_generation) {
-                    ResetMoviePacing();
                 }
             } else if (Nx2VideoSyncTraceEnabled()) {
                 ++m_sync.empty_polls;
@@ -3424,7 +3367,6 @@ private:
             if (write) {
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
-                const u64 movie_generation = m_movie_generation;
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -3467,14 +3409,7 @@ private:
                     m_sync.write.Add(write_end - write_start);
                 }
                 // Even an image written during a flush counts: the client waits for its value.
-                if (!m_flush && m_movie_pacing_enabled && movie_generation == m_movie_generation &&
-                    frame.picture && frame.picture->frame &&
-                    MkwMovieActivity::IsLargeMovie(m_movie_program_id, frame.picture->width)) {
-                    m_objects->mkw_movie_activity.RecordFrame(write_end);
-                    m_movie_activity_recorded = true;
-                }
-                m_outputs.push_back(
-                    {image, width, height, frame.pts, frame.end, write_end, movie_generation});
+                m_outputs.push_back({image, width, height, frame.pts, frame.end, write_end});
                 if (frame.end) {
                     m_stream_ended = true;
                     m_end_queued = false;
@@ -3695,8 +3630,7 @@ private:
             const u32 image = m_free.front();
             m_free.pop_front();
             m_release_fences.erase(image);
-            m_outputs.push_back({image, m_last_output.width, m_last_output.height, m_last_output.pts,
-                                 true, {}, m_last_output.movie_generation});
+            m_outputs.push_back({image, m_last_output.width, m_last_output.height, m_last_output.pts, true});
             syncpoints.IncrementGuest(m_syncpoint);
         }
         return static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
@@ -4022,10 +3956,6 @@ private:
     std::string m_codec;
     u32 m_width{};
     u32 m_height{};
-    u64 m_movie_program_id{};
-    u64 m_movie_generation{};
-    bool m_movie_pacing_enabled{};
-    bool m_movie_activity_recorded{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
     u64 m_decoded_frames{};

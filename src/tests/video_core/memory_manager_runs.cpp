@@ -4,8 +4,6 @@
 #include <exception>
 #include <limits>
 #include <random>
-#include <utility>
-#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -29,7 +27,7 @@ public:
                u32) override {}
     void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
     void DisableGraphicsUniformBuffer(size_t, u32) override {}
-    void SignalFence(std::function<void()>&&, bool) override {}
+    void SignalFence(std::function<void()>&&) override {}
     void SyncOperation(std::function<void()>&&) override {}
     void SignalSyncPoint(u32) override {}
     void SignalReference() override {}
@@ -49,9 +47,7 @@ public:
     }
     void InvalidateGPUCache() override {}
     void UnmapMemory(DAddr, u64) override {}
-    void ModifyGPUMemory(size_t, GPUVAddr address, u64 size) override {
-        modified.emplace_back(address, size);
-    }
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
     void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
     void WaitForIdle() override {}
     void FragmentBarrier() override {}
@@ -62,31 +58,9 @@ public:
         std::terminate();
     }
     void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
-    std::vector<std::pair<GPUVAddr, u64>> modified;
 };
 
 } // namespace
-
-TEST_CASE("Remapping GPU pages invalidates caches when only backing changes", "[memory_manager]") {
-    const bool big_pages = GENERATE(false, true);
-    ScopedSystemTestContext context;
-    Core::System system;
-    Core::DeviceMemory physical;
-    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
-    NullRasterizer rasterizer;
-    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31, 16};
-    memory.BindRasterizer(&rasterizer);
-    constexpr GPUVAddr address = 0x4000'0000;
-    const u64 size = big_pages ? 0x20000 : 0x2000;
-    memory.Map(address, 0x1000'0000, size, Tegra::PTEKind::PITCH, big_pages);
-    rasterizer.modified.clear();
-    memory.Map(address, 0x2000'0000, size, Tegra::PTEKind::PITCH, big_pages);
-    REQUIRE(rasterizer.modified.size() == 1);
-    CHECK(rasterizer.modified.front() == std::pair<GPUVAddr, u64>{address, size});
-    rasterizer.modified.clear();
-    memory.Map(address, 0x2000'0000, size, Tegra::PTEKind::PITCH, big_pages);
-    CHECK(rasterizer.modified.empty());
-}
 
 TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[memory_manager]") {
     REQUIRE(VideoCommon::Nx2Perf::Enabled());

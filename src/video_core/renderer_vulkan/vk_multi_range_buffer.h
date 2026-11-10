@@ -59,8 +59,6 @@ public:
 
     void DropOwner(Scheduler& scheduler, VkBuffer owner);
 
-    void TickFrame(Scheduler& scheduler);
-
     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
     bool use_sparse{};
 
