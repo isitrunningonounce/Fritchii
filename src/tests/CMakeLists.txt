@@ -12,6 +12,7 @@ add_executable(tests
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
+    core/nx2_movie_pacing.cpp
     core/nx2_present_pacer.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
@@ -114,6 +115,7 @@ add_executable(tests
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
+    video_core/mkw_upscale.cpp
     video_core/ocarina_upscale.cpp
     video_core/fsr4_support.cpp
     common/bit_field.cpp

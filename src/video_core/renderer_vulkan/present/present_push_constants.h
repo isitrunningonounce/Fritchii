@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/common_types.h"
+#include "common/math_util.h"
 
 namespace Vulkan {
 
@@ -14,6 +15,18 @@ struct ScreenRectVertex {
     std::array<f32, 2> position;
     std::array<f32, 2> tex_coord;
 };
+
+inline std::array<ScreenRectVertex, 4> MakeScreenVertices(const Common::Rectangle<u32>& screen,
+                                                        const Common::Rectangle<f32>& crop) {
+    const auto x = f32(screen.left);
+    const auto y = f32(screen.top);
+    const auto w = f32(screen.GetWidth());
+    const auto h = f32(screen.GetHeight());
+    return {ScreenRectVertex(x, y, crop.left, crop.top),
+            ScreenRectVertex(x + w, y, crop.right, crop.top),
+            ScreenRectVertex(x, y + h, crop.left, crop.bottom),
+            ScreenRectVertex(x + w, y + h, crop.right, crop.bottom)};
+}
 
 static inline std::array<f32, 4 * 4> MakeOrthographicMatrix(f32 width, f32 height) {
     // clang-format off

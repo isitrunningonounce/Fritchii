@@ -11,12 +11,16 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <vector>
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
+#include "common/math_util.h"
 #include "common/polyfill_thread.h"
+#include "video_core/renderer_vulkan/present/mkw_ui_alpha.h"
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
+#include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -41,6 +45,23 @@ struct Frame {
     vk::CommandBuffer cmdbuf;
     vk::Semaphore render_ready;
     vk::Fence present_done;
+    std::unique_ptr<Frame> hudless;
+    VkFormat hudless_format{};
+    vk::Image hudless_present;
+    vk::ImageView hudless_present_view;
+    VkExtent2D hudless_present_extent{};
+    VkFormat hudless_present_format{};
+    Streamline::FrameGenInputFence hudless_fence;
+    MarioKartUiImages ui_images;
+    bool ui_alpha_valid{};
+    bool hudless_valid{};
+    bool hudless_available{true};
+    vk::Buffer hudless_check;
+    vk::Image hudless_check_color;
+    VkExtent2D hudless_check_extent{};
+    Common::Rectangle<u32> hudless_check_rect{};
+    size_t hudless_check_pixels{};
+    bool hudless_check_pending{};
     bool storage_capable{};
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
@@ -98,6 +119,10 @@ private:
     void CopyToSwapchain(Frame* frame);
 
     void CopyToSwapchainImpl(Frame* frame);
+    void PrepareHudlessPresent(Frame* frame, VkExtent2D extent);
+    void RecordUiAlpha(Frame* frame, vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    void RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    void ReportHudlessCheck(Frame* frame);
 
     void RecreateSwapchain(Frame* frame);
 
@@ -126,6 +151,13 @@ private:
     bool blit_supported;
     bool storage_supported;
     bool use_present_thread;
+    std::unique_ptr<MarioKartUiAlpha> ui_alpha;
+    const char* ui_alpha_reason{"not prepared"};
+    VkFormat ui_alpha_checked_format{VK_FORMAT_UNDEFINED};
+    bool ui_alpha_supported{};
+    u64 hudless_check_frames{};
+    bool hudless_allocation_failed{};
+    const char* hudless_check_reason{};
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};

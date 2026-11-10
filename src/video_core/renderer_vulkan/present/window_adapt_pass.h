@@ -23,6 +23,7 @@ namespace Vulkan {
 
 class Device;
 struct Frame;
+struct FramebufferTextureInfo;
 class Layer;
 class Scheduler;
 class RasterizerVulkan;
@@ -35,7 +36,9 @@ public:
 
     void Draw(const Device& device, RasterizerVulkan& rasterizer, Scheduler& scheduler, size_t image_index,
               std::list<Layer>& layers, std::span<const Tegra::FramebufferConfig> configs,
-              const Layout::FramebufferLayout& layout, Frame* dst);
+              const Layout::FramebufferLayout& layout, Frame* dst,
+              std::span<const FramebufferTextureInfo> overrides = {},
+              FramebufferTextureInfo* first_texture = nullptr);
 
     VkDescriptorSetLayout GetDescriptorSetLayout();
     VkRenderPass GetRenderPass();

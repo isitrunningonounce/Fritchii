@@ -44,6 +44,8 @@ public:
         VkImageView reactive_mask{}; ///< Optional render-size mask, 0..1.
         VkImageView transparency_mask{}; ///< Optional render-size transparency/composition mask.
         f32 vertical_fov = 1.04719755f; ///< Radians; 60 degrees when the camera is unknown.
+        f32 camera_near = 0.1f;
+        f32 camera_far = 25000.0f;
     };
 
     explicit Fsr3Upscaler(const Device& device, Scheduler& scheduler,

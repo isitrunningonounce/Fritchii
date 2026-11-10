@@ -8,6 +8,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -86,6 +87,50 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 /// through it (surface creation, before the device exists). Null otherwise.
 [[nodiscard]] void* FrameGenProcAddress(const char* name);
 
+struct FrameGenInputFence {
+    VkSemaphore semaphore{};
+    u64 value{};
+    bool pending{};
+    bool timed_out{};
+
+    template <typename Wait>
+    bool Retire(Wait&& wait) {
+        if (!pending) {
+            return true;
+        }
+        if (!semaphore || !wait(semaphore, value)) {
+            return false;
+        }
+        *this = {};
+        return true;
+    }
+};
+
+struct FrameGenUiOptionsState {
+    std::optional<bool> requested;
+    bool active{};
+
+    bool NeedsUpdate(bool desired) const {
+        return requested != desired;
+    }
+    static bool Desired(bool enabled, bool hudless_tagged, bool alpha_tagged) {
+        return enabled && hudless_tagged && alpha_tagged;
+    }
+    void Applied(bool desired, bool actual) {
+        requested = desired;
+        active = actual;
+    }
+};
+
+struct FrameGenHudlessImage {
+    VkImage image{};
+    VkImageView view{};
+    VkFormat format{};
+    VkExtent2D extent{};
+};
+
+bool WaitFrameGenInputs(FrameGenInputFence& fence);
+
 /// Frame generation per presented frame. The present manager takes the token on the Vulkan worker
 /// right after the frame's commands (so it is the token of the DLSS evaluation in that frame, or
 /// null without one), then wraps the frame's vkQueuePresentKHR with it.
@@ -93,8 +138,10 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 /// game_* is the rectangle the game image covers in the backbuffer: frame generation runs inside it
 /// (a little inset) and copies the rest as is (else, scaled to fullscreen, it smeared the edge row).
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
-                           u32 game_bottom);
-void FrameGenAfterPresent(void* token);
+                           u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent,
+                           const FrameGenHudlessImage* hudless = nullptr,
+                           const FrameGenHudlessImage* ui_alpha = nullptr);
+void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs = nullptr);
 /// Time the present thread spent acquiring the swapchain image (for the frame generation log).
 void NoteFrameGenAcquire(u64 ns);
 /// Time the renderer waited for a free present frame (for the frame generation log).

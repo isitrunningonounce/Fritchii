@@ -175,6 +175,8 @@ add_library(video_core STATIC
     renderer_vulkan/present/smaa.h
     renderer_vulkan/present/sgsr.cpp
     renderer_vulkan/present/sgsr.h
+    renderer_vulkan/present/mkw_ui_alpha.cpp
+    renderer_vulkan/present/mkw_ui_alpha.h
     renderer_vulkan/present/util.cpp
     renderer_vulkan/present/util.h
     renderer_vulkan/present/window_adapt_pass.cpp

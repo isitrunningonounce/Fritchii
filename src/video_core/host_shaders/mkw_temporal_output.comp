@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D scene_color;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D guest_color;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(guest_color)))) {
+        return;
+    }
+    imageStore(guest_color, pixel, vec4(texelFetch(scene_color, pixel, 0).rgb, 1.0));
+}

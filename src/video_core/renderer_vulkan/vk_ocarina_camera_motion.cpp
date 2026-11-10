@@ -11,6 +11,9 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr.h"
+#include "video_core/mkw_upscale.h"
+#include "video_core/host_shaders/mkw_temporal_output_comp_spv.h"
+#include "video_core/host_shaders/mkw_hudless_present_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
@@ -461,20 +464,24 @@ public:
     }
     void RecordOutput(Scheduler& scheduler, const void* descriptors,
                       const OcarinaUpscaler& upscaler, VkExtent2D extent, u64 frame,
-                      bool reset) {
-        scheduler.Record([this, descriptors, &upscaler, extent, frame, reset](vk::CommandBuffer cmd) {
-            if (upscaler.EvaluationFailed()) {
+                      bool reset, const void* fallback = nullptr) {
+        scheduler.Record([this, descriptors, &upscaler, extent, frame, reset, fallback](vk::CommandBuffer cmd) {
+            const bool failed = upscaler.EvaluationFailed();
+            if (failed && !fallback) {
                 return;
             }
             const VkMemoryBarrier before{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .srcAccessMask = fallback ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+                                          : VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
             };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                0, before);
+            cmd.PipelineBarrier(fallback ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+                                        : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
             const VkDescriptorSet set = descriptor_allocator.Commit();
-            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
+            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template,
+                                                    failed ? fallback : descriptors);
             cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
             cmd.Dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
@@ -486,7 +493,10 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0, after);
             static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
-            if (trace || reset || frame % 120 == 0) {
+            if (fallback && (trace || reset || failed || frame % 120 == 0)) {
+                LOG_INFO(Render_Vulkan, "Mario Kart World temporal: writeback frame={} history_reset={} native_color_fallback={}",
+                         frame, reset, failed);
+            } else if (!fallback && (trace || reset || frame % 120 == 0)) {
                 LOG_INFO(Render_Vulkan, "Ocarina temporal writeback frame={} history_reset={}", frame, reset);
             }
         });
@@ -702,11 +712,12 @@ struct OcarinaEffects {
 struct OcarinaUpscaler::Impl {
     Impl(const Device& device_, Scheduler& scheduler_, DescriptorPool& pool,
          ComputePassDescriptorQueue& queue_, MemoryAllocator& allocator_, StagingBufferPool& staging,
-         VideoCommon::OcarinaUpscaleBackend backend)
-        : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool},
+         VideoCommon::OcarinaUpscaleBackend backend, bool mario_kart_)
+        : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool}, mario_kart{mario_kart_},
           motion_pass{device, scheduler, pool},
           color_pass{device, scheduler, pool},
-          output_pass{device, scheduler, pool, OCARINA_DLSS_OUTPUT_COMP_SPV} {
+          output_pass{device, scheduler, pool, mario_kart ? std::span<const u32>{MKW_TEMPORAL_OUTPUT_COMP_SPV}
+                                                        : std::span<const u32>{OCARINA_DLSS_OUTPUT_COMP_SPV}} {
 #ifdef EGLANTINE_STREAMLINE
         if (backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
             dlss = std::make_unique<StreamlineDlssUpscaler>(device, scheduler, allocator);
@@ -715,7 +726,7 @@ struct OcarinaUpscaler::Impl {
 #endif
         // FSR 4 when it's turned on and AMD's runtime offers it; FSR 3.1 stays the fallback (it
         // takes over if FSR 4 fails to create or dispatch).
-        if (Fsr4Upscaler::IsWanted(device)) {
+        if (!mario_kart && Fsr4Upscaler::IsWanted(device)) {
             try {
                 fsr4 = std::make_unique<Fsr4Upscaler>(device, scheduler, allocator);
             } catch (const vk::Exception& error) {
@@ -735,6 +746,7 @@ struct OcarinaUpscaler::Impl {
     ComputePassDescriptorQueue& queue;
     MemoryAllocator& allocator;
     DescriptorPool& pool;
+    const bool mario_kart;
 #ifdef EGLANTINE_STREAMLINE
     std::unique_ptr<StreamlineDlssUpscaler> dlss;
 #endif
@@ -776,6 +788,13 @@ struct OcarinaUpscaler::Impl {
     std::array<std::unique_ptr<OcarinaFrameSlot>, 4> slots;
     std::optional<u64> last_frame;
     Matrix last_view_projection{};
+    vk::Image mkw_scene;
+    vk::ImageView mkw_scene_view;
+    VkExtent2D mkw_scene_extent{};
+    vk::Image mkw_present;
+    vk::ImageView mkw_present_view;
+    VkExtent2D mkw_present_extent{};
+    std::unique_ptr<OcarinaColorPass> mkw_present_pass;
     vk::Image native_scene;
     vk::ImageView native_scene_view;
     vk::Image composite;
@@ -808,13 +827,99 @@ struct OcarinaUpscaler::Impl {
 
 OcarinaUpscaler::OcarinaUpscaler(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
                                ComputePassDescriptorQueue& queue, MemoryAllocator& allocator,
-                               StagingBufferPool& staging, VideoCommon::OcarinaUpscaleBackend backend)
-    : impl{std::make_unique<Impl>(device, scheduler, pool, queue, allocator, staging, backend)} {}
+                               StagingBufferPool& staging, VideoCommon::OcarinaUpscaleBackend backend,
+                               bool mario_kart)
+    : impl{std::make_unique<Impl>(device, scheduler, pool, queue, allocator, staging, backend, mario_kart)} {}
 
 OcarinaUpscaler::~OcarinaUpscaler() = default;
 
 bool OcarinaUpscaler::EvaluationFailed() const {
     return impl->Failed();
+}
+
+void OcarinaUpscaler::SaveMarioKartScene(VkImage color, VkExtent2D extent) {
+    auto& state = *impl;
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    if (!state.mkw_scene || state.mkw_scene_extent.width != extent.width ||
+        state.mkw_scene_extent.height != extent.height) {
+        state.scheduler.Finish();
+        state.mkw_scene_view.reset();
+        constexpr auto format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        state.mkw_scene = CreateOcarinaImage(state.allocator, extent, format,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        state.mkw_scene_view = CreateOcarinaView(state.device, *state.mkw_scene, format);
+        state.mkw_scene_extent = extent;
+    }
+    const VkImage snapshot = *state.mkw_scene;
+    state.scheduler.RecordNamed("Mario Kart World HUD-less scene snapshot",
+        [color, snapshot, extent](vk::CommandBuffer cmd, vk::CommandBuffer) {
+        const std::array before{
+            ProbeBarrier(color, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+            ProbeBarrier(snapshot, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, {}, {}, before);
+        const VkImageCopy copy{
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .extent = {extent.width, extent.height, 1},
+        };
+        cmd.CopyImage(color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snapshot,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+        const std::array after{
+            ProbeBarrier(color, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT |
+                             VK_ACCESS_MEMORY_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+            ProbeBarrier(snapshot, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, {}, {}, after);
+    });
+    state.scheduler.InvalidateState();
+}
+
+void OcarinaUpscaler::MakeMarioKartHudlessPresent(VkExtent2D extent) {
+    auto& state = *impl;
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    if (!state.mkw_present || state.mkw_present_extent.width != extent.width ||
+        state.mkw_present_extent.height != extent.height) {
+        state.scheduler.Finish();
+        state.mkw_present_view.reset();
+        constexpr auto format = VK_FORMAT_R8G8B8A8_UNORM;
+        state.mkw_present = CreateOcarinaImage(state.allocator, extent, format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        state.mkw_present_view = CreateOcarinaView(state.device, *state.mkw_present, format);
+        state.mkw_present_extent = extent;
+    }
+    if (!state.mkw_present_pass) {
+        state.mkw_present_pass = std::make_unique<OcarinaColorPass>(
+            state.device, state.scheduler, state.pool, MKW_HUDLESS_PRESENT_COMP_SPV);
+    }
+    state.queue.Acquire(state.scheduler, 2);
+    state.queue.AddSampledImage(*state.mkw_scene_view, state.PointSampler());
+    state.queue.AddImage(*state.mkw_present_view);
+    state.mkw_present_pass->Record(state.scheduler, state.queue.UpdateData(), *state.mkw_present, extent);
+    state.scheduler.Record([](vk::CommandBuffer cmd) {
+        const VkMemoryBarrier ready{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, ready);
+    });
+    state.scheduler.InvalidateState();
+}
+
+VkImage OcarinaUpscaler::MarioKartHudlessImage() const {
+    return *impl->mkw_present;
+}
+
+VkImageView OcarinaUpscaler::MarioKartHudlessView() const {
+    return *impl->mkw_present_view;
 }
 
 void OcarinaUpscaler::SaveSceneReference(VkImageView color) {
@@ -921,7 +1026,8 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                             VkExtent2D output_extent, VkExtent2D target_extent,
                             const Matrix& current, const Matrix& previous,
                             const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame,
-                            std::array<f32, 2> jitter) {
+                            std::array<f32, 2> jitter, VkFormat depth_format,
+                            std::optional<VideoCommon::TemporalCameraConstants> camera) {
     auto& state = *impl;
     if (state.last_frame == frame || state.Failed()) {
         return false;
@@ -988,6 +1094,9 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         bias_image = *effects.bias;
     }
 
+    const VkImageAspectFlags depth_aspect = VK_IMAGE_ASPECT_DEPTH_BIT |
+        ((depth_format == VK_FORMAT_D24_UNORM_S8_UINT || depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+             ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     const bool reset = !state.last_frame || frame != *state.last_frame + 1 ||
                        !std::ranges::equal(previous, state.last_view_projection,
                                            [](f32 a, f32 b) { return std::abs(a - b) < 0.001f; });
@@ -995,7 +1104,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     if (state.dlss && !state.dlss->Upscale({
             .color = {*resources.color_view, *resources.color, LIVE_COLOR_FORMAT, COLOR_RANGE,
                       VK_IMAGE_ASPECT_COLOR_BIT},
-            .depth = {depth, depth_image, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE, VK_IMAGE_ASPECT_DEPTH_BIT},
+            .depth = {depth, depth_image, depth_format, DEPTH_RANGE, depth_aspect},
             .motion_vectors = {*resources.motion_view, *resources.motion, MOTION_FORMAT,
                                COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
             .render_size = extent,
@@ -1009,6 +1118,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .reset = reset,
             .depth_inverted = false,
             .hdr = false,
+            .camera = camera,
         })) {
         state.scheduler.InvalidateState();
         return false;
@@ -1023,7 +1133,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
         used_fsr4 = state.fsr4->Upscale({
             .color = {*resources.color, LIVE_COLOR_FORMAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
-            .depth = {depth_image, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE, VK_IMAGE_ASPECT_DEPTH_BIT},
+            .depth = {depth_image, depth_format, DEPTH_RANGE, depth_aspect},
             .motion_vectors = {*resources.motion, MOTION_FORMAT, COLOR_RANGE,
                                VK_IMAGE_ASPECT_COLOR_BIT},
             .reactive = bias_image ? std::optional{Fsr4Upscaler::Image{
@@ -1073,13 +1183,16 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .reactive_mask = bias_view,
             .transparency_mask = bias_view,
             .vertical_fov = 2.0f * std::atan(1.0f / projection_y),
+            .camera_near = state.mario_kart ? 1.0f : 0.1f,
+            .camera_far = state.mario_kart ? 10000.0f : 25000.0f,
         });
         state.last_evaluation = now;
         static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
         if (trace || frame % 120 == 0 || fsr_reset) {
             LOG_INFO(Render_Vulkan,
-                     "Ocarina FSR 3.1 evaluated frame={} {}x{} -> {}x{} reset={} effects={} "
+                     "{} FSR 3.1 evaluated frame={} {}x{} -> {}x{} reset={} effects={} "
                      "jitter=({:.3f},{:.3f})",
+                     state.mario_kart ? "Mario Kart World temporal:" : "Ocarina",
                      frame, extent.width, extent.height, output_extent.width, output_extent.height,
                      fsr_reset, bias_view != VK_NULL_HANDLE, jitter[0], jitter[1]);
         }
@@ -1088,14 +1201,21 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     // A resize can submit the inputs before recording evaluation, so keep the later tick.
     resources.tick = state.scheduler.CurrentTick();
     if (target) {
-        state.queue.Acquire(state.scheduler, 2);
+        state.queue.Acquire(state.scheduler, state.mario_kart ? 4 : 2);
         const bool same_size = output_extent.width == target_extent.width &&
                                output_extent.height == target_extent.height;
         const auto output_sampler = same_size ? sampler : state.LinearSampler();
         state.queue.AddSampledImage(state.OutputView(), output_sampler);
         state.queue.AddImage(target);
-        state.output_pass.RecordOutput(state.scheduler, state.queue.UpdateData(), *this,
-                                        target_extent, frame, reset);
+        const auto* descriptors = state.queue.UpdateData();
+        const void* fallback = nullptr;
+        if (state.mario_kart) {
+            state.queue.AddSampledImage(color, sampler);
+            state.queue.AddImage(target);
+            fallback = descriptors + 2;
+        }
+        state.output_pass.RecordOutput(state.scheduler, descriptors, *this,
+                                        target_extent, frame, reset, fallback);
     }
     state.scheduler.InvalidateState();
     state.last_frame = frame;
@@ -1115,6 +1235,18 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }
     return backend;
+}
+
+VideoCommon::OcarinaUpscaleBackend ResolveMarioKartUpscaler(const Device& device) {
+    const char* value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    bool dlss_available = false;
+#ifdef EGLANTINE_STREAMLINE
+    dlss_available = Streamline::IsDlssAvailable();
+#endif
+    const auto backend = VideoCommon::SelectMarioKartUpscaler(
+        Settings::NvidiaDlssEnabled(), dlss_available, value ? value : "");
+    return backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)
+        ? VideoCommon::OcarinaUpscaleBackend::Native : backend;
 }
 
 } // namespace Vulkan
