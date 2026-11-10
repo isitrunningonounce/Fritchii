@@ -2656,12 +2656,13 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
     return false;
 }
 
-ComputePipeline* PipelineCache::CurrentComputePipeline() {
+ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
 
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
         return nullptr;
     }
+    native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
     const auto& qmd{kepler_compute->launch_description};
     const ComputePipelineCacheKey key{
         .unique_hash = shader->unique_hash,
@@ -3426,6 +3427,8 @@ u64 SpirvSettingsStamp() {
             << 17;
     bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
     bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
+    // Translation revision: rebuild prepared modules after the upstream shader fixes.
+    bits |= u64{1} << 32;
     return bits;
 }
 
@@ -4643,7 +4646,8 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
     // NX2KEPT5 (v5.6): F32->S32 conversions saturate in range (zortos293/Lichii#1051), and the
     // fragment output masks are kept with the infos (Fritchii #29, AMD horizon rainbow).
-    return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+    // NX2KEPT6: upstream shader lowering, MKW water and Intel task/mesh metadata fixes.
+    return fmt::format("{}kept NX2KEPT6 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
@@ -5420,7 +5424,8 @@ vk::PipelineCache& PipelineCache::WarmPipelineCache() {
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        !device.CanReadPipelineCacheDuringBuilds()) {
         return;
     }
     if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {
@@ -5456,7 +5461,8 @@ bool PipelineCache::VulkanPipelineCacheSaveDue(std::chrono::steady_clock::time_p
 }
 
 void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        !device.CanReadPipelineCacheDuringBuilds()) {
         return;
     }
     if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {

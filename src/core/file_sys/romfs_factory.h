@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -56,6 +57,8 @@ private:
     VirtualFile base;
 
     bool updatable;
+    mutable VirtualFile layered_file;
+    mutable std::mutex layered_mutex;
 
     ContentProvider& content_provider;
     Service::FileSystem::FileSystemController& filesystem_controller;

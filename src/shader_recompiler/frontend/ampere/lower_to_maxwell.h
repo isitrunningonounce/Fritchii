@@ -310,7 +310,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // (0x9a8), RED (0x98e) and SURED (0x59f), all listed with operand 32 in RegisterPressure.
             if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xb6c && opcode != 0xf6c && opcode != 0x986 && opcode != 0x987 && opcode != 0xf66 && opcode != 0x988 && opcode != 0x927 && opcode != 0x9a8 && opcode != 0x98e && opcode != 0x59f) continue;
             const u32 reg = insn.Bits(bit, 8);
-            if (reg >= (uses_uniform_bank ? high_uniform_base : 246U) && reg < 255)
+            const u32 span = (bit == 24 && opcode == 0x59f)
+                                 ? (insn.Bits(61, 3) <= 1 ? 1U : insn.Bits(61, 3) <= 3 ? 2U : 3U)
+                                 : (bit == 24 && opcode == 0x98e) ? 2U : 1U;
+            if (reg < 255 && reg + span > (uses_uniform_bank ? high_uniform_base : 246U))
                 requires_shadow = true;
         }
         if (requires_shadow) {
@@ -1591,24 +1594,36 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36));
             break;
         }
-        case 0x59f: { // SURED.D.STRONG.GPU.IGN U32, direct descriptor, buffer/2D/3D.
-            const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
-            const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
-            const u32 dimension = insn.Bits(61, 3);
-            const u32 operation = insn.Bits(87, 3);
-            // Eglantine nx2 supports 3D ADD/OR with the same Maxwell surface encoding.
-            if ((insn.words[2] & ~0x03800000U) != 0x0010e000 ||
-                (dimension != 1 && dimension != 3 && dimension != 5) ||
-                (dimension == 5 && operation != 0 && operation != 6) || binding >= 18 ||
-                offset > 0x1fff || insn.Bits(59, 2) || coordinate > (dimension == 5 ? 252U : 253U))
+        case 0x59f: { // SURED (bound descriptor): SUATOM's layout without a destination or fault predicate.
+            // Coordinates 24, data 32, descriptor 40..58, dimension 61..63 (Maxwell's codes), type 73..75
+            // (U32/S32) and the operation at 87..90 (ADD..XOR). Lowered to SUATOM with the result in RZ.
+            const u32 coordinate = insn.Bits(24, 8), data = insn.Bits(32, 8);
+            const u32 offset = insn.Bits(40, 14), binding = insn.Bits(54, 5), dimension = insn.Bits(61, 3);
+            const u32 type = insn.Bits(73, 3), operation = insn.Bits(87, 4);
+            const u32 coordinates = dimension <= 1 ? 1U : dimension <= 3 ? 2U : 3U;
+            // Retain the existing U32 INC/DEC forms while extending the other reductions.
+            if (type == 0 && (operation == 3 || operation == 4) &&
+                (dimension == 1 || dimension == 3) &&
+                (insn.words[2] & ~0x03800000U) == 0x0010e000 && !insn.Bits(59, 2) &&
+                binding < 18 && offset <= 0x1fff && coordinate <= 253) {
+                if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                    return fail(index, "native surface descriptor buffer conflict");
+                result.required_texture_buffer = binding;
+                emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+                     (u64{operation} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+                break;
+            }
+            if ((insn.words[2] & ~((7U << 9) | (15U << 23))) != 0x0010e000 || insn.Bits(59, 2) ||
+                dimension > 5 || type > 1 || operation > 7 || operation == 3 || operation == 4 ||
+                binding >= 18 || offset > 0x1fff ||
+                (coordinate == 255 ? coordinates > 1 : coordinate + coordinates > 255) ||
+                (data >= 253 && data != 255))
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
             result.required_texture_buffer = binding;
-            // Maxwell SURED: operand 0-7, coordinates 8-15, op 24, U32 zero at 20,
-            // type 33 (1 = buffer, 3 = 2D, 5 = 3D), bound offset 36, bound 51.
-            emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
-                (u64{operation} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+            emit(0xea00000000000000ULL | predicate | 255 | (u64{coordinate} << 8) | (u64{data} << 20) |
+                 (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{type} << 51));
             break;
         }
         case 0x301: // BREV register.
@@ -1645,7 +1660,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 shift_operand &&
                 (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) == 0x00000600U) {
                 load_shift();
-                emit(base(0x5c28000000000000ULL) | (u64{low} << 8) | (u64{shift} << 20));
+                emit(base(0x5c28000000000000ULL) | (u64{low} << 8) | (u64{shift} << 20) |
+                     (u64{insn.Bits(75, 1)} << 39));
                 break;
             }
             if (!shift_operand || insn.Bits(73, 2) != 3 || shift == ~0U ||
@@ -3343,8 +3359,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(76, 4)} << 48) | (u64{1} << 52) | (u64{insn.Bits(80, 1)} << 55));
             break;
         }
-        case 0x234: case 0x434: { // HSETP2 with a register (B swizzle 60-61, abs 62, neg 63) or an
-                      // immediate half pair: A swizzle 74-75 (neg 72, abs 73),
+        case 0x234: case 0x434: case 0x634: { // HSETP2 with a register (B swizzle 60-61, abs 62,
+                      // neg 63), an immediate half pair or a constant buffer (same B fields):
+                      // A swizzle 74-75 (neg 72, abs 73),
                       // combine 69-70, H_AND 71, compare 76-79, FTZ 80, P/Q 81-86, input 87-90.
             u64 source = u64{250} << 20;
             if (opcode == 0x234) {
@@ -3352,6 +3369,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     return fail(index, "native half comparison mode");
                 source = (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(60, 2)} << 28) |
                          (u64{insn.Bits(62, 1)} << 30) | (u64{insn.Bits(63, 1)} << 31);
+            } else if (opcode == 0x634) {
+                // Mario Kart World: HSETP2.GT.AND P1, PT, RZ.H0_H0, c[0x7][0xfc].H1_H1, !P1.
+                if (insn.Bits(64, 5)) return fail(index, "native half comparison mode");
+                if (materialize(2, 255, 250, false, false) == 255) break;
+                source |= (u64{insn.Bits(60, 2)} << 28) | (u64{insn.Bits(62, 1)} << 30) |
+                          (u64{insn.Bits(63, 1)} << 31);
             } else {
                 mov_imm(250, insn.words[1]);
             }

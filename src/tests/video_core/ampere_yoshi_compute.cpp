@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 
@@ -55,7 +56,7 @@ TEST_CASE("Ampere IMNMX retains its signed twenty-bit immediate encoding", "[amp
 }
 
 TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampere][yoshi]") {
-    for (const u32 dimension : {1U, 3U, 5U}) {
+    for (const u32 dimension : {0U, 1U, 2U, 3U, 4U, 5U}) {
         for (const u32 guard : {0U, 7U, 9U}) {
             auto instruction = Reduction;
             instruction.words[0] = (instruction.words[0] & ~0xf000U) | (guard << 12);
@@ -66,16 +67,16 @@ TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampe
             REQUIRE(lowered.instructions.size() == 2);
             CHECK(lowered.required_texture_buffer == 3);
             CHECK(lowered.instructions[0] ==
-                  (0xeb48002000000506ULL | (u64{guard} << 16) | (u64{dimension} << 33)));
+                  (0xea000020006005ffULL | (u64{guard} << 16) | (u64{dimension} << 33)));
         }
     }
-    for (const u32 dimension : {0U, 2U, 4U, 6U, 7U}) {
+    for (const u32 dimension : {6U, 7U}) {
         auto instruction = Reduction;
         instruction.words[1] = (instruction.words[1] & 0x1fffffffU) | (dimension << 29);
         REQUIRE_FALSE(LowerToMaxwell(std::array{instruction, Exit}));
     }
     auto unsupported = Reduction;
-    unsupported.words[2] |= 0x200;
+    unsupported.words[2] |= 0x400;
     REQUIRE_FALSE(LowerToMaxwell(std::array{unsupported, Exit}));
 }
 
@@ -196,7 +197,7 @@ TEST_CASE("Yoshi immediate I2F preserves F16 size signedness rounding and guard"
 TEST_CASE("Yoshi 3D SURED preserves all coordinates and the OR operation", "[ampere][yoshi]") {
     constexpr Instruction captured{{0x0800759f, 0xa0c00201, 0x0310e000, 0x000fe200}};
     for (const u32 guard : {0U, 7U, 9U}) {
-        for (const u32 operation : {0U, 6U}) {
+        for (const u32 operation : {0U, 1U, 2U, 5U, 6U, 7U}) {
             auto instruction = captured;
             instruction.words[0] = (instruction.words[0] & ~0xf000U) | (guard << 12);
             instruction.words[2] = 0x0010e000U | (operation << 23);
@@ -205,10 +206,10 @@ TEST_CASE("Yoshi 3D SURED preserves all coordinates and the OR operation", "[amp
             REQUIRE(lowered.instructions.size() == 2);
             CHECK(lowered.required_texture_buffer == 3);
             CHECK(lowered.instructions[0] ==
-                  (0xeb48002a00000801ULL | (u64{guard} << 16) | (u64{operation} << 24)));
+                  (0xea00002a001008ffULL | (u64{guard} << 16) | (u64{operation} << 29)));
         }
     }
-    for (const u32 operation : {1U, 2U, 3U, 4U, 5U, 7U, 8U}) {
+    for (const u32 operation : {3U, 4U, 8U}) {
         auto invalid = captured;
         invalid.words[2] = 0x0010e000U | (operation << 23);
         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
@@ -221,7 +222,17 @@ TEST_CASE("Yoshi 3D SURED preserves all coordinates and the OR operation", "[amp
     for (const u32 coordinate : {214U, 218U}) {
         auto crossing = captured;
         crossing.words[0] = (crossing.words[0] & 0xffffffU) | (coordinate << 24);
-        REQUIRE_FALSE(Shader::Ampere::PrepareRegisterPressure(crossing, 216).valid);
+        const auto pressure = Shader::Ampere::PrepareRegisterPressure(crossing, 216);
+        REQUIRE(pressure.valid);
+        const u32 mapped = pressure.instruction.Bits(24, 8);
+        CHECK(mapped + 3 <= 216);
+        for (u32 component = 0; component < 3; ++component) {
+            const u32 original = coordinate + component;
+            const u32 bank = original >= 216 ? 1U : 0U;
+            CHECK(std::ranges::find(pressure.prefix,
+                Shader::Ampere::NativeRegisterCopy(0, mapped + component, bank, original)) !=
+                pressure.prefix.end());
+        }
     }
     auto high = captured;
     high.words[0] = (high.words[0] & 0xffffffU) | (216U << 24);

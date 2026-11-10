@@ -78,6 +78,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(16);
         operand(24);
         break;
+    case 0xc24: // IMAD with a uniform multiplier and register addend
     case 0xa24:
     case 0xa23:
     case 0x623:
@@ -108,13 +109,16 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(32);
         break;
     case 0xb6c:
-    case 0xf6c: // TXD: results in Rd/Rd+1 and the second pair, coordinates in Ra (Ra+2 is the layer
-                // of ARRAY_2D), gradients in Rb..Rb+3.
-        operand(16, 2);
-        operand(24, input.Bits(61, 3) == 5 ? 3 : 2);
+    case 0xf6c: { // TXD: results in Rd and the second destination, coordinates in Ra, gradients in Rb.
+        const u32 channels = static_cast<u32>(std::popcount(input.Bits(72, 4)));
+        operand(16, (std::min)((std::max)(channels, 1U), 2U));
+        operand(24, input.Bits(61, 3) == 5 ? 3 : 2); // ARRAY_2D also reads the layer
         operand(32, 4);
-        operand(64, 2);
+        if (channels > 2) {
+            operand(64, channels - 2);
+        }
         break;
+    }
     case 0x224:
     case 0x223:
         operand(16);
@@ -141,7 +145,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(16);
         break;
     case 0x59f:
-        operand(24, input.Bits(61, 3) == 5 ? 3 : 2);
+        operand(24, input.Bits(61, 3) <= 1 ? 1U : input.Bits(61, 3) <= 3 ? 2U : 3U);
         operand(32);
         break;
     case 0x98e:
@@ -256,43 +260,89 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     }
     std::array<bool, 256> used{};
     std::array<bool, 64> groups{};
+    std::array<bool, 64> paired{};
     for (const auto [bit, count] : operands) {
         const u32 reg = input.Bits(bit, 8);
-        if (reg == 255)
+        if (reg == 255) {
             continue;
-        if (reg + count > 255 ||
-            (reg < reserved && reg + count > reserved) ||
-            (reg >= reserved && reg / 4 != (reg + count - 1) / 4)) {
+        }
+        if (reg + count > 255) {
             result.valid = false;
             return result;
         }
+        const bool overlaps_reserved = reg + count > reserved;
         for (u32 component = 0; component < count; ++component) {
             used[reg + component] = true;
-            if (reg + component >= reserved)
+            if (overlaps_reserved) {
                 groups[(reg + component) / 4] = true;
+            }
+        }
+        if (overlaps_reserved && reg / 4 != (reg + count - 1) / 4) {
+            paired[reg / 4] = true;
+        }
+    }
+    for (u32 group = 0; group < groups.size(); ++group) {
+        if (!groups[group]) {
+            continue;
+        }
+        // The allocator reserves at most two contiguous quartets for an operand group.
+        if (group > 0 && paired[group - 1] && paired[group]) {
+            result.valid = false;
+            return result;
+        }
+        for (u32 component = 0; component < 4; ++component) {
+            used[group * 4 + component] = true;
         }
     }
     std::array<u32, 64> mapped{};
     for (u32 group = 0; group < groups.size(); ++group) {
-        if (!groups[group])
+        if (!groups[group]) {
             continue;
-        u32 borrow = reserved;
-        while (borrow >= 4) {
-            borrow -= 4;
-            if (!used[borrow] && !used[borrow + 1] && !used[borrow + 2] && !used[borrow + 3])
-                break;
         }
-        if (used[borrow] || used[borrow + 1] || used[borrow + 2] || used[borrow + 3]) {
-            result.valid = false;
-            return result;
+        if (group > 0 && paired[group - 1]) {
+            mapped[group] = mapped[group - 1] + 4;
+        } else if (paired[group]) {
+            u32 borrow = reserved >= 4 ? reserved - 4 : 0;
+            while (borrow >= 4) {
+                borrow -= 4;
+                if (!used[borrow] && !used[borrow + 1] && !used[borrow + 2] && !used[borrow + 3] &&
+                    !used[borrow + 4] && !used[borrow + 5] && !used[borrow + 6] && !used[borrow + 7]) {
+                    break;
+                }
+            }
+            if (borrow + 8 > reserved ||
+                used[borrow] || used[borrow + 1] || used[borrow + 2] || used[borrow + 3] ||
+                used[borrow + 4] || used[borrow + 5] || used[borrow + 6] || used[borrow + 7]) {
+                result.valid = false;
+                return result;
+            }
+            mapped[group] = borrow;
+            for (u32 component = 0; component < 8; ++component) {
+                used[borrow + component] = true;
+            }
+        } else {
+            u32 borrow = reserved;
+            while (borrow >= 4) {
+                borrow -= 4;
+                if (!used[borrow] && !used[borrow + 1] && !used[borrow + 2] && !used[borrow + 3]) {
+                    break;
+                }
+            }
+            if (used[borrow] || used[borrow + 1] || used[borrow + 2] || used[borrow + 3]) {
+                result.valid = false;
+                return result;
+            }
+            mapped[group] = borrow;
+            for (u32 component = 0; component < 4; ++component) {
+                used[borrow + component] = true;
+            }
         }
-        mapped[group] = borrow;
         for (u32 component = 0; component < 4; ++component) {
-            const u32 low = borrow + component, high = group * 4 + component;
-            used[low] = true;
+            const u32 low = mapped[group] + component, high = group * 4 + component;
+            const u32 high_bank = high >= reserved ? 1U : 0U;
             result.prefix.push_back(NativeRegisterCopy(2, low, 0, low));
-            result.prefix.push_back(NativeRegisterCopy(0, low, 1, high));
-            result.suffix.push_back(NativeRegisterCopy(1, high, 0, low));
+            result.prefix.push_back(NativeRegisterCopy(0, low, high_bank, high));
+            result.suffix.push_back(NativeRegisterCopy(high_bank, high, 0, low));
             result.suffix.push_back(NativeRegisterCopy(0, low, 2, low));
         }
     }

@@ -15,6 +15,8 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/info_serialize.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 
 namespace {
@@ -132,7 +134,8 @@ Profile MakeProfile() {
 // A one-triangle mesh program (or the task program launching it), as the frontend lowers them.
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
-                             Profile profile = MakeProfile(), bool lane_id = false) {
+                             Profile profile = MakeProfile(), bool lane_id = false,
+                             bool emit_task_count = true) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -155,7 +158,7 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
         ir.IsbeWriteAttribute(ir.Imm32(0), index);
         ir.IsbeWriteMapU8(ir.Imm32(4), ir.Imm32(0));
         ir.IsbeWriteMapU32(ir.Imm32(3), ir.Imm32(1));
-    } else {
+    } else if (emit_task_count) {
         ir.IsbeWriteAttribute(ir.Imm32(4), ir.Imm32(1)); // one mesh workgroup
     }
     ir.Epilogue();
@@ -194,6 +197,68 @@ TEST_CASE("Mesh fallback leaves native task and mesh programs as mesh shaders",
     Dump(task, "native-task");
     REQUIRE(Model(task) == spv::ExecutionModel::TaskEXT);
     REQUIRE(UsesStorageClass(task, spv::StorageClass::TaskPayloadWorkgroupEXT));
+}
+
+TEST_CASE("A fully culled native task initializes its emitted mesh count", "[spirv][mesh_fallback]") {
+    const auto task = EmitProgram(Stage::Task, false, false, MakeProfile(), false, false);
+    Dump(task, "native-task-culled");
+    std::vector<u32> zero_constants;
+    std::vector<u32> payload_pointers;
+    u32 payload{};
+    bool initialized{};
+    bool synchronized{};
+    for (const auto& inst : Instructions(task)) {
+        if (inst.op == spv::Op::OpConstant && inst.operands.size() == 3 && inst.operands[2] == 0) {
+            zero_constants.push_back(inst.operands[1]);
+        } else if (inst.op == spv::Op::OpVariable &&
+                   inst.operands[2] == static_cast<u32>(spv::StorageClass::TaskPayloadWorkgroupEXT)) {
+            payload = inst.operands[1];
+        } else if (inst.op == spv::Op::OpAccessChain && inst.operands[2] == payload) {
+            payload_pointers.push_back(inst.operands[1]);
+        } else if (inst.op == spv::Op::OpStore &&
+                   std::ranges::find(payload_pointers, inst.operands[0]) != payload_pointers.end()) {
+            REQUIRE(std::ranges::find(zero_constants, inst.operands[1]) != zero_constants.end());
+            initialized = true;
+        } else if (inst.op == spv::Op::OpControlBarrier && initialized) {
+            synchronized = true;
+        } else if (inst.op == spv::Op::OpEmitMeshTasksEXT) {
+            REQUIRE(initialized);
+            REQUIRE(synchronized);
+        }
+    }
+    REQUIRE(initialized);
+    REQUIRE(synchronized);
+}
+
+TEST_CASE("Removing a divergent barrier retains the guest warp requirement", "[spirv][mesh_fallback]") {
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::IREmitter ir{block};
+    ir.Barrier();
+    IR::Program program;
+    program.syntax_list = {{{}, IR::AbstractSyntaxNode::Type::If},
+                           {{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::EndIf}};
+    REQUIRE_FALSE(program.info.UsesWarpOps());
+    Optimization::ConditionalBarrierPass(program);
+    REQUIRE(program.info.removed_conditional_barrier);
+    REQUIRE(program.info.UsesWarpOps());
+}
+
+TEST_CASE("Cached shader metadata retains removed-barrier subgroup requirements", "[spirv][mesh_fallback]") {
+    for (const bool removed : {false, true}) {
+        Info source;
+        source.removed_conditional_barrier = removed;
+        std::vector<u8> bytes;
+        SerializeInfo(source, bytes);
+        std::span<const u8> remaining{bytes};
+        Info restored;
+        restored.removed_conditional_barrier = !removed;
+        REQUIRE(DeserializeInfo(remaining, restored));
+        REQUIRE(remaining.empty());
+        CHECK(restored.removed_conditional_barrier == removed);
+        CHECK(restored.UsesWarpOps() == removed);
+    }
 }
 
 TEST_CASE("Mesh fallback emits mesh programs as compute shaders writing storage buffers",

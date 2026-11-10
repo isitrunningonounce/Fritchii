@@ -143,7 +143,11 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         const GPUVAddr current_gpu_addr = gpu_addr + offset;
         [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, false);
         SetEntry(current_gpu_addr, entry_type, false);
-        if (current_entry_type != entry_type) {
+        const bool changed_backing = entry_type == EntryType::Mapped &&
+            current_entry_type == EntryType::Mapped &&
+            page_table[PageEntryIndex(current_gpu_addr, false)] !=
+                static_cast<u32>((dev_addr + offset) >> cpu_page_bits);
+        if (current_entry_type != entry_type || changed_backing) {
             if (modified_size == 0) {
                 modified_start = current_gpu_addr;
             }
@@ -185,7 +189,11 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
         const GPUVAddr current_gpu_addr = gpu_addr + offset;
         [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, true);
         SetEntry(current_gpu_addr, entry_type, true);
-        if (current_entry_type != entry_type) {
+        const bool changed_backing = entry_type == EntryType::Mapped &&
+            current_entry_type == EntryType::Mapped &&
+            big_page_table_dev[PageEntryIndex(current_gpu_addr, true)] !=
+                static_cast<u32>((dev_addr + offset) >> cpu_page_bits);
+        if (current_entry_type != entry_type || changed_backing) {
             if (modified_size == 0) {
                 modified_start = current_gpu_addr;
             }
@@ -287,7 +295,24 @@ std::optional<size_t> MemoryManager::GetNativeMappingSizeFrom(GPUVAddr gpu_addr)
     return static_cast<size_t>(it->second - gpu_addr);
 }
 
+void MemoryManager::PreserveMapping(GPUVAddr gpu_addr, std::size_t size) {
+    if (!UsesNativeTiling() || rasterizer == nullptr || size == 0) {
+        return;
+    }
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> ranges;
+    GetSubmappedRangeImpl<false>(gpu_addr, size, ranges);
+    for (const auto& [address, bytes] : ranges) {
+        rasterizer->FlushRegion(address, bytes, VideoCommon::CacheType::All);
+    }
+}
+
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
+    if (UsesNativeTiling() && rasterizer != nullptr && size != 0 &&
+        (!IsContinuousRange(gpu_addr, size) || GpuToCpuAddress(gpu_addr) != dev_addr)) {
+        PreserveMapping(gpu_addr, size);
+        rasterizer->FlushRegion(dev_addr, size, VideoCommon::CacheType::All);
+        rasterizer->InvalidateRegion(dev_addr, size, VideoCommon::CacheType::TextureCache);
+    }
     const auto lock = LockPageTableForWrite(page_table_lock);
     TrackNativeMapping(gpu_addr, size, true);
     if (is_big_pages)
@@ -296,6 +321,7 @@ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
 }
 
 GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
+    PreserveMapping(gpu_addr, size);
     const auto lock = LockPageTableForWrite(page_table_lock);
     TrackNativeMapping(gpu_addr, size, false);
     if (is_big_pages)
@@ -307,6 +333,7 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     if (size == 0) {
         return;
     }
+    PreserveMapping(gpu_addr, size);
     TrackNativeMapping(gpu_addr, size, false);
     GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
 
@@ -439,7 +466,10 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         return;
     }
 
-    ASSERT(false);
+    static std::atomic<u32> reported{};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_ERROR(HW_GPU, "Write{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
+    }
 }
 
 template u8 MemoryManager::Read<u8>(GPUVAddr addr) const;

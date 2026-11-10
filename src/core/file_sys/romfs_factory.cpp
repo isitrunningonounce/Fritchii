@@ -42,9 +42,16 @@ VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const
     if (!updatable) {
         // sergio: a NUP already carries its update merged, but LayeredFS mods
         // (user/load/<title>/<mod>/romfs) still apply; no NCA, so no update step.
-        const PatchManager mods{current_process_title_id, filesystem_controller,
-                                content_provider};
-        return mods.PatchRomFS(nullptr, file, type, nullptr);
+        std::scoped_lock lock{layered_mutex};
+        if (!layered_file) {
+            const PatchManager mods{current_process_title_id, filesystem_controller,
+                                    content_provider};
+            layered_file = mods.PatchRomFS(nullptr, file, type, nullptr);
+            if (!layered_file) {
+                layered_file = file;
+            }
+        }
+        return layered_file;
     }
 
     const auto nca = content_provider.GetEntry(current_process_title_id, type);

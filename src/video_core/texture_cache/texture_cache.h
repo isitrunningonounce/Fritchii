@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <tuple>
 #include <map>
 #include <vector>
 #include <optional>
@@ -426,6 +427,8 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
 
 template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+    const u64 budget_critical = critical_memory;
+    const u64 budget_expected = expected_memory;
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget. Larger cards get 5/8 of the
@@ -450,13 +453,15 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
-    // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
-    for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
-                                       std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
+    // Overrides may exceed the collection cap, but not the device budget before that cap.
+    for (const auto& [name, target, limit] :
+         {std::tuple{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory, budget_expected},
+          std::tuple{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory, budget_critical}}) {
         if (const char* value = std::getenv(name)) {
-            *target = std::strtoull(value, nullptr, 10) << 20;
+            *target = (std::min)(static_cast<u64>(std::strtoull(value, nullptr, 10)) << 20, limit);
         }
     }
+    expected_memory = (std::min)(expected_memory, critical_memory);
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
@@ -1125,6 +1130,30 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
     MarkModification(slot_images[id]);
 }
 
+template <class P>
+bool TextureCache<P>::PublishComputeCollisionImage(u32 index) {
+    const auto view_id = VisitImageView(index, true);
+    if (!view_id || !slot_image_views[view_id].image_id) {
+        return false;
+    }
+    Image& image = slot_images[slot_image_views[view_id].image_id];
+    const auto& info = image.info;
+    // The title writes a CPU-readable 256x256 pitch-linear SNORM height map.
+    if (info.type != ImageType::Linear || info.format != PixelFormat::R16G16B16A16_SNORM ||
+        info.size.width != 256 || info.size.height != 256 || info.size.depth != 1 ||
+        info.pitch != 2048 || info.resources.layers != 1 || info.resources.levels != 1 ||
+        !IsDownloadable(image) ||
+        !gpu_memory->IsFullyMappedRange(image.gpu_addr, image.guest_size_bytes)) {
+        return false;
+    }
+    const auto copies = FullDownloadCopies(info);
+    auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+    image.DownloadMemory(map, copies);
+    runtime.Finish();
+    SwizzleImage(*gpu_memory, image.gpu_addr, info, copies, map.mapped_span, swizzle_data_buffer);
+    image.flags &= ~ImageFlagBits::GpuModified;
+    return true;
+}
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
     bool has_blacklisted = false;
@@ -1837,11 +1866,11 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             return;
         }
         if (True(image.flags & ImageFlagBits::SparseTiles)) {
-            MarkRangeWritten(image, cpu_addr, size);
+            MarkRangeWritten(image, image_id, cpu_addr, size);
             return;
         }
         if (UploadsByLayer(image)) {
-            MarkLayersWritten(image, cpu_addr, size);
+            MarkLayersWritten(image, image_id, cpu_addr, size);
             return;
         }
         if (True(image.flags & ImageFlagBits::CpuModified)) {
@@ -2838,40 +2867,61 @@ bool TextureCache<P>::UploadsByLayer(const ImageBase& image) const noexcept {
 }
 
 template <class P>
-void TextureCache<P>::MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size) {
+void TextureCache<P>::MarkLayersWritten(Image& image, ImageId image_id, DAddr cpu_addr, size_t size) {
     if (True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty()) {
         return; // all of it is dirty already
     }
     const u32 layers = static_cast<u32>(image.info.resources.layers);
-    if (False(image.flags & ImageFlagBits::CpuModified)) {
-        image.flags |= ImageFlagBits::CpuModified;
-        image.dirty_layers.assign(Common::DivCeil(layers, 64U), 0);
-    }
-    const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr) - image.cpu_addr;
-    const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes) -
-                      image.cpu_addr;
     const u32 stride = image.info.layer_stride;
-    if (end <= begin || stride == 0) {
+    if (stride == 0 || layers == 0) {
         return;
     }
-    const u32 last = (std::min)(static_cast<u32>((end - 1) / stride), layers - 1);
-    for (u32 layer = static_cast<u32>(begin / stride); layer <= last; ++layer) {
-        image.dirty_layers[layer / 64] |= u64{1} << (layer % 64);
-    }
+    ForEachWrittenRange(image, image_id, cpu_addr, size, [&](u64 offset, u64 bytes) {
+        if (False(image.flags & ImageFlagBits::CpuModified)) {
+            image.flags |= ImageFlagBits::CpuModified;
+            image.dirty_layers.assign(Common::DivCeil(layers, 64U), 0);
+        }
+        const u32 last = std::min(static_cast<u32>((offset + bytes - 1) / stride), layers - 1);
+        for (u32 layer = static_cast<u32>(offset / stride); layer <= last; ++layer) {
+            image.dirty_layers[layer / 64] |= u64{1} << (layer % 64);
+        }
+    });
 }
 
 template <class P>
-void TextureCache<P>::MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size) {
+void TextureCache<P>::MarkRangeWritten(Image& image, ImageId image_id, DAddr cpu_addr, size_t size) {
     if (True(image.flags & ImageFlagBits::CpuModified) && image.dirty_ranges.empty()) {
         return; // all of it is dirty already
+    }
+    ForEachWrittenRange(image, image_id, cpu_addr, size, [&](u64 offset, u64 bytes) {
+        image.flags |= ImageFlagBits::CpuModified;
+        image.dirty_ranges.emplace_back(offset, bytes);
+    });
+}
+
+template <class P>
+template <typename Func>
+void TextureCache<P>::ForEachWrittenRange(Image& image, ImageId image_id, DAddr cpu_addr,
+                                         size_t size, Func&& func) {
+    if (True(image.flags & ImageFlagBits::Sparse)) {
+        const auto it = sparse_views.find(image_id);
+        ASSERT(it != sparse_views.end());
+        for (const ImageMapId map_id : it->second) {
+            const auto& map = slot_map_views[map_id];
+            const DAddr begin = std::max(cpu_addr, map.cpu_addr);
+            const DAddr end = std::min(cpu_addr + size, map.cpu_addr + map.size);
+            if (begin < end) {
+                func(map.gpu_addr - image.gpu_addr + begin - map.cpu_addr, end - begin);
+            }
+        }
+        return;
     }
     const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr);
     const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes);
     if (end <= begin) {
         return;
     }
-    image.flags |= ImageFlagBits::CpuModified;
-    image.dirty_ranges.emplace_back(begin - image.cpu_addr, end - begin);
+    func(begin - image.cpu_addr, end - begin);
 }
 
 template <class P>
@@ -3898,7 +3948,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
-        new_info.is_sparse) {
+        (new_info.is_sparse ||
+         (new_info.native_tiling &&
+          Tegra::Nx2InSparseRegion(new_image.gpu_addr, new_image.guest_size_bytes)))) {
         new_image.flags |= ImageFlagBits::Sparse;
     }
 

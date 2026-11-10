@@ -471,6 +471,7 @@ add_library(core STATIC
     hle/service/am/service/application_proxy.cpp
     hle/service/am/service/graphics_scale_controller.h
     hle/service/am/service/application_proxy.h
+    hle/service/am/service/performance_functions.h
     hle/service/am/service/application_proxy_service.cpp
     hle/service/am/service/application_proxy_service.h
     hle/service/am/service/audio_controller.cpp
@@ -1058,6 +1059,7 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_movie_pacing.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h

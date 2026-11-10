@@ -606,9 +606,23 @@ private:
 
     // Signals a job slot's event once the GPU thread has run everything queued so far, as the
     // console's graphics server completes unmap jobs behind the submitted work.
-    void SignalAfterGpu(u32 slot) {
+    void SignalAfterGpu(u32 slot, bool release_memory = false) {
         auto* const event = EventFor(slot);
-        system.GPU().RunInOrder([this, event] { event->Signal(system.Kernel()); });
+        system.GPU().RunInOrder([this, event, release_memory] {
+            if (release_memory) {
+                system.GPU().Renderer().ReadRasterizer()->SignalFence(
+                    [this, event] { event->Signal(system.Kernel()); }, true);
+            } else {
+                event->Signal(system.Kernel());
+            }
+        });
+    }
+
+    void QueueBackingRelease(std::shared_ptr<std::atomic<bool>> done) {
+        system.GPU().RunInOrder([this, done] {
+            system.GPU().Renderer().ReadRasterizer()->SignalFence(
+                [done] { done->store(true, std::memory_order_release); }, true);
+        });
     }
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
@@ -631,7 +645,7 @@ private:
         } else {
             LOG_WARNING(Service, "nx2:gpu 102 destroy of unknown handle {}", handle);
         }
-        SignalAfterGpu(w[3]);
+        SignalAfterGpu(w[3], true);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -736,10 +750,12 @@ private:
                     region->second.cpu_address, region->second.size);
                 if (!done) {
                     done = std::make_shared<std::atomic<bool>>(false);
-                    system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
                 }
                 m_released_regions.push_back({std::move(region->second), done});
                 region = m_gpu_only_regions.erase(region);
+            }
+            if (done) {
+                QueueBackingRelease(done);
             }
         }
         SignalAfterGpu(w[8]);
@@ -905,7 +921,7 @@ private:
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
                                                                         it->second.size);
             auto done = std::make_shared<std::atomic<bool>>(false);
-            system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            QueueBackingRelease(done);
             m_gpu_only_bytes -= it->second.size;
             m_released_regions.push_back({std::move(it->second), done});
             m_gpu_only_regions.erase(it);
@@ -1154,7 +1170,8 @@ private:
                 region = &it->second;
             }
         }
-        if (const auto gpu_only = GpuOnlyRegionOf(gpu_address, size)) {
+        if (const auto gpu_only = GpuOnlyRegionOf(gpu_address, size);
+            gpu_only && region == nullptr) {
             ApplyGpuOnlyRequest(*gpu_only, request);
             return;
         }
@@ -1350,6 +1367,7 @@ private:
     // tile was mapped, which the console would have dropped) go back.
     void StartTiles(u64 start, SparseRegion& region) {
         using Core::Memory::YUZU_PAGESIZE;
+        Tegra::Nx2SparseRegionTiled(start, region.size, SparseBlockSize);
         region.tiles = true;
         region.tile_pages.assign(Common::DivCeil(region.size, YUZU_PAGESIZE), false);
         std::shared_ptr<std::atomic<bool>> done;
@@ -1366,13 +1384,17 @@ private:
             }
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(block_address, 0,
                                                                         backing->second.size);
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(
+                backing->second.cpu_address, backing->second.size);
             if (!done) {
                 done = std::make_shared<std::atomic<bool>>(false);
-                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
             }
             released += backing->second.size;
             m_released_regions.push_back({std::move(backing->second), done});
             m_gpu_only_regions.erase(backing);
+        }
+        if (done) {
+            QueueBackingRelease(done);
         }
         m_sparse_released_bytes += released;
         LOG_INFO(Service, "nx2:gpu sparse region at {:#x}: the game maps its tiles, {} MiB of blocks "

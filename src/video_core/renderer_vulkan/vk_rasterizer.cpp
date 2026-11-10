@@ -74,6 +74,7 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/textures/texture.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
@@ -530,6 +531,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
+    state_tracker.ClearChannel();
     scheduler.WaitWorker();
     scheduler.Finish();
 }
@@ -2077,11 +2079,12 @@ void RasterizerVulkan::DispatchCompute() {
         flash_watch.EndPass();
     }
 
+    u64 native_key{};
     ComputePipeline* const pipeline{[&] {
         const VideoCommon::Nx2Profile::Scope lookup_scope{
             VideoCommon::Nx2Profile::Zone::ComputeLookup};
         try {
-            return pipeline_cache.CurrentComputePipeline();
+            return pipeline_cache.CurrentComputePipeline(native_key);
         } catch (const Shader::Exception& error) {
             if (frame_dump.Capturing()) {
                 frame_dump.NoteSkipped(true,
@@ -2187,6 +2190,19 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     const auto& qmd{kepler_compute->launch_description};
+    const auto publish_collision_map = [&] {
+        if (native_key != 0x6e0ae200ee9aa220ULL ||
+            (qmd.const_buffer_enable_mask & 1) == 0) {
+            return;
+        }
+        const auto& constants = qmd.const_buffer_config[0];
+        if (constants.size < 0x3c) {
+            return;
+        }
+        const u32 handle = gpu_memory->Read<u32>(constants.Address() + 0x38);
+        const u32 index = Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0).first;
+        texture_cache.PublishComputeCollisionImage(index);
+    };
     // Earlier writes must be visible to the dispatch, its indirect arguments included
     // (RecordDispatchBarrier, recorded at the start of the dispatch's own command), and what it
     // writes to the next render pass (NoteComputeWrites).
@@ -2224,6 +2240,7 @@ void RasterizerVulkan::DispatchCompute() {
         buffer_cache.RecordComputeExtentProbes();
         compute_since_count_barrier = true;
         SubmitNx2ListCopies(pipeline->ShaderHash());
+        publish_collision_map();
         return;
     }
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
@@ -2300,6 +2317,7 @@ void RasterizerVulkan::DispatchCompute() {
     }
     compute_since_count_barrier = true;
     SubmitNx2ListCopies(pipeline->ShaderHash());
+    publish_collision_map();
 
     if (!can_replace) {
         TryOcarinaUpscale(*pipeline, false);
@@ -2752,8 +2770,8 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
     buffer_cache.UnmapGPUMemory(as_id, addr, size);
 }
 
-void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
-    fence_manager.SignalFence(std::move(func));
+void RasterizerVulkan::SignalFence(std::function<void()>&& func, bool force_completion) {
+    fence_manager.SignalFence(std::move(func), force_completion);
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
@@ -2805,18 +2823,34 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
     // queued behind the pending report writes instead. On the split's back the fence's
     // submission may be deferred, and the fencing thread would wait for this thread to submit it.
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
-    bool written{};
-    fence_manager.SyncOperation([&] {
-        std::scoped_lock lock{wait_mutex};
-        written = true;
-        wait_cv.notify_all();
+    // The callback can run after a timed-out wait, so its state must outlive this call.
+    struct WaitState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto state = std::make_shared<WaitState>();
+    fence_manager.SyncOperation([state] {
+        std::scoped_lock lock{state->mutex};
+        state->written = true;
+        state->cv.notify_all();
     });
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    std::unique_lock lock{state->mutex};
+    while (!state->cv.wait_for(lock, std::chrono::milliseconds(5),
+                              [&state] { return state->written; })) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOG_WARNING(Render_Vulkan,
+                        "FlushQueryResults: gave up waiting for query results at {:#x} after 2 s",
+                        addr);
+            return;
+        }
+        lock.unlock();
+        scheduler.FlushDeferred();
+        lock.lock();
+    }
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -4799,9 +4833,14 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     query_cache.BindToChannel(channel_id);
     state_tracker.ChangeChannel(channel);
     state_tracker.InvalidateState();
+    bound_channel_id = channel_id;
 }
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
+    if (channel_id == bound_channel_id) {
+        state_tracker.ClearChannel();
+        bound_channel_id = -1;
+    }
     EraseChannel(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};

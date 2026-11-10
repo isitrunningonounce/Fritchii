@@ -90,7 +90,7 @@ public:
         work_epoch.fetch_add(1, std::memory_order_release);
     }
 
-    void SignalFence(std::function<void()>&& func) {
+    void SignalFence(std::function<void()>&& func, bool force_completion = false) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
@@ -99,7 +99,8 @@ public:
         // operation at once, before the host GPU has run the work the report follows, and
         // Ocarina of Time then reads a wrong report (white flashes on leaves and walls at low GPU
         // accuracy). Only set by the query cache while EXP33 is on.
-        const bool delay_fence = DelayFences() || VideoCore::g_signaling_query_report_fence;
+        const bool delay_fence = force_completion || DelayFences() ||
+                                 VideoCore::g_signaling_query_report_fence;
         // EDEN_NX2_EXP28 (zortos293/Lichii#717 FENCE_TRIM, FENCE_FOLD), one value per fence.
         const int fence_trims = VideoCore::Nx2Debug::Experiment(28);
         const bool trim = (fence_trims & 1) != 0;
@@ -117,7 +118,7 @@ public:
             return;
         }
         skipped_fences = 0;
-        should_flush |= query_cache.HasUncommittedFlushes();
+        should_flush |= force_completion || query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         if constexpr (can_async_check) {
             // EXP28 & 2: a fence with nothing to wait for on the host GPU carries only queued
