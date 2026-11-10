@@ -14,6 +14,10 @@ namespace Common::FrameGenStats {
 inline std::atomic<bool> available{};
 /// The player's switch (status bar): off keeps the setup but generates nothing.
 inline std::atomic<bool> user_enabled{true};
+/// The player's multiplier: 2 shows one generated frame per rendered one, 6 five.
+inline std::atomic<unsigned> multiplier{2};
+/// The GPU's highest multiplier; 0 until a game sets frame generation up, retained after stop.
+inline std::atomic<unsigned> max_multiplier{};
 /// Frame generation is on (its frames are counted below).
 inline std::atomic<bool> active{};
 /// Frames shown per second over the last second, generated ones included.

@@ -2,6 +2,7 @@
 
 #include "yuzu/fritchii/fritchii_ui.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -360,10 +361,21 @@ void OfferRestart(QWidget* parent, const GraphicsHooks& hooks, const QString& wh
     }
 }
 
+unsigned CurrentFrameGenMultiplier() {
+    const unsigned maximum = Common::FrameGenStats::max_multiplier.load(std::memory_order_relaxed);
+    return std::clamp(Common::FrameGenStats::multiplier.load(std::memory_order_relaxed), 2u,
+                      maximum == 0 ? 6u : (std::min)(maximum, 6u));
+}
+
 } // Anonymous namespace
 
 QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks) {
-    auto* button = new QPushButton(QObject::tr("FRAME GEN 2X"), parent);
+    if (const std::string value = Env("LICHII_DLSS_FG_MULTIPLIER"); !value.empty()) {
+        Common::FrameGenStats::multiplier.store(
+            static_cast<unsigned>(std::clamp(std::atoi(value.c_str()), 2, 6)),
+            std::memory_order_relaxed);
+    }
+    auto* button = new QPushButton(parent);
     button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
     button->setFocusPolicy(Qt::NoFocus);
     button->setCheckable(true);
@@ -373,19 +385,26 @@ QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks) {
         const bool user_on = Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed);
         const bool next_start = Env("LICHII_DLSS_FG") == "1";
         const bool on = available ? user_on : next_start;
+        const unsigned multiplier = CurrentFrameGenMultiplier();
         button->setChecked(on);
-        button->setText(on ? QObject::tr("FRAME GEN 2X") : QObject::tr("FRAME GEN OFF"));
+        button->setText(on ? QObject::tr("FRAME GEN %1X").arg(multiplier)
+                           : QObject::tr("FRAME GEN OFF"));
+        QString tooltip;
         if (available) {
-            button->setToolTip(on ? QObject::tr("DLSS Frame Generation 2x is on (it generates "
-                                                "frames while the window has focus)")
-                                  : QObject::tr("DLSS Frame Generation 2x is off"));
+            tooltip = on ? QObject::tr("DLSS Frame Generation %1x is on (it generates frames "
+                                       "while the window has focus)")
+                               .arg(multiplier)
+                         : QObject::tr("DLSS Frame Generation %1x is off").arg(multiplier);
         } else {
-            button->setToolTip(next_start
-                                   ? QObject::tr("DLSS Frame Generation 2x turns on when the game "
-                                                 "starts again")
-                                   : QObject::tr("DLSS Frame Generation 2x is off (needs NVIDIA "
-                                                 "DLSS and an RTX 40 or newer GPU)"));
+            tooltip = next_start
+                          ? QObject::tr("DLSS Frame Generation %1x turns on when the game starts "
+                                        "again")
+                                .arg(multiplier)
+                          : QObject::tr("DLSS Frame Generation %1x is off (needs NVIDIA DLSS "
+                                        "and an RTX 40 or newer GPU)")
+                                .arg(multiplier);
         }
+        button->setToolTip(tooltip + QObject::tr(". 3x to 6x need an RTX 50 GPU."));
     };
     update();
     auto* timer = new QTimer(button);
@@ -393,22 +412,56 @@ QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks) {
     timer->start(1000);
 
     QObject::connect(button, &QPushButton::clicked, button, [button, hooks, update] {
-        if (Common::FrameGenStats::available.load(std::memory_order_relaxed)) {
-            // Set up in this game start: switch it at once.
-            Common::FrameGenStats::user_enabled.store(
-                !Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-            update();
+        update();
+        QMenu menu(button);
+        QActionGroup group(&menu);
+        const bool available = Common::FrameGenStats::available.load(std::memory_order_relaxed);
+        const bool on = available
+                            ? Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed)
+                            : Env("LICHII_DLSS_FG") == "1";
+        const unsigned current = on ? CurrentFrameGenMultiplier() : 0;
+        const unsigned maximum =
+            Common::FrameGenStats::max_multiplier.load(std::memory_order_relaxed);
+        for (const unsigned multiplier : {0u, 2u, 3u, 4u, 5u, 6u}) {
+            const QString label = multiplier == 0   ? QObject::tr("Off")
+                                  : multiplier == 2 ? QObject::tr("2x")
+                                                    : QObject::tr("%1x (RTX 50)").arg(multiplier);
+            QAction* action = menu.addAction(label);
+            action->setData(multiplier);
+            action->setCheckable(true);
+            action->setChecked(multiplier == current);
+            action->setEnabled(maximum == 0 || multiplier <= maximum);
+            group.addAction(action);
+        }
+        const QAction* const choice =
+            menu.exec(button->mapToGlobal(QPoint(0, -menu.sizeHint().height())));
+        if (!choice) {
             return;
         }
-        const bool turn_on = Env("LICHII_DLSS_FG") != "1";
-        Settings::SetSessionOverride("LICHII_DLSS_FG", turn_on ? "1" : nullptr);
-        if (turn_on) {
-            Common::FrameGenStats::user_enabled.store(true, std::memory_order_relaxed);
-            if (CurrentDlssMode() == DlssMode::Off) {
-                SetDlssMode(DlssMode::To1440); // frame generation runs on DLSS's output
+        const unsigned multiplier = choice->data().toUInt();
+        const bool running_available =
+            Common::FrameGenStats::available.load(std::memory_order_relaxed);
+        if (multiplier == 0) {
+            if (running_available) {
+                Common::FrameGenStats::user_enabled.store(false, std::memory_order_relaxed);
+            } else {
+                Settings::SetSessionOverride("LICHII_DLSS_FG", nullptr);
             }
-            OfferRestart(button->window(), hooks, QObject::tr("DLSS Frame Generation"));
+        } else {
+            Common::FrameGenStats::multiplier.store(multiplier, std::memory_order_relaxed);
+            const std::string value = std::to_string(multiplier);
+            Settings::SetSessionOverride("LICHII_DLSS_FG_MULTIPLIER", value.c_str());
+            Common::FrameGenStats::user_enabled.store(true, std::memory_order_relaxed);
+            if (!running_available) {
+                const bool was_on = Env("LICHII_DLSS_FG") == "1";
+                Settings::SetSessionOverride("LICHII_DLSS_FG", "1");
+                if (CurrentDlssMode() == DlssMode::Off) {
+                    SetDlssMode(DlssMode::To1440);
+                }
+                if (!was_on) {
+                    OfferRestart(button->window(), hooks, QObject::tr("DLSS Frame Generation"));
+                }
+            }
         }
         update();
         if (hooks.refresh) {

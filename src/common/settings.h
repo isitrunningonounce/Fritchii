@@ -1088,7 +1088,7 @@ bool IsGPULevelHigh();
 bool NvidiaDlssEnabled();
 /// Sets (or, with null or "", clears) one of those launcher variables for this process: the
 /// Graphics menu uses it for the next game start (LICHII_DLSS, LICHII_RESOLUTION,
-/// LICHII_SKIP_BUILTIN, LICHII_DLSS_FG).
+/// LICHII_SKIP_BUILTIN, LICHII_DLSS_FG, LICHII_DLSS_FG_MULTIPLIER).
 void SetSessionOverride(const char* name, const char* value);
 /// LICHII_OOT_NO_SHARPEN=1: Ocarina of Time anti-aliasing "No sharpening" (oot_anti_aliasing).
 bool OotNoSharpening();

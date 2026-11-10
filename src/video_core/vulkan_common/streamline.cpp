@@ -81,6 +81,8 @@ struct State {
     std::chrono::steady_clock::time_point fg_present_begin{};
     std::chrono::steady_clock::time_point fg_last_present{};
     bool fg_on{};         ///< Present thread from here on
+    u32 fg_frames{};      ///< Generated frames per rendered one while on
+    u32 fg_max_frames{1}; ///< DLSSGState::numFramesToGenerateMax
     u64 fg_presents{};
     u64 fg_generated_presents{};
     sl::DLSSGStatus fg_last_status{};
@@ -630,6 +632,15 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
             sl::DLSSGOptions probe{};
             api.dlssg_get_state(sl::ViewportHandle{0u}, fg_state, &probe);
             state.fg_available = true;
+            state.fg_max_frames = (std::max)(fg_state.numFramesToGenerateMax, 1u);
+            Common::FrameGenStats::max_multiplier.store(state.fg_max_frames + 1,
+                                                       std::memory_order_relaxed);
+            if (const char* const value = std::getenv("LICHII_DLSS_FG_MULTIPLIER");
+                value && value[0] != '\0') {
+                Common::FrameGenStats::multiplier.store(
+                    static_cast<unsigned>(std::clamp(std::atoi(value), 2, 6)),
+                    std::memory_order_relaxed);
+            }
             Common::FrameGenStats::available.store(true, std::memory_order_relaxed);
             LOG_INFO(Render_Vulkan,
                      "DLSS Frame Generation is available: up to {} generated frames per rendered "
@@ -861,11 +872,13 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     }
     const Api& api = state.api;
     const bool want_on = token != nullptr;
-    if (want_on != state.fg_on) {
+    const u32 multiplier = Common::FrameGenStats::multiplier.load(std::memory_order_relaxed);
+    const u32 frames = want_on ? std::clamp<u32>(multiplier, 2, state.fg_max_frames + 1) - 1 : 0;
+    if (want_on != state.fg_on || frames != state.fg_frames) {
         // Off for frames without a DLSS evaluation (menus, loading): nothing to generate from.
         sl::DLSSGOptions options{};
         options.mode = want_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-        options.numFramesToGenerate = 1;
+        options.numFramesToGenerate = (std::max)(frames, 1u);
         options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         // The default blocks the presenting queue (the emulator's only graphics queue) until
         // frame generation finishes: the real frame rate halved (50 -> 26 fps). LICHII_DLSS_FG_BLOCK=1
@@ -875,9 +888,15 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
                                            ? sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue
                                            : sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
         const sl::Result result = api.dlssg_set_options(sl::ViewportHandle{0u}, options);
-        LOG_INFO(Render_Vulkan, "DLSS Frame Generation {} (result {})", want_on ? "on" : "off",
-                 static_cast<int>(result));
+        if (want_on) {
+            LOG_INFO(Render_Vulkan, "DLSS Frame Generation on, {}x (result {})", frames + 1,
+                     static_cast<int>(result));
+        } else {
+            LOG_INFO(Render_Vulkan, "DLSS Frame Generation off (result {})",
+                     static_cast<int>(result));
+        }
         state.fg_on = want_on;
+        state.fg_frames = frames;
         Common::FrameGenStats::active.store(want_on, std::memory_order_relaxed);
         state.fg_window_begin = {};
         state.fg_window_shown = 0;
@@ -1003,6 +1022,7 @@ void Stop() {
     state.fg_available = false;
     state.fg_reflex_set = false;
     state.fg_on = false;
+    state.fg_frames = 0;
     state.fg_tagged.store(nullptr, std::memory_order_relaxed);
     state.fg_inputs_fence.store(VK_NULL_HANDLE, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline stopped (result {})", static_cast<int>(result));
