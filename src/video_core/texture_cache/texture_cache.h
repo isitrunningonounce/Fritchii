@@ -33,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/color_feedback.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -763,6 +764,30 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+
+    if constexpr (requires { runtime.IsFree(u64{}); }) {
+        std::erase_if(feedback_shadows, [&](const FeedbackShadow& shadow) {
+            if (frame_tick - shadow.last_frame <= 120 || !runtime.IsFree(shadow.tick)) {
+                return false;
+            }
+            const auto& image = slot_images[shadow.id];
+            for (const ImageViewId view : image.image_view_ids) {
+                slot_image_views.erase(view);
+            }
+            total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
+            slot_images.erase(shadow.id);
+            return true;
+        });
+    }
+    if (frame_tick % 600 == 0 && color_feedback_copies != 0) {
+        LOG_INFO(HW_GPU,
+                 "Color feedback last 600 frames: {} copies ({} scaled), {} texels, {} MiB; "
+                 "{} shadow images",
+                 color_feedback_copies, color_feedback_scaled_copies, color_feedback_texels,
+                 color_feedback_bytes >> 20, feedback_shadows.size());
+        color_feedback_copies = color_feedback_scaled_copies = color_feedback_texels =
+            color_feedback_bytes = 0;
+    }
     // Prepared render targets skip the LRU touch of their images: keep them to one frame.
     ++bindings_epoch;
     if (VideoCore::Nx2Debug::Experiment(31) != 0 && frame_tick % 600 == 0) {
@@ -1251,6 +1276,108 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
 }
 
 template <class P>
+ImageViewId TextureCache<P>::CopyColorFeedbackView(ImageViewId view_id) {
+    if constexpr (requires(Image& image) {
+                      runtime.CopyImage(image, image, std::span<const ImageCopy>{}, true);
+                  }) {
+        if (!view_id || view_id == NULL_IMAGE_VIEW_ID || !gpu_memory->UsesNativeTiling()) {
+            return {};
+        }
+        for (const auto& [source_view, shadow_view] : color_feedback_views) {
+            if (source_view == view_id) {
+                return shadow_view;
+            }
+        }
+        const auto& view = slot_image_views[view_id];
+        const ImageId source_id = view.image_id;
+        if (!source_id || source_id == NULL_IMAGE_ID) {
+            return {};
+        }
+        const auto& source = slot_images[source_id];
+        if (!CanCopyColorFeedback(true, IsColorRenderTarget(source_id, rt_active_mask, rt_image_id),
+                                  GetFormatType(view.format) == SurfaceType::ColorTexture &&
+                                      GetFormatType(source.info.format) ==
+                                          SurfaceType::ColorTexture,
+                                  view.type, source.info.num_samples, view.range.extent) ||
+            source.info.type != ImageType::e2D ||
+            True(source.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
+            return {};
+        }
+        const auto view_it = std::ranges::find(source.image_view_ids, view_id);
+        ASSERT(view_it != source.image_view_ids.end());
+        ImageViewInfo view_info =
+            source.image_view_infos[std::distance(source.image_view_ids.begin(), view_it)];
+        const SubresourceBase source_base = view.range.base;
+        const bool scaled = True(source.flags & ImageFlagBits::Rescaled);
+        const auto& resolution = Settings::values.resolution_info;
+        const u32 width =
+            scaled ? resolution.ScaleUp(source.info.size.width) : source.info.size.width;
+        const u32 height =
+            scaled ? resolution.ScaleUp(source.info.size.height) : source.info.size.height;
+        ImageInfo shadow_info;
+        shadow_info.type = ImageType::e2D;
+        shadow_info.format = source.info.format;
+        shadow_info.size = ColorFeedbackExtent({width, height, 1}, source_base.level);
+        const GPUVAddr source_address = source.gpu_addr;
+
+        // Port of Eglantine #720, a2cefedfc4: sample a reusable shadow of the pre-draw contents.
+        // A shadow used by another binding in this draw cannot be overwritten until the next draw.
+        auto shadow_it = std::ranges::find_if(feedback_shadows, [&](const FeedbackShadow& shadow) {
+            const auto& info = slot_images[shadow.id].info;
+            return shadow.draw != color_feedback_draw && info.format == shadow_info.format &&
+                   info.size == shadow_info.size;
+        });
+        if (shadow_it == feedback_shadows.end()) {
+            const ImageId id = slot_images.insert(runtime, shadow_info, GPUVAddr{}, DAddr{});
+            if (slot_images[id].OutOfMemory()) {
+                slot_images.erase(id);
+                return {};
+            }
+            runtime.TransitionImageLayout(slot_images[id]);
+            total_used_memory += ImageMemoryBytes(slot_images[id]);
+            feedback_shadows.push_back(
+                {id, color_feedback_draw, frame_tick, runtime.CurrentTick()});
+            shadow_it = std::prev(feedback_shadows.end());
+            LOG_INFO(HW_GPU, "Color feedback shadow: {}x{} format {} for target {:#x}, scaled={}",
+                     shadow_info.size.width, shadow_info.size.height,
+                     static_cast<u32>(shadow_info.format), source_address, scaled);
+        }
+        shadow_it->draw = color_feedback_draw;
+        shadow_it->last_frame = frame_tick;
+        shadow_it->tick = runtime.CurrentTick();
+        const ImageId shadow_id = shadow_it->id;
+        const ImageCopy copy{
+            .src_subresource = {source_base.level, source_base.layer, 1},
+            .dst_subresource = {0, 0, 1},
+            .src_offset = {},
+            .dst_offset = {},
+            .extent = shadow_info.size,
+        };
+        runtime.CopyImage(slot_images[shadow_id], slot_images[source_id], std::span{&copy, 1},
+                          true);
+        view_info.range.base = {};
+        ++color_feedback_copies;
+        color_feedback_scaled_copies += scaled;
+        const u64 texels = u64{shadow_info.size.width} * shadow_info.size.height;
+        color_feedback_texels += texels;
+        color_feedback_bytes += texels * BytesPerBlock(shadow_info.format);
+        if (VideoCommon::RenderTrace::Enabled()) {
+            LOG_DEBUG(HW_GPU,
+                      "Color feedback draw {} frame {}: target {:#x}, view {}, mip {} layer {}, "
+                      "{}x{}, scaled={}",
+                      color_feedback_draw, frame_tick, source_address, view_id.Value(),
+                      source_base.level, source_base.layer, shadow_info.size.width,
+                      shadow_info.size.height, scaled);
+        }
+        const ImageViewId shadow_view = FindOrEmplaceImageView(shadow_id, view_info);
+        color_feedback_views.emplace_back(view_id, shadow_view);
+        return shadow_view;
+    } else {
+        return {};
+    }
+}
+
+template <class P>
 bool TextureCache<P>::SamplesRenderTarget(std::span<const ImageViewInOut> views) {
     if (rt_active_mask == 0) {
         return false;
@@ -1264,10 +1391,8 @@ bool TextureCache<P>::SamplesRenderTarget(std::span<const ImageViewInOut> views)
         if (depth_active && image_id == rt_depth_image_id) {
             return true;
         }
-        for (size_t i = 0; i < NUM_RT; ++i) {
-            if ((rt_active_mask & (1u << i)) != 0 && image_id == rt_image_id[i]) {
-                return true;
-            }
+        if (IsColorRenderTarget(image_id, rt_active_mask, rt_image_id)) {
+            return true;
         }
     }
     return false;
