@@ -3201,18 +3201,18 @@ void RasterizerVulkan::UpdateMarioKartJitter() {
     const bool jittered_backend = mkw_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
         (mkw_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
          VideoCommon::OcarinaDlssJitterMode() != 0);
-    if (jittered_backend && MarioKartTemporalEnabled() && mkw_motion.channel == gpu_memory &&
+    if (jittered_backend && MarioKartTemporalEnabled() && mkw_jitter_scene.channel == gpu_memory &&
         mkw_temporal_frame && *mkw_temporal_frame + 1 >= render_trace_frame &&
         maxwell3d->regs.depth_test_enable) {
         const auto& targets = texture_cache.GetRenderTargets();
         if (targets.depth_buffer_id && targets.color_buffer_ids[0]) {
             const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
             const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
-            if (color.size.width == mkw_motion.extent.width &&
-                color.size.height == mkw_motion.extent.height && !color.IsRescaled() &&
-                depth.gpu_addr == mkw_motion.depth_address && !depth.IsRescaled() &&
-                depth.size.width == mkw_motion.extent.width &&
-                depth.size.height == mkw_motion.extent.height) {
+            if (color.size.width == mkw_jitter_scene.extent.width &&
+                color.size.height == mkw_jitter_scene.extent.height && !color.IsRescaled() &&
+                depth.gpu_addr == mkw_jitter_scene.depth_address && !depth.IsRescaled() &&
+                depth.size.width == mkw_jitter_scene.extent.width &&
+                depth.size.height == mkw_jitter_scene.extent.height) {
                 const u32 phases = mkw_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? 16 : 8;
                 const u32 index = static_cast<u32>(render_trace_frame % phases) + 1;
                 want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
@@ -3314,6 +3314,7 @@ bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, boo
             return fail("temporal upscaler declined the frame");
         }
         mkw_temporal_frame = render_trace_frame;
+        mkw_jitter_scene = {gpu_memory, mkw_motion.depth_address, extent};
         mkw_fallback_reason = nullptr;
         const char* backend = *mkw_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1";
         if (!mkw_logged) {

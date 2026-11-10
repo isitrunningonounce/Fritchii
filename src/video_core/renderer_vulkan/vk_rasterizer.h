@@ -330,6 +330,11 @@ private:
     std::array<f32, 2> mkw_jitter_applied{};
     std::array<f32, 2> mkw_jitter_offset{};
     std::optional<u64> mkw_jitter_frame;
+    struct {
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr depth_address{};
+        VkExtent2D extent{};
+    } mkw_jitter_scene;
 
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;

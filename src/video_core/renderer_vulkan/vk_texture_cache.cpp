@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cmath>
 #include <optional>
 #include <set>
 #include <span>

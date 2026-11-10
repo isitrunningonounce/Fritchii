@@ -1106,19 +1106,18 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     // A resize can submit the inputs before recording evaluation, so keep the later tick.
     resources.tick = state.scheduler.CurrentTick();
     if (target) {
-        state.queue.Acquire(state.scheduler, 2);
+        state.queue.Acquire(state.scheduler, state.mario_kart ? 4 : 2);
         const bool same_size = output_extent.width == target_extent.width &&
                                output_extent.height == target_extent.height;
         const auto output_sampler = same_size ? sampler : state.LinearSampler();
         state.queue.AddSampledImage(state.OutputView(), output_sampler);
         state.queue.AddImage(target);
-        const void* descriptors = state.queue.UpdateData();
+        const auto* descriptors = state.queue.UpdateData();
         const void* fallback = nullptr;
         if (state.mario_kart) {
-            state.queue.Acquire(state.scheduler, 2);
             state.queue.AddSampledImage(color, sampler);
             state.queue.AddImage(target);
-            fallback = state.queue.UpdateData();
+            fallback = descriptors + 2;
         }
         state.output_pass.RecordOutput(state.scheduler, descriptors, *this,
                                         target_extent, frame, reset, fallback);
