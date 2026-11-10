@@ -68,22 +68,26 @@ start.
   Its shaders use `HDR_COLOR_INPUT=0` and `INVERTED_DEPTH=0`. Camera reconstruction alone
   converts the stored [0,1] depth to GL [-1,1] clip coordinates. Motion is previous minus
   current in render pixels, with screen-down Y, so FSR's scale is `(1,1)` before normalization.
-- Jitter (FSR only, on by default): the game has no subpixel sample sequence, so the host adds
-  one. While FSR replaced the previous frame's upscale, every draw that depth-tests against the
-  scene depth at the scene size has its viewport offset by a Halton (2,3) sub-pixel amount
-  (AMD's phase count, 8 x (output / render width)^2: 18 for 1440p -> 4K, 8 for native AA), and
-  FSR gets the same offset as the frame's jitter. Shadow maps, half-size passes, full-screen
-  passes and frames the game upscales itself are not offset. A full-screen pass with depth
-  writes on but the test off writes no depth (Vulkan disables writes with the test), so the
-  depth-write flag alone doesn't count. DLSS gets no jitter.
+- Jitter (FSR and DLSS, on by default): the game has no subpixel sample sequence, so the host
+  adds one. While FSR or DLSS replaced the previous frame's upscale, every draw that depth-tests
+  against the scene depth at the scene size has its viewport offset by a Halton (2,3) sub-pixel
+  amount (AMD's phase count, 8 x (output / render width)^2: 18 for 1440p -> 4K, 8 for native
+  AA; at least 16 for DLSS, as NVIDIA's guide asks), and the upscaler gets the same offset as
+  the frame's jitter. Shadow maps, half-size passes, full-screen passes and frames the game
+  upscales itself are not offset. A full-screen pass with depth writes on but the test off
+  writes no depth (Vulkan disables writes with the test), so the depth-write flag alone doesn't
+  count. DLSS gets the offset as FSR does (NVIDIA's guide, 3.7.3: render pixels, in the motion
+  vectors' direction); `EDEN_NX2_DLSS_JITTER=0` turns its jitter and bias off, `2` flips the
+  vertical sign as a check (the wrong sign shakes).
 - Motion with jitter: FSR is told the motion vectors carry no jitter (no jitter-cancellation
   flag). Camera motion comes from the unjittered matrices, reconstructed at each depth sample's
   unjittered position (the pixel centre minus the jitter). The replay of Link's skinned draw is
   offset by the same jitter, so its scene-depth check compares the same samples the game drew,
   and its motion is taken from the unjittered position. Without that offset the jitter made the
   check fail on most of the fragments it otherwise accepts.
-- Texture LOD bias (FSR only): when the session's upscaler is FSR, mipmapped samplers get
-  AMD's recommended bias log2(render / output) - 1 = -1.58 in docked mode (none in handheld).
+- Texture LOD bias: when the session's upscaler is FSR or jittered DLSS, mipmapped samplers get
+  the bias AMD and NVIDIA (DLSS guide 3.5) both recommend, log2(render / output) - 1 = -1.58 in
+  docked mode (none in handheld).
   Samplers pick the biased or unbiased variant at each bind, so a console mode switch takes
   effect in-session. Images the GPU wrote (render targets: bloom, blur, reflections, fog) keep
   the game's own bias.
