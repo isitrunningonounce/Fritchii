@@ -237,7 +237,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
 
-    INSERT(Settings, frame_gen, tr("Enable Frame Generation"), QString());
+    INSERT(Settings, frame_gen, tr("Enable Frame Generation (experimental)"),
+           tr("Shows generated frames between the game's own frames for smoother motion. The "
+              "game still runs and responds at its own frame rate.\nExperimental: it can make "
+              "the camera flicker, and frame pacing is off while it runs."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
     INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());

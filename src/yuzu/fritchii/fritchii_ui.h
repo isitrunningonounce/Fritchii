@@ -30,7 +30,7 @@ namespace FritchiiUi {
 /// when the Fritchii UI is off.
 bool ApplyTheme();
 
-/// Settings the Fritchii settings pages leave out (frame generation and its dev options).
+/// Settings the Fritchii settings pages leave out (frame generation's dev options).
 [[nodiscard]] bool HidesSetting(const std::string& label);
 
 /// A bundled line icon (fritchii/icons/<name>.svg): grey, and violet when checked.

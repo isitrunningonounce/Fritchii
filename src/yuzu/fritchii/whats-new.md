@@ -17,6 +17,8 @@ This build is Fritchii v5.6 with this fork's fixes for Yoshi and the Mysterious 
 ### New in this build
 - **Updates come from this fork:** builds are named build-N and check this repository's releases for the next one.
 - **Linux:** an AppImage that uses Wayland when it's available (X11 otherwise), and a tar.gz that uses your system's libraries.
+- **Frame generation is back, as an experimental opt-in:** Graphics > Enable Frame Generation. It shows generated frames between the game's own frames for smoother motion; the game still runs and responds at its own frame rate. It starts off for everyone, including players who had it on before Fritchii v5. It can make the camera flicker, and frame pacing is off while it runs.
+  - **On a 60 Hz screen, set Target Frame Rate to 60.** Frame generation turns vsync on, so with the default x2 every game frame waits for two refreshes and the game drops to 30 fps, which also makes ghosting worse.
 
 ### Fritchii v5.6
 
