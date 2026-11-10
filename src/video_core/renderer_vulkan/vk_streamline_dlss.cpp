@@ -508,7 +508,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                         .barrier_aspect = aspect,
                     };
                 };
-                const auto depth_copy = copy_image(*fg_copy->depth, VK_IMAGE_ASPECT_DEPTH_BIT);
+                const auto depth_copy = copy_image(*fg_copy->depth, in.depth.barrier_aspect);
                 const auto motion_copy = copy_image(*fg_copy->motion, VK_IMAGE_ASPECT_COLOR_BIT);
                 constexpr VkImageLayout READ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 constexpr VkImageLayout SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;

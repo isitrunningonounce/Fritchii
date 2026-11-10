@@ -24,6 +24,7 @@
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/settings.h"
+#include "common/game_presets.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
@@ -4709,6 +4710,16 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
         ocarina_fsr_lod_bias =
             ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+        if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId &&
+            ResolveMarioKartUpscaler(device) != VideoCommon::OcarinaUpscaleBackend::Native) {
+            if (const char* value = std::getenv("EDEN_NX2_MKW_LOD_BIAS")) {
+                char* end{};
+                const f32 bias = std::strtof(value, &end);
+                if (end != value && *end == '\0' && std::isfinite(bias)) {
+                    ocarina_fsr_lod_bias = std::clamp(bias, -15.0f, 15.0f);
+                }
+            }
+        }
     }
     return *ocarina_fsr_lod_bias;
 }
@@ -4776,6 +4787,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     // size's mips; the bias keeps the output's detail (VideoCommon::OcarinaFsrLodBias).
     f32 lod_bias = tsc.LodBias();
     ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    mario_kart_lod_bias = Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId;
     if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
         fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
@@ -4824,7 +4836,7 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     if (added_lod_bias != 0.0f) {
         const Image* const image = image_view.BackingImage();
         key.drop_lod_bias = !VideoCommon::KeepOcarinaFsrLodBias(
-            Settings::IsDockedMode(), *ocarina_fsr_failed,
+            mario_kart_lod_bias || Settings::IsDockedMode(), *ocarina_fsr_failed,
             image != nullptr && True(image->flags & ImageFlagBits::GpuModified));
     }
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {

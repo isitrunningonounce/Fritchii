@@ -40,6 +40,7 @@
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
+#include "common/game_presets.h"
 #include "core/core.h"
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/qt_common.h"
@@ -320,7 +321,7 @@ namespace {
 // Lichii mod: NVIDIA DLSS and its frame generation are set by the launchers' variables, read at
 // every game start. The Graphics menu and the frame generation button change them for the next
 // start of this window (nothing is saved: the launchers keep their own choice).
-enum class DlssMode { Off, To1440, To4K };
+enum class DlssMode { Off, To1440, To4K, NativeAA };
 
 std::string Env(const char* name) {
     const char* const value = std::getenv(name);
@@ -330,6 +331,9 @@ std::string Env(const char* name) {
 DlssMode CurrentDlssMode() {
     if (Env("LICHII_DLSS") != "1") {
         return DlssMode::Off;
+    }
+    if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
+        return DlssMode::NativeAA;
     }
     return Env("LICHII_SKIP_BUILTIN").find("Max Resolution") != std::string::npos
                ? DlssMode::To1440
@@ -521,11 +525,15 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
             [](Settings::ScalingFilter filter) { Settings::values.scaling_filter.SetValue(filter); },
             true);
         // Lichii mod: NVIDIA DLSS in place of the game's own upscaler, for the next game start.
-        const std::map<DlssMode, QString> dlss_modes{
+        std::map<DlssMode, QString> dlss_modes{
             {DlssMode::Off, QObject::tr("Off")},
             {DlssMode::To1440, QObject::tr("1080p to 1440p")},
             {DlssMode::To4K, QObject::tr("1440p to 4K")},
         };
+        if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
+            dlss_modes = {{DlssMode::Off, QObject::tr("Off")},
+                          {DlssMode::NativeAA, QObject::tr("Native resolution (DLAA)")}};
+        }
         const QWidget* const owner = button;
         add_choices(
             QObject::tr("NVIDIA &DLSS"), dlss_modes, CurrentDlssMode(),

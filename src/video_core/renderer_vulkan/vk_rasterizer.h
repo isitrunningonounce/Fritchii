@@ -199,7 +199,7 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
+    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false, u32 instance_count = 0);
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
@@ -260,6 +260,11 @@ private:
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
+    bool MarioKartTemporalEnabled();
+    void TrackMarioKartCamera();
+    void UpdateMarioKartJitter();
+    bool TryMarioKartUpscale(const GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect,
+                              u32 instance_count);
     bool OcarinaTemporalEnabled() const;
     void TrackOcarinaCamera();
     /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
@@ -306,6 +311,25 @@ private:
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
+
+    struct MarioKartMotion {
+        const Tegra::MemoryManager* channel{};
+        std::optional<u64> camera_frame;
+        VideoCommon::ImageViewId depth;
+        GPUVAddr depth_address{};
+        VkExtent2D extent{};
+        std::array<f32, 16> current{};
+        std::array<f32, 16> previous{};
+    } mkw_motion;
+    std::optional<VideoCommon::OcarinaUpscaleBackend> mkw_backend;
+    std::unique_ptr<class OcarinaUpscaler> mkw_upscaler;
+    std::optional<u64> mkw_temporal_frame;
+    bool mkw_failed{};
+    bool mkw_logged{};
+    const char* mkw_fallback_reason{};
+    std::array<f32, 2> mkw_jitter_applied{};
+    std::array<f32, 2> mkw_jitter_offset{};
+    std::optional<u64> mkw_jitter_frame;
 
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;

@@ -45,6 +45,8 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_debug_control.h"
 #include "common/settings.h"
+#include "common/game_presets.h"
+#include "video_core/mkw_upscale.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
 
@@ -1242,7 +1244,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
-    if (record_sampled) {
+    if (record_sampled || (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId &&
+                           key.unique_hashes[5] == VideoCommon::MarioKartBlendFragment)) {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};
