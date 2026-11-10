@@ -3335,6 +3335,7 @@ bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, boo
         return true;
     } catch (const vk::Exception& error) {
         LOG_WARNING(Render_Vulkan, "Mario Kart World temporal: unavailable ({})", error.what());
+        scheduler.InvalidateState();
         mkw_failed = true;
         texture_cache_runtime.ocarina_fsr_failed = true;
         return fail("temporal resources unavailable");
