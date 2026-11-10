@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "core/file_sys/fsa/fs_i_file.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -19,6 +21,7 @@ public:
 
 private:
     std::unique_ptr<FileSys::Fsa::IFile> backend;
+    std::string name; ///< for LICHII_TELEMETRY read summaries
 
     Result Read(FileSys::ReadOption option, Out<s64> out_size, s64 offset,
                 const OutBuffer<BufferAttr_HipcMapAlias | BufferAttr_HipcMapTransferAllowsNonSecure>

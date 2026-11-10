@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -28,6 +30,7 @@
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
 #endif
+#include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -50,6 +53,39 @@
 #endif
 namespace Vulkan {
 namespace {
+
+// LICHII_HIDE_GLITCH_FRAMES: a frame that skipped draws for unready pipelines is not presented, so
+// the previous complete frame stays on screen; at most this many in a row are hidden.
+bool HideGlitchFrame() {
+    static const int limit = [] {
+        const char* value = std::getenv("LICHII_HIDE_GLITCH_FRAMES");
+        const int frames = std::clamp(value ? std::atoi(value) : 0, 0, 10);
+        LOG_INFO(Render_Vulkan, "LICHII_HIDE_GLITCH_FRAMES: up to {} frames in a row", frames);
+        return frames;
+    }();
+    static int hidden_in_row = 0;
+    static u32 hidden_total = 0;
+    static auto window = std::chrono::steady_clock::now();
+    const u32 skipped = TakeSkippedDrawsSinceLastFrame();
+    if (const auto now = std::chrono::steady_clock::now(); now - window > std::chrono::seconds{10}) {
+        if (hidden_total != 0) {
+            LOG_INFO(Render_Vulkan, "LICHII_HIDE_GLITCH_FRAMES: {} frames hidden in the last 10 s",
+                     hidden_total);
+        }
+        hidden_total = 0;
+        window = now;
+    }
+    if (limit == 0) {
+        return false;
+    }
+    if (skipped != 0 && hidden_in_row < limit) {
+        ++hidden_in_row;
+        ++hidden_total;
+        return true;
+    }
+    hidden_in_row = 0;
+    return false;
+}
 
 constexpr VkExtent2D CaptureImageSize{
     .width = VideoCore::Capture::LinearWidth,
@@ -124,6 +160,22 @@ Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dl
     return Device(*instance, physical_device, surface, dld);
 }
 
+/// DLSS Frame Generation finds the swapchain's window through the surface it saw created, and
+/// its surface proxy needs the device Streamline was given: once the device exists, the surface is
+/// made again through it, before the swapchain. Returns the device for the next member.
+const Device& RebindSurfaceForFrameGen(
+    const vk::Instance& instance, vk::SurfaceKHR& surface,
+    const Core::Frontend::EmuWindow::WindowSystemInfo& window_info, const Device& device) {
+#ifdef EGLANTINE_STREAMLINE
+    if (Streamline::IsFrameGenAvailable()) {
+        surface = vk::SurfaceKHR{};
+        surface = CreateSurface(instance, window_info);
+        LOG_INFO(Render_Vulkan, "DLSS Frame Generation: window surface made through Streamline");
+    }
+#endif
+    return device;
+}
+
 RendererVulkan::RendererVulkan(Core::Frontend::EmuWindow& emu_window,
                                Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                Tegra::GPU& gpu_,
@@ -149,7 +201,8 @@ try
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
     , device(CreateDevice(instance, dld, *surface))
-    , memory_allocator(device)
+    , memory_allocator(RebindSurfaceForFrameGen(instance, surface, render_window.GetWindowInfo(),
+                                                device))
     , state_tracker()
     , scheduler(device, state_tracker)
     , swapchain(*surface,
@@ -223,6 +276,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 
     RenderScreenshot(framebuffers);
+    if (HideGlitchFrame()) {
+        return;
+    }
     const auto acquiring = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
     Frame* frame = present_manager.GetRenderFrame();
@@ -230,8 +286,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                 : std::chrono::steady_clock::time_point{};
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
-                               render_window.GetFramebufferLayout(),
+    const auto frame_layout = render_window.GetFramebufferLayout();
+    // Where the game image lands in the frame (DLSS Frame Generation's backbuffer subrect).
+    frame->game_left = frame_layout.screen.left;
+    frame->game_top = frame_layout.screen.top;
+    frame->game_right = frame_layout.screen.right;
+    frame->game_bottom = frame_layout.screen.bottom;
+    blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers, frame_layout,
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
 

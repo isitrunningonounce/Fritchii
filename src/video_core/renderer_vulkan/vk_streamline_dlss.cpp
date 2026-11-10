@@ -4,9 +4,11 @@
 // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS evaluation.
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <string_view>
 
+#include "common/frame_gen_stats.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/dlss_evaluation.h"
@@ -119,7 +121,71 @@ sl::Resource Resource(VkImage image, VkImageView view, VkFormat format, VkImageL
     return resource;
 }
 
+// LICHII_DLSS_FG_COPY=0: let Streamline copy frame generation's inputs (eOnlyValidNow).
+bool FrameGenOwnCopies() {
+    static const bool own = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_COPY");
+        return !value || value[0] != '0';
+    }();
+    return own;
+}
+
+constexpr VkImageUsageFlags FG_COPY_USAGE =
+    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
 } // Anonymous namespace
+
+void StreamlineDlssUpscaler::CreateFrameGenCopies(const Inputs& in) {
+    if (fg_copies[0].depth) {
+        scheduler.Finish(); // frame generation may still read the old ones
+    }
+    const auto create = [&](VkFormat format, VkImageAspectFlags aspect, vk::Image& image,
+                            vk::ImageView& view) {
+        image = memory_allocator.CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = {in.render_size.width, in.render_size.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = FG_COPY_USAGE,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = *image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = format,
+            .components{},
+            .subresourceRange{
+                .aspectMask = aspect,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        });
+    };
+    for (FrameGenCopy& copy : fg_copies) {
+        create(in.depth.format, VK_IMAGE_ASPECT_DEPTH_BIT, copy.depth, copy.depth_view);
+        create(in.motion_vectors.format, VK_IMAGE_ASPECT_COLOR_BIT, copy.motion,
+               copy.motion_view);
+    }
+    fg_copy_extent = in.render_size;
+    fg_depth_format = in.depth.format;
+    fg_motion_format = in.motion_vectors.format;
+    LOG_INFO(Render_Vulkan, "DLSS Frame Generation: {} copies of depth and motion at {}x{}",
+             FRAME_GEN_COPIES, in.render_size.width, in.render_size.height);
+}
 
 StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler& scheduler_,
                                                MemoryAllocator& memory_allocator_)
@@ -244,6 +310,18 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     }
     hdr_input = in.hdr;
 
+    // DLSS Frame Generation's inputs, copied into the next slot of the ring.
+    const FrameGenCopy* fg_copy = nullptr;
+    if (Streamline::IsFrameGenAvailable() && FrameGenOwnCopies() &&
+        Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed)) {
+        if (!fg_copies[0].depth || fg_copy_extent.width != in.render_size.width ||
+            fg_copy_extent.height != in.render_size.height ||
+            fg_depth_format != in.depth.format || fg_motion_format != in.motion_vectors.format) {
+            CreateFrameGenCopies(in);
+        }
+        fg_copy = &fg_copies[fg_copy_next++ % FRAME_GEN_COPIES];
+    }
+
     // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
     // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
@@ -269,7 +347,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, reset, options, options_changed, index = frame_index++,
+    scheduler.Record([this, in, reset, options, options_changed, index = frame_index++, fg_copy,
                       output_image_handle = *output_image,
                       output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
         const Streamline::Api& api = Streamline::GetApi();
@@ -411,11 +489,92 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             },
             [&] {
                 api_result = api.set_constants(constants, *frame, viewport);
-                return api_result == sl::Result::eOk;
+                if (api_result != sl::Result::eOk) {
+                    return false;
+                }
+                // DLSS Frame Generation (when on) presents from this frame's depth and motion.
+                if (!fg_copy) {
+                    Streamline::TagFrameGen(*frame, depth, motion, render_area, *cmdbuf,
+                                            sl::ResourceLifecycle::eOnlyValidNow);
+                    return true;
+                }
+                // Copy depth and motion (read-only for DLSS right now) into this frame's slot.
+                const auto copy_image = [](VkImage image, VkImageAspectFlags aspect) {
+                    return StreamlineDlssUpscaler::Image{
+                        .view = VK_NULL_HANDLE,
+                        .image = image,
+                        .format = VK_FORMAT_UNDEFINED,
+                        .range = {aspect, 0, 1, 0, 1},
+                        .barrier_aspect = aspect,
+                    };
+                };
+                const auto depth_copy = copy_image(*fg_copy->depth, VK_IMAGE_ASPECT_DEPTH_BIT);
+                const auto motion_copy = copy_image(*fg_copy->motion, VK_IMAGE_ASPECT_COLOR_BIT);
+                constexpr VkImageLayout READ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                constexpr VkImageLayout SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                constexpr VkImageLayout DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                const std::array before_copy{
+                    Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                            READ, SRC),
+                    Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT, READ, SRC),
+                    Barrier(depth_copy, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_IMAGE_LAYOUT_UNDEFINED, DST),
+                    Barrier(motion_copy, VK_ACCESS_SHADER_READ_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, DST),
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before_copy);
+                const auto region = [&](const StreamlineDlssUpscaler::Image& source,
+                                        VkImageAspectFlags aspect) {
+                    return VkImageCopy{
+                        .srcSubresource = {aspect, source.range.baseMipLevel,
+                                           source.range.baseArrayLayer, 1},
+                        .srcOffset = {0, 0, 0},
+                        .dstSubresource = {aspect, 0, 0, 1},
+                        .dstOffset = {0, 0, 0},
+                        .extent = {in.render_size.width, in.render_size.height, 1},
+                    };
+                };
+                cmdbuf.CopyImage(in.depth.image, SRC, *fg_copy->depth, DST,
+                                 region(in.depth, VK_IMAGE_ASPECT_DEPTH_BIT));
+                cmdbuf.CopyImage(in.motion_vectors.image, SRC, *fg_copy->motion, DST,
+                                 region(in.motion_vectors, VK_IMAGE_ASPECT_COLOR_BIT));
+                const std::array after_copy{
+                    Barrier(in.depth, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                            SRC, READ),
+                    Barrier(in.motion_vectors, VK_ACCESS_TRANSFER_READ_BIT,
+                            VK_ACCESS_SHADER_READ_BIT, SRC, READ),
+                    Barrier(depth_copy, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                            DST, READ),
+                    Barrier(motion_copy, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                            DST, READ),
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, after_copy);
+                const sl::Resource depth_tagged =
+                    Resource(*fg_copy->depth, *fg_copy->depth_view, in.depth.format, READ,
+                             in.render_size, FG_COPY_USAGE);
+                const sl::Resource motion_tagged =
+                    Resource(*fg_copy->motion, *fg_copy->motion_view, in.motion_vectors.format,
+                             READ, in.render_size, FG_COPY_USAGE);
+                Streamline::TagFrameGen(*frame, depth_tagged, motion_tagged, render_area, *cmdbuf,
+                                        sl::ResourceLifecycle::eValidUntilPresent);
+                return true;
             },
             [&] {
                 api_result = api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, std::size(inputs),
                                                   reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
+                // eWarnOutOfVRAM is a warning: the evaluation was recorded. Treating it as a
+                // failure turned DLSS off for the session on an 8 GB card with other apps open.
+                if (api_result == sl::Result::eWarnOutOfVRAM) {
+                    static std::atomic<bool> warned{};
+                    if (!warned.exchange(true)) {
+                        LOG_WARNING(Render_Vulkan, "NVIDIA DLSS: video memory is over budget "
+                                                   "(Streamline warning); DLSS keeps running");
+                    }
+                    return true;
+                }
                 return api_result == sl::Result::eOk;
             },
             [&] {

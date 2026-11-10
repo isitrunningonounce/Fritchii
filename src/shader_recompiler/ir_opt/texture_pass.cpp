@@ -341,11 +341,19 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
         return it->second;
     const u32 sec_idx = cbuf.has_secondary ? cbuf.secondary_index  : cbuf.index;
     const u32 sec_off = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
+    ++env.handle_read_depth;
     const u32 lhs = ReadCbufCached(env, cbuf.index, cbuf.offset) << cbuf.shift_left;
     const u32 rhs = ReadCbufCached(env, sec_idx, sec_off) << cbuf.secondary_shift_left;
+    --env.handle_read_depth;
     const u32 handle = lhs | rhs;
     env.handle_cache.emplace(hk, handle);
     return handle;
+}
+
+static inline HandleKey HandleLocation(const ConstBufferAddr& cbuf) {
+    return HandleKey{cbuf.index, cbuf.offset, cbuf.shift_left, cbuf.secondary_index,
+                     cbuf.secondary_offset, cbuf.secondary_shift_left, cbuf.count,
+                     cbuf.has_secondary};
 }
 
 // Cached variants of existing helpers
@@ -354,17 +362,30 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
 // ImageQueryDimensions case, which has none).
 static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return TextureType::Color2D;
-    return env.ReadTextureType(GetTextureHandleCached(env, cbuf));
+    const u32 handle = GetTextureHandleCached(env, cbuf);
+    const TextureType type = env.ReadTextureType(handle);
+    env.location_texture_types.insert_or_assign(HandleLocation(cbuf), type);
+    env.location_handles.insert_or_assign(handle, true);
+    return type;
 }
 static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
                                                                 const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
-    return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
+    const u32 handle = GetTextureHandleCached(env, cbuf);
+    const TexturePixelFormat format = env.ReadTexturePixelFormat(handle);
+    env.location_texture_formats.insert_or_assign(HandleLocation(cbuf), format);
+    env.location_handles.insert_or_assign(handle, true);
+    return format;
 }
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return false;
-    return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
+    // Only the integer/float class is recorded by location: any format of that class fits.
+    const u32 handle = GetTextureHandleCached(env, cbuf);
+    const bool integer = env.IsTexturePixelFormatInteger(handle);
+    env.location_integer_formats.insert_or_assign(HandleLocation(cbuf), integer);
+    env.location_handles.insert_or_assign(handle, true);
+    return integer;
 }
 
 

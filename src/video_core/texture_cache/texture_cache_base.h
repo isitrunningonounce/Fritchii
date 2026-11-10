@@ -508,6 +508,24 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// LICHII_BATCH_GC_DOWNLOADS (default on, =0 off): the collector's downloads of evicted images wait
+    /// once per pass instead of once per image.
+    static bool BatchGcDownloads() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LICHII_BATCH_GC_DOWNLOADS");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+    void FinishGcDownloads();
+    struct GcDownload {
+        decltype(std::declval<Runtime&>().DownloadStagingBuffer(0)) map;
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        GPUVAddr gpu_addr;
+        ImageInfo info;
+    };
+    std::vector<GcDownload> gc_pending_downloads;
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 

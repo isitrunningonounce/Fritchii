@@ -1083,6 +1083,15 @@ bool GetDebugKnobAt(u8 i);
 
 void UpdateGPUAccuracy();
 bool IsGPULevelHigh();
+/// Lichii mod: config values a launcher can override for one session without saving them.
+/// LICHII_DLSS=1: NVIDIA DLSS in place of the game's pass (nvidia_dlss).
+bool NvidiaDlssEnabled();
+/// Sets (or, with null or "", clears) one of those launcher variables for this process: the
+/// Graphics menu uses it for the next game start (LICHII_DLSS, LICHII_RESOLUTION,
+/// LICHII_SKIP_BUILTIN, LICHII_DLSS_FG).
+void SetSessionOverride(const char* name, const char* value);
+/// LICHII_OOT_NO_SHARPEN=1: Ocarina of Time anti-aliasing "No sharpening" (oot_anti_aliasing).
+bool OotNoSharpening();
 
 bool IsDMALevelDefault();
 bool IsDMALevelSafe();

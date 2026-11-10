@@ -42,6 +42,50 @@
 
 namespace VideoCommon {
 
+/// LICHII_UNIFORM_STATS=1: every 10 s, how graphics uniform buffers were bound (stream "fast"
+/// path vs the cached buffer, whose changes are uploaded with barriers mid-frame) and why.
+namespace UniformBindStats {
+inline bool Enabled() {
+    static const bool enabled = std::getenv("LICHII_UNIFORM_STATS") != nullptr;
+    return enabled;
+}
+inline std::atomic<u64> fast{}, cached{}, cached_small{}, cached_gpu_modified{},
+    cached_cpu_modified{}, cached_bytes{};
+inline std::atomic<u64> size_hist[8]{}; ///< cached binds by size: <=256, 1K, 4K, 16K, 64K, more
+inline std::atomic<u64> inline_updates{}, upload_reordered{}, upload_in_frame{};
+inline void Note(bool used_fast, u32 size, bool is_small, bool gpu_modified, bool cpu_modified) {
+    if (used_fast) {
+        fast.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        cached.fetch_add(1, std::memory_order_relaxed);
+        cached_bytes.fetch_add(size, std::memory_order_relaxed);
+        cached_small.fetch_add(is_small ? 1 : 0, std::memory_order_relaxed);
+        cached_gpu_modified.fetch_add(gpu_modified ? 1 : 0, std::memory_order_relaxed);
+        cached_cpu_modified.fetch_add(cpu_modified ? 1 : 0, std::memory_order_relaxed);
+        const u32 bucket = size <= 256 ? 0 : size <= 1024 ? 1 : size <= 4096 ? 2
+                           : size <= 16384 ? 3 : size <= 65536 ? 4 : 5;
+        size_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+    }
+    static std::atomic<u64> next_report{};
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    u64 expected = next_report.load(std::memory_order_relaxed);
+    if (now >= expected && next_report.compare_exchange_strong(expected, now + 10)) {
+        LOG_INFO(HW_GPU,
+                 "LICHII_UNIFORM_STATS (10 s): fast {} cached {} ({:.1f} MiB; small {} gpu-modified "
+                 "{} cpu-modified {}) sizes <=256:{} <=1K:{} <=4K:{} <=16K:{} <=64K:{} more:{} | inline "
+                 "updates {} uploads reordered {} in-frame {}",
+                 fast.exchange(0), cached.exchange(0), cached_bytes.exchange(0) / 1048576.0,
+                 cached_small.exchange(0), cached_gpu_modified.exchange(0),
+                 cached_cpu_modified.exchange(0), size_hist[0].exchange(0),
+                 size_hist[1].exchange(0), size_hist[2].exchange(0), size_hist[3].exchange(0),
+                 size_hist[4].exchange(0), size_hist[5].exchange(0), inline_updates.exchange(0),
+                 upload_reordered.exchange(0), upload_in_frame.exchange(0));
+    }
+}
+} // namespace UniformBindStats
+
 using Core::DEVICE_PAGESIZE;
 
 template <class P>
@@ -358,8 +402,39 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         }
         return std::nullopt;
     }();
-    const bool preflush =
+    // LICHII_HOT_READ_PREFLUSH / LICHII_HOT_READ_COPY (off by default): a page the guest keeps
+    // reading is preflushed or copied after writes instead of waiting for the GPU on each read.
+    bool preflush =
         forced_preflush.value_or(!Tegra::g_nx2_ampere.load(std::memory_order_relaxed));
+    if (!area->preemtive && !preflush && HotReadCopyThreshold() != 0 &&
+        !Tegra::Nx2IsCommandListPage(device_addr_start_aligned)) {
+        u32& reads = flushed_cpu_reads[device_addr_start_aligned];
+        if (++reads >= HotReadCopyThreshold()) {
+            flushed_cpu_reads.erase(device_addr_start_aligned);
+            for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
+                 page += Core::DEVICE_PAGESIZE) {
+                Tegra::Nx2MarkCommandListPage(page);
+            }
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_INFO(HW_GPU, "LICHII_HOT_READ_COPY: page {:#x} (+{:#x}) is copied after writes",
+                         device_addr_start_aligned,
+                         device_addr_end_aligned - device_addr_start_aligned);
+            }
+        }
+    } else if (!area->preemtive && !preflush && HotReadPreflushThreshold() != 0) {
+        u32& reads = flushed_cpu_reads[device_addr_start_aligned];
+        if (++reads >= HotReadPreflushThreshold()) {
+            preflush = true;
+            flushed_cpu_reads.erase(device_addr_start_aligned);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_INFO(HW_GPU, "LICHII_HOT_READ_PREFLUSH: page {:#x} (+{:#x}) is preflushed now",
+                         device_addr_start_aligned,
+                         device_addr_end_aligned - device_addr_start_aligned);
+            }
+        }
+    }
     if (!area->preemtive) {
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
@@ -388,7 +463,51 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 }
 
 template <class P>
+bool BufferCache<P>::DownloadFromWriteCopy(DAddr device_addr, u64 size) {
+    if constexpr (IS_OPENGL) {
+        return false;
+    } else {
+        if (HotReadCopyThreshold() == 0 || size == 0 ||
+            !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+        const DAddr end = device_addr + size;
+        for (DAddr page = Common::AlignDown(device_addr, page_size); page < end; page += page_size) {
+            if (!Tegra::Nx2IsCommandListPage(page)) {
+                return false;
+            }
+        }
+        std::array<u8, page_size> data;
+        for (DAddr page = Common::AlignDown(device_addr, page_size); page < end; page += page_size) {
+            const DAddr begin = (std::max)(page, device_addr);
+            const DAddr upper = (std::min)(page + page_size, end);
+            const std::span<u8> out{data.data(), static_cast<size_t>(upper - begin)};
+            switch (Nx2ReadListCopy(begin, out, true)) {
+            case Nx2ListRead::Copied:
+                device_memory.WriteBlockUnsafe(begin, data.data(), out.size());
+                break;
+            case Nx2ListRead::Synced:
+                break;
+            default:
+                // No copy of the latest write (a draw wrote the page, or it has none yet).
+                return false;
+            }
+        }
+        static std::atomic<u64> served{};
+        if ((served.fetch_add(1, std::memory_order_relaxed) & 4095) == 0) {
+            LOG_INFO(HW_GPU, "LICHII_HOT_READ_COPY: CPU reads served from write copies: {}",
+                     served.load(std::memory_order_relaxed));
+        }
+        return true;
+    }
+}
+
+template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+    if (DownloadFromWriteCopy(device_addr, size)) {
+        return;
+    }
     if constexpr (USE_MEMORY_MAPS) {
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;
@@ -2162,6 +2281,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 cost.last_log = now;
             }
         }
+    }
+    if (UniformBindStats::Enabled()) [[unlikely]] {
+        UniformBindStats::Note(use_fast_buffer, size,
+                               size <= channel_state->uniform_buffer_skip_cache_size,
+                               has_host_buffer && memory_tracker.IsRegionGpuModified(device_addr, size),
+                               has_host_buffer && memory_tracker.IsRegionCpuModified(device_addr, size));
     }
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
     if (use_fast_buffer) {
@@ -4026,6 +4151,10 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             copy.src_offset += upload_staging.offset;
         }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+        if (UniformBindStats::Enabled()) [[unlikely]] {
+            (can_reorder ? UniformBindStats::upload_reordered : UniformBindStats::upload_in_frame)
+                .fetch_add(1, std::memory_order_relaxed);
+        }
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     }
 }
@@ -4052,6 +4181,9 @@ template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
     Core::g_buffer_write_pages.Mark(dest_address, copy_size);
+    if (UniformBindStats::Enabled()) [[unlikely]] {
+        UniformBindStats::inline_updates.fetch_add(1, std::memory_order_relaxed);
+    }
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);

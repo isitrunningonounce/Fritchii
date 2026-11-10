@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "core/lichii_telemetry.h"
 #include "common/dkb_frame_trace.h"
 #include "common/host_memory.h"
 #include "common/memory_detect.h"
@@ -65,6 +66,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/renderer_vulkan/lichii_dynamic_rendering.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -913,7 +915,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             bool recorded = frame_dump.NoteSampled(sampled);
             recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
             if (recorded) {
-                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+                scheduler.RequestRendering(texture_cache.GetFramebuffer());
             }
         }
     }
@@ -1688,7 +1690,7 @@ void RasterizerVulkan::CaptureIndirectTrace() {
     });
     slot->tick = scheduler.CurrentTick();
     slot->pending = true;
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.RequestRendering(texture_cache.GetFramebuffer());
     scheduler.NoteRenderPassStores();
 }
 
@@ -1971,7 +1973,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                                  !scheduler.IsRenderPassActive() &&
                                  (!use_color || color_full_channels) && ds_deferrable;
     if (!can_defer_clear) {
-        scheduler.RequestRenderpass(framebuffer);
+        scheduler.RequestRendering(framebuffer);
     }
 
     query_cache.NotifySegment(true);
@@ -2671,7 +2673,14 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
     CountGuestAccess(g_guest_access.write_locked);
     {
+        const auto lock_start = Core::Telemetry::Enabled() ? std::chrono::steady_clock::now()
+                                                           : std::chrono::steady_clock::time_point{};
         std::scoped_lock lock{buffer_cache.mutex};
+        if (Core::Telemetry::Enabled()) {
+            Core::Telemetry::NoteTrapLockWait(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - lock_start)
+                                                  .count());
+        }
         if (buffer_cache.OnCPUWrite(addr, size)) {
             return true;
         }
@@ -4019,7 +4028,11 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
             std::array<VkViewport, Maxwell::NumViewports> viewport_list{};
             viewport_list.fill(viewport);
             const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
-            cmdbuf.SetViewport(0, viewports);
+            if (UseShaderObjects(device)) {
+                cmdbuf.SetViewportWithCountEXT(viewports);
+            } else {
+                cmdbuf.SetViewport(0, viewports);
+            }
         });
         return;
     }
@@ -4044,7 +4057,11 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
     scheduler.Record([this, viewport_list](vk::CommandBuffer cmdbuf) {
         const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
-        cmdbuf.SetViewport(0, viewports);
+        if (UseShaderObjects(device)) {
+                cmdbuf.SetViewportWithCountEXT(viewports);
+            } else {
+                cmdbuf.SetViewport(0, viewports);
+            }
     });
 }
 
@@ -4070,7 +4087,11 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
             std::array<VkRect2D, Maxwell::NumViewports> scissor_list{};
             scissor_list.fill(scissor);
             const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
-            cmdbuf.SetScissor(0, scissors);
+            if (UseShaderObjects(device)) {
+                cmdbuf.SetScissorWithCountEXT(scissors);
+            } else {
+                cmdbuf.SetScissor(0, scissors);
+            }
         });
         return;
     }
@@ -4101,7 +4122,11 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
     scheduler.Record([this, scissor_list](vk::CommandBuffer cmdbuf) {
         const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkRect2D> scissors(scissor_list.data(), num_scissors);
-        cmdbuf.SetScissor(0, scissors);
+        if (UseShaderObjects(device)) {
+                cmdbuf.SetScissorWithCountEXT(scissors);
+            } else {
+                cmdbuf.SetScissor(0, scissors);
+            }
     });
 }
 

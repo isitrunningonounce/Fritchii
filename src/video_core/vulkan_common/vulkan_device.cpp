@@ -48,6 +48,14 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+#ifdef EGLANTINE_STREAMLINE
+// LICHII_DLSS_FG_PRESENT_QUEUE=0: present from the renderer's queue with frame generation (test).
+bool UseFrameGenSwapchainQueue() {
+    const char* const value = std::getenv("LICHII_DLSS_FG_PRESENT_QUEUE");
+    return !value || value[0] != '0';
+}
+#endif
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -509,6 +517,19 @@ bool WantsAmdFsr4(VkDriverId driver_id) {
 #endif
 }
 } // Anonymous namespace
+Settings::ExtendedDynamicState EffectiveDynaState() {
+    static const std::optional<Settings::ExtendedDynamicState> override_level =
+        []() -> std::optional<Settings::ExtendedDynamicState> {
+        const char* value = std::getenv("LICHII_DYNA_STATE");
+        if (value == nullptr || *value == '\0') {
+            return std::nullopt;
+        }
+        const int level = std::clamp(std::atoi(value), 0, 3);
+        LOG_INFO(Render_Vulkan, "LICHII_DYNA_STATE: extended dynamic state level {}", level);
+        return static_cast<Settings::ExtendedDynamicState>(level);
+    }();
+    return override_level.value_or(Settings::values.dyna_state.GetValue());
+}
 
 Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR surface,
                const vk::InstanceDispatch& dld_)
@@ -728,7 +749,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         properties.properties.limits.maxVertexInputBindings = 32;
     }
 
-    const auto dyna_state = Settings::values.dyna_state.GetValue();
+    const auto dyna_state = EffectiveDynaState();
     switch (dyna_state) {
     case Settings::ExtendedDynamicState::Disabled:
         // Level 0: Disable all extended dynamic state extensions
@@ -829,6 +850,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (host_float16_supported) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
+
+    // DLSS Frame Generation's optical flow (VK_NV_optical_flow) needs its feature enabled.
+    VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV,
+        .pNext = const_cast<void*>(first_next),
+        .opticalFlow = VK_TRUE,
+    };
+    if (streamline_optical_flow) {
+        first_next = &optical_flow_features;
+    }
+
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -837,9 +869,34 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
         streamline_attached =
-            Streamline::AttachDevice(instance, physical, *logical, graphics_family, dld);
+            Streamline::AttachDevice(instance, physical, *logical, graphics_family,
+                                     optical_flow_family.value_or(graphics_family), dld);
     } else if (Streamline::WantsDevice()) {
         Streamline::Stop();
+    }
+    // DLSS Frame Generation holds the presenting queue, and the swapchain images it hands out,
+    // until its paced presentation is done: on the renderer's only queue that stalled all
+    // rendering on the GPU and halved the real frame rate. The swapchain copy and present get a
+    // queue of their own (the last one in the graphics family).
+    if (Streamline::IsFrameGenAvailable() && UseFrameGenSwapchainQueue() &&
+        present_family == graphics_family) {
+        const Streamline::ExtraQueues extra = Streamline::ExtraQueuesWanted();
+        const u32 index = 1 + extra.compute + extra.graphics +
+                          (optical_flow_family == graphics_family ? extra.optical_flow : 0);
+        const auto ci = std::ranges::find(queue_cis, graphics_family,
+                                          &VkDeviceQueueCreateInfo::queueFamilyIndex);
+        if (ci != queue_cis.end() && ci->queueCount > index) {
+            VkQueue queue{};
+            // Through Streamline, so DLSS-G knows the queue it is handed presents on.
+            queue = Streamline::FrameGenDeviceQueue(*logical, graphics_family, index);
+            if (!queue) {
+                dld.vkGetDeviceQueue(*logical, graphics_family, index, &queue);
+            }
+            swapchain_queue = vk::Queue(queue, dld);
+            has_swapchain_queue = true;
+            LOG_INFO(Render_Vulkan, "DLSS Frame Generation: swapchain queue {} of family {}",
+                     index, graphics_family);
+        }
     }
 #endif
 
@@ -1282,6 +1339,33 @@ bool Device::GetSuitability(bool requires_swapchain) {
         streamline_extensions = all;
         LOG_INFO(Render_Vulkan, "NVIDIA DLSS device extensions: {} ({})",
                  all ? "enabled" : "unavailable", names.empty() ? "none" : names);
+        // Frame generation's own extensions: all of them, or frame generation goes (DLSS stays).
+        const std::vector<std::string> fg_wanted = Streamline::FrameGenDeviceExtensions();
+        if (all && !fg_wanted.empty()) {
+            const bool fg_all = std::ranges::all_of(fg_wanted, [&](const std::string& name) {
+                return supported_extensions.contains(name);
+            });
+            // SetupFamilies runs after this: look for an optical flow family here.
+            const bool has_optical_flow_family =
+                std::ranges::any_of(physical.GetQueueFamilyProperties(),
+                                    [](const VkQueueFamilyProperties& family) {
+                                        return family.queueCount != 0 &&
+                                               (family.queueFlags &
+                                                VK_QUEUE_OPTICAL_FLOW_BIT_NV) != 0;
+                                    });
+            if (fg_all && has_optical_flow_family) {
+                for (const std::string& name : fg_wanted) {
+                    loaded_extensions.insert(name);
+                }
+                streamline_optical_flow =
+                    std::ranges::find(fg_wanted, VK_NV_OPTICAL_FLOW_EXTENSION_NAME) !=
+                    fg_wanted.end();
+            } else {
+                Streamline::DropFrameGen(has_optical_flow_family
+                                             ? "the device lacks some of its extensions"
+                                             : "the device has no optical flow queue family");
+            }
+        }
     }
 #endif
 
@@ -1536,7 +1620,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
         }
     }
 
-    if (u32(Settings::values.dyna_state.GetValue()) == 0) {
+    if (u32(EffectiveDynaState()) == 0) {
         LOG_INFO(Render_Vulkan, "Extended Dynamic State disabled by user setting, clearing all EDS features");
         features.extended_dynamic_state.extendedDynamicState = false;
         features.extended_dynamic_state2.extendedDynamicState2 = false;
@@ -1998,6 +2082,13 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     if (present) {
         present_family = *present;
     }
+    for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
+        if (queue_family_properties[index].queueCount != 0 &&
+            (queue_family_properties[index].queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) != 0) {
+            optical_flow_family = index;
+            break;
+        }
+    }
 }
 
 bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
@@ -2189,22 +2280,53 @@ void Device::CollectToolingInfo() {
 }
 
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
-    static constexpr float QUEUE_PRIORITY = 1.0f;
+    static constexpr std::array<float, 16> QUEUE_PRIORITIES{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                                            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                                            1.0f, 1.0f, 1.0f, 1.0f};
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    // DLSS Frame Generation's queues (Streamline::AttachDevice gives it their indices): compute
+    // and graphics after the renderer's queue in the graphics family, optical flow in its family.
+    u32 graphics_extra = 0;
+    u32 optical_flow_count = 0;
+#ifdef EGLANTINE_STREAMLINE
+    const Streamline::ExtraQueues extra = Streamline::ExtraQueuesWanted();
+    graphics_extra = extra.compute + extra.graphics;
+    if (extra.optical_flow != 0 && optical_flow_family) {
+        if (*optical_flow_family == graphics_family) {
+            graphics_extra += extra.optical_flow;
+        } else {
+            optical_flow_count = extra.optical_flow;
+            unique_queue_families.insert(*optical_flow_family);
+        }
+    }
+    // Plus the swapchain queue, after all of frame generation's (see the constructor).
+    if (graphics_extra != 0 && UseFrameGenSwapchainQueue()) {
+        ++graphics_extra;
+    }
+#endif
+    const std::vector queue_family_properties = physical.GetQueueFamilyProperties();
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
     for (const u32 queue_family : unique_queue_families) {
-        auto& ci = queue_cis.emplace_back(VkDeviceQueueCreateInfo{
+        u32 count = 1;
+        if (queue_family == graphics_family) {
+            count += graphics_extra;
+        } else if (optical_flow_family && queue_family == *optical_flow_family &&
+                   optical_flow_count != 0) {
+            count = optical_flow_count;
+        }
+        count = (std::min)({count, queue_family_properties[queue_family].queueCount,
+                            static_cast<u32>(QUEUE_PRIORITIES.size())});
+        queue_cis.push_back(VkDeviceQueueCreateInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .queueFamilyIndex = queue_family,
-            .queueCount = 1,
-            .pQueuePriorities = nullptr,
+            .queueCount = count,
+            .pQueuePriorities = QUEUE_PRIORITIES.data(),
         });
-        ci.pQueuePriorities = &QUEUE_PRIORITY;
     }
 
     return queue_cis;

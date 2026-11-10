@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstring>
 #include "common/settings.h"
 #include "common/random.h"
@@ -90,7 +91,10 @@ AppLoader::LoadResult AppLoader_KIP::Load(Kernel::KProcess& process,
 
     // TODO: this is bad form of ASLR, it sucks
     std::uintptr_t aslr_offset = ((::Settings::values.rng_seed_enabled.GetValue()
-        ? ::Settings::values.rng_seed.GetValue() : Common::Random::Random64(0)) << 12) & 0xfff000;
+        ? ::Settings::values.rng_seed.GetValue()
+        // Lichii: the same code layout every boot, so translated code stored by one run (the CPU
+        // precompile, lichii_jit) matches the next. LICHII_RANDOM_CODE_LAYOUT=1 randomizes it again.
+        : (std::getenv("LICHII_RANDOM_CODE_LAYOUT") != nullptr ? Common::Random::Random64(0) : 0)) << 12) & 0xfff000;
 
     // Setup the process code layout
     if (process.LoadFromMetadata(system.Kernel(), FileSys::ProgramMetadata::GetDefault(), codeset.memory.size(), 0, aslr_offset).IsError()) {

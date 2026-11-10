@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -339,6 +340,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
         // Nothing reads the module once the pipeline exists; the driver keeps its SPIR-V while it
         // lives.
+        ForgetShaderSpirv(*spv_module);
         spv_module.reset();
         std::scoped_lock lock{build_mutex};
         is_built = true;

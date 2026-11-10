@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include <version>
 #include <atomic>
 #if __cpp_lib_chrono >= 201907L
@@ -157,19 +159,35 @@ bool GetDebugKnobAt(u8 i) {
 }
 
 void UpdateGPUAccuracy() {
-    values.current_gpu_accuracy = values.gpu_accuracy.GetValue();
+    // LICHII_GPU_ACCURACY_LOW=1: the Low GPU accuracy level without changing the config (+2.5 fps
+    // in Ocarina's village; to be checked for glitches in play).
+    static const bool force_low = [] {
+        const char* value = std::getenv("LICHII_GPU_ACCURACY_LOW");
+        return value != nullptr && value[0] == '1';
+    }();
+    values.current_gpu_accuracy = force_low ? GpuAccuracy::Low : values.gpu_accuracy.GetValue();
 }
 
 bool IsGPULevelHigh() {
     return values.current_gpu_accuracy == GpuAccuracy::High;
 }
 
+// LICHII_FAST_LIST_READS=1: DMA accuracy Unsafe without changing the config: command lists are read
+// without a full cache flush (GPU-written ones through their copies), +1.2 fps in Ocarina's village.
+static DmaAccuracy EffectiveDmaAccuracy() {
+    static const bool fast_list_reads = [] {
+        const char* value = std::getenv("LICHII_FAST_LIST_READS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return fast_list_reads ? DmaAccuracy::Unsafe : values.dma_accuracy.GetValue();
+}
+
 bool IsDMALevelDefault() {
-    return values.dma_accuracy.GetValue() == DmaAccuracy::Default;
+    return EffectiveDmaAccuracy() == DmaAccuracy::Default;
 }
 
 bool IsDMALevelSafe() {
-    return values.dma_accuracy.GetValue() == DmaAccuracy::Safe;
+    return EffectiveDmaAccuracy() == DmaAccuracy::Safe;
 }
 
 bool IsGPUFenceBehaviorDefault() {
@@ -394,8 +412,53 @@ void TranslateResolutionInfo(ResolutionSetup setup, ResolutionScalingInfo& info)
     info.active = info.up_scale != 1 || info.down_shift != 0;
 }
 
+namespace {
+bool EnvIsOne(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] == '1';
+}
+// LICHII_DLSS, read again at every game start (UpdateRescalingInfo): the Graphics menu changes it
+// for the next start.
+std::atomic<bool> g_dlss_forced{EnvIsOne("LICHII_DLSS")};
+} // Anonymous namespace
+
+bool NvidiaDlssEnabled() {
+    return g_dlss_forced.load(std::memory_order_relaxed) || values.nvidia_dlss.GetValue();
+}
+
+void SetSessionOverride(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value && value[0] != '\0') {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+bool OotNoSharpening() {
+    static const bool forced = EnvIsOne("LICHII_OOT_NO_SHARPEN");
+    return forced || values.oot_anti_aliasing.GetValue() == OotAntiAliasing::NoSharpening;
+}
+
 void UpdateRescalingInfo() {
-    const auto setup = values.resolution_setup.GetValue();
+    g_dlss_forced.store(EnvIsOne("LICHII_DLSS"), std::memory_order_relaxed);
+    // LICHII_RESOLUTION=<ResolutionSetup index> (3 = 1x, 5 = 1.5x): this session only, the config
+    // keeps its value (DLSS needs 1x; the other launchers use 1.5x). Read at every game start.
+    const std::optional<ResolutionSetup> forced = []() -> std::optional<ResolutionSetup> {
+        const char* value = std::getenv("LICHII_RESOLUTION");
+        if (value == nullptr || value[0] == '\0') {
+            return std::nullopt;
+        }
+        const int index = std::atoi(value);
+        if (index < 0 || index > static_cast<int>(ResolutionSetup::Res8X)) {
+            return std::nullopt;
+        }
+        return static_cast<ResolutionSetup>(index);
+    }();
+    const auto setup = forced.value_or(values.resolution_setup.GetValue());
     auto& info = values.resolution_info;
     TranslateResolutionInfo(setup, info);
 }

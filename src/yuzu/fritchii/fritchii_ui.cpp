@@ -2,7 +2,9 @@
 
 #include "yuzu/fritchii/fritchii_ui.h"
 
+#include <cstdlib>
 #include <map>
+#include <string>
 #include <string_view>
 
 #include <QAction>
@@ -21,6 +23,7 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QPalette>
 #include <QPixmap>
 #include <QProxyStyle>
@@ -28,7 +31,9 @@
 #include <QUrl>
 #include <QScrollArea>
 #include <QStyleFactory>
+#include <QTimer>
 
+#include "common/frame_gen_stats.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -309,6 +314,110 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     Rename(ui.action_Eden_Dependencies, tr("&Open-Source Components"));
 }
 
+namespace {
+
+// Lichii mod: NVIDIA DLSS and its frame generation are set by the launchers' variables, read at
+// every game start. The Graphics menu and the frame generation button change them for the next
+// start of this window (nothing is saved: the launchers keep their own choice).
+enum class DlssMode { Off, To1440, To4K };
+
+std::string Env(const char* name) {
+    const char* const value = std::getenv(name);
+    return value ? value : "";
+}
+
+DlssMode CurrentDlssMode() {
+    if (Env("LICHII_DLSS") != "1") {
+        return DlssMode::Off;
+    }
+    return Env("LICHII_SKIP_BUILTIN").find("Max Resolution") != std::string::npos
+               ? DlssMode::To1440
+               : DlssMode::To4K;
+}
+
+void SetDlssMode(DlssMode mode) {
+    // The game renders at 1x for DLSS; the game's own "Max Resolution" doubles it to 1440p, which
+    // DLSS reconstructs in 4K. Off goes back to the configured resolution (1.5x).
+    Settings::SetSessionOverride("LICHII_DLSS", mode == DlssMode::Off ? nullptr : "1");
+    Settings::SetSessionOverride("LICHII_RESOLUTION", mode == DlssMode::Off ? nullptr : "3");
+    Settings::SetSessionOverride("LICHII_SKIP_BUILTIN",
+                                 mode == DlssMode::To1440 ? "Max Resolution" : nullptr);
+    if (mode == DlssMode::Off) {
+        Settings::SetSessionOverride("LICHII_DLSS_FG", nullptr); // it needs DLSS
+    }
+}
+
+void OfferRestart(QWidget* parent, const GraphicsHooks& hooks, const QString& what) {
+    if (!hooks.game_running || !hooks.game_running() || !hooks.restart_game) {
+        return;
+    }
+    const auto answer = QMessageBox::question(
+        parent, what,
+        QObject::tr("This takes effect when the game starts again. Restart the game now?"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+    if (answer == QMessageBox::Yes) {
+        hooks.restart_game();
+    }
+}
+
+} // Anonymous namespace
+
+QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks) {
+    auto* button = new QPushButton(QObject::tr("FRAME GEN 2X"), parent);
+    button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    button->setFocusPolicy(Qt::NoFocus);
+    button->setCheckable(true);
+
+    const auto update = [button] {
+        const bool available = Common::FrameGenStats::available.load(std::memory_order_relaxed);
+        const bool user_on = Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed);
+        const bool next_start = Env("LICHII_DLSS_FG") == "1";
+        const bool on = available ? user_on : next_start;
+        button->setChecked(on);
+        button->setText(on ? QObject::tr("FRAME GEN 2X") : QObject::tr("FRAME GEN OFF"));
+        if (available) {
+            button->setToolTip(on ? QObject::tr("DLSS Frame Generation 2x is on (it generates "
+                                                "frames while the window has focus)")
+                                  : QObject::tr("DLSS Frame Generation 2x is off"));
+        } else {
+            button->setToolTip(next_start
+                                   ? QObject::tr("DLSS Frame Generation 2x turns on when the game "
+                                                 "starts again")
+                                   : QObject::tr("DLSS Frame Generation 2x is off (needs NVIDIA "
+                                                 "DLSS and an RTX 40 or newer GPU)"));
+        }
+    };
+    update();
+    auto* timer = new QTimer(button);
+    QObject::connect(timer, &QTimer::timeout, button, update);
+    timer->start(1000);
+
+    QObject::connect(button, &QPushButton::clicked, button, [button, hooks, update] {
+        if (Common::FrameGenStats::available.load(std::memory_order_relaxed)) {
+            // Set up in this game start: switch it at once.
+            Common::FrameGenStats::user_enabled.store(
+                !Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            update();
+            return;
+        }
+        const bool turn_on = Env("LICHII_DLSS_FG") != "1";
+        Settings::SetSessionOverride("LICHII_DLSS_FG", turn_on ? "1" : nullptr);
+        if (turn_on) {
+            Common::FrameGenStats::user_enabled.store(true, std::memory_order_relaxed);
+            if (CurrentDlssMode() == DlssMode::Off) {
+                SetDlssMode(DlssMode::To1440); // frame generation runs on DLSS's output
+            }
+            OfferRestart(button->window(), hooks, QObject::tr("DLSS Frame Generation"));
+        }
+        update();
+        if (hooks.refresh) {
+            hooks.refresh();
+        }
+    });
+    return button;
+}
+
 QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
     auto* button = new QPushButton(QObject::tr("GRAPHICS"), parent);
     button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
@@ -357,6 +466,23 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
             QObject::tr("Upscaling &Filter"), ConfigurationShared::scaling_filter_texts_map,
             Settings::values.scaling_filter.GetValue(),
             [](Settings::ScalingFilter filter) { Settings::values.scaling_filter.SetValue(filter); },
+            true);
+        // Lichii mod: NVIDIA DLSS in place of the game's own upscaler, for the next game start.
+        const std::map<DlssMode, QString> dlss_modes{
+            {DlssMode::Off, QObject::tr("Off")},
+            {DlssMode::To1440, QObject::tr("1080p to 1440p")},
+            {DlssMode::To4K, QObject::tr("1440p to 4K")},
+        };
+        const QWidget* const owner = button;
+        add_choices(
+            QObject::tr("NVIDIA &DLSS"), dlss_modes, CurrentDlssMode(),
+            [hooks, owner](DlssMode mode) {
+                if (mode == CurrentDlssMode()) {
+                    return;
+                }
+                SetDlssMode(mode);
+                OfferRestart(owner->window(), hooks, QObject::tr("NVIDIA DLSS"));
+            },
             true);
         add_choices(
             QObject::tr("Anti-&Aliasing"), ConfigurationShared::anti_aliasing_texts_map,

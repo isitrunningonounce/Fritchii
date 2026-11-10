@@ -44,6 +44,9 @@ enum class LoadCallbackStage {
     Prepare,
     Build,
     Complete,
+    Translate, ///< LICHII_PRECOMPILE: translating the game's shader archives (first boot only)
+    Effects,   ///< LICHII_PRECOMPILE: building the stored compute (effect) pipelines
+    Pipelines, ///< LICHII_PRECOMPILE_PIPELINES: driver pipelines for the translations (first boot)
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
 

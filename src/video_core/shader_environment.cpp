@@ -50,6 +50,9 @@ constexpr std::array<char, 8> MAGIC_NUMBER{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h
 
 constexpr size_t INST_SIZE = sizeof(u64);
 
+/// Precedes the mesh state of task and mesh program cache entries ("MSH1").
+constexpr u32 MeshStateTag = 0x3148534D;
+
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
 // The shader hash of lowered native code (frame dump "shaders", pipeline cache keys), with a
@@ -189,6 +192,7 @@ GenericEnvironment::GenericEnvironment(Tegra::MemoryManager& gpu_memory_, GPUVAd
 GenericEnvironment::~GenericEnvironment() = default;
 
 u32 GenericEnvironment::TextureBoundBuffer() const {
+    texture_bound_queried = true;
     return texture_bound;
 }
 
@@ -299,8 +303,10 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
         return it->second != 0;
     }
+    ++pointer_probe_depth;
     const u64 address = u64{ReadCbufValue(index, offset)} |
                         (u64{ReadCbufValue(index, offset + 4)} << 32);
+    --pointer_probe_depth;
     const bool mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
                         (guarded_reads ? IsMappedGuarded(address, 1)
                                        : gpu_memory->IsFullyMappedRange(address, 1));
@@ -315,8 +321,10 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
     }
     bool mapped = false;
     if (IsCbufStorageBufferPointer(index, offset)) {
+        ++pointer_probe_depth;
         const u64 holder =
             u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
+        --pointer_probe_depth;
         if (guarded_reads) {
             // A pointer table in guest memory, read when translated (the GPU thread reads it at
             // its translation too; nothing copies it).
@@ -470,8 +478,9 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
                        sizeof(gp_passthrough_mask));
         }
         if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
-            // Task and mesh programs are translated with these (none were stored before).
-            file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
+            // The mesh state the translation reads, behind a tag (entries of older builds lack it).
+            file.write(reinterpret_cast<const char*>(&MeshStateTag), sizeof(MeshStateTag))
+                .write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
                 .write(reinterpret_cast<const char*>(&mesh_primitive_header),
                        sizeof(mesh_primitive_header));
         }
@@ -1057,6 +1066,9 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
         value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
     }
     cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    if (pointer_probe_depth == 0 && handle_read_depth == 0) {
+        direct_cbuf_reads.insert(MakeCbufKey(cbuf_index, cbuf_offset));
+    }
     return value;
 }
 
@@ -1510,9 +1522,18 @@ void FileEnvironment::Deserialize(std::istream& file) {
             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
         }
         if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
-            file.read(reinterpret_cast<char*>(&mesh_registers), sizeof(mesh_registers))
-                .read(reinterpret_cast<char*>(&mesh_primitive_header),
-                      sizeof(mesh_primitive_header));
+            const auto tag_position = file.tellg();
+            u32 tag{};
+            file.read(reinterpret_cast<char*>(&tag), sizeof(tag));
+            if (file && tag == MeshStateTag) {
+                file.read(reinterpret_cast<char*>(&mesh_registers), sizeof(mesh_registers))
+                    .read(reinterpret_cast<char*>(&mesh_primitive_header),
+                          sizeof(mesh_primitive_header));
+                has_mesh_state = static_cast<bool>(file);
+            } else {
+                file.clear();
+                file.seekg(tag_position);
+            }
         }
     }
     // Native programs fold bank 1 reads as they did when they were built.
@@ -1689,6 +1710,11 @@ std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
+        if (permissive) {
+            // A program that addresses memory through a constant is given a valid pointer there.
+            storage_pointer_types.emplace(MakeCbufKey(index, offset), u8{1});
+            return true;
+        }
         if (guess) {
             return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
         }
@@ -1701,6 +1727,10 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
+        if (permissive) {
+            storage_pointer_types.emplace(MakeIndirectCbufKey(index, offset, indirect), u8{1});
+            return true;
+        }
         if (guess) {
             return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
         }
@@ -1718,12 +1748,22 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
 }
 
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    const auto it{cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset))};
+    auto it{cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset))};
     if (it == cbuf_values.end()) {
-        if (guess) {
-            return cbuf_index == 0 ? guess->cbuf_bank0 : guess->cbuf_other;
+        if (!permissive) {
+            if (guess) {
+                return cbuf_index == 0 ? guess->cbuf_bank0 : guess->cbuf_other;
+            }
+            throw Shader::LogicError("Uncached read texture type");
         }
-        throw Shader::LogicError("Uncached read texture type");
+        // Material constants (texture handles among them) are unknown before the game binds
+        // them: zero, recorded (handle reads by location only).
+        it = cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), 0U).first;
+    }
+    // The storage pointer probes answer from their own map here, so every read but the texture
+    // handle reads (recorded by location) is direct.
+    if (handle_read_depth == 0) {
+        direct_cbuf_reads.insert(it->first);
     }
     return it->second;
 }
@@ -1731,6 +1771,10 @@ u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
 Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
     const auto it{texture_types.find(handle)};
     if (it == texture_types.end()) {
+        if (permissive) {
+            // 98.6% of the game's cached texture queries are plain 2D textures.
+            return texture_types.emplace(handle, Shader::TextureType::Color2D).first->second;
+        }
         if (guess) {
             return guess->texture_type;
         }
@@ -1742,12 +1786,100 @@ Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
 Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
     const auto it{texture_pixel_formats.find(handle)};
     if (it == texture_pixel_formats.end()) {
+        if (permissive) {
+            return texture_pixel_formats.emplace(handle, Shader::TexturePixelFormat::A8B8G8R8_UNORM)
+                .first->second;
+        }
         if (guess) {
             return guess->pixel_format;
         }
         throw Shader::LogicError("Uncached read texture pixel format");
     }
     return it->second;
+}
+
+void FileEnvironment::InitializeFromArchive(std::vector<u64> lowered_code,
+                                            const Shader::ProgramHeader& header,
+                                            Shader::Stage program_stage, u32 bound_buffer,
+                                            std::span<const u32> bank1_constants) {
+    code = std::move(lowered_code);
+    sph = header;
+    stage = program_stage;
+    start_address = 0;
+    initial_offset = sizeof(sph);
+    read_lowest = 0;
+    read_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
+    local_memory_size = static_cast<u32>(sph.LocalMemorySize()) + sph.common3.shader_local_memory_crs_size;
+    texture_bound = bound_buffer;
+    viewport_transform_state = 1;
+    is_proprietary_driver = true;
+    permissive = true;
+    for (size_t i = 0; i < bank1_constants.size(); ++i) {
+        cbuf_values.emplace(MakeCbufKey(1, static_cast<u32>(i * sizeof(u32))), bank1_constants[i]);
+    }
+}
+
+std::shared_ptr<const LoweredNativeCode> LowerNativeProgramBytes(std::span<const u8> program,
+                                                                 Shader::Stage stage) {
+    // As GenericEnvironment::LowerNativeCode does for a graphics program bound at an address: the
+    // 128-byte header, then instructions until the capture completes.
+    using Shader::Ampere::Instruction;
+    constexpr u32 header_size = 128;
+    if (program.size() < header_size + sizeof(Instruction)) {
+        return nullptr;
+    }
+    Shader::ProgramHeader sph{};
+    std::memcpy(&sph, program.data(), sizeof(sph));
+    std::vector<Instruction> native;
+    Shader::Ampere::ProgramCaptureState capture;
+    const size_t available = (program.size() - header_size) / sizeof(Instruction);
+    for (u32 index = 0; index < available &&
+                        index < Shader::Ampere::ProgramCaptureState::MaximumInstructions;
+         ++index) {
+        Instruction instruction;
+        std::memcpy(&instruction, program.data() + header_size + index * sizeof(Instruction),
+                    sizeof(instruction));
+        native.push_back(instruction);
+        const auto status = capture.Observe(instruction, index);
+        if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
+            return nullptr;
+        }
+        if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) {
+            break;
+        }
+    }
+    for (u32 i = 0; i < native.size(); ++i) {
+        if (native[i].Bits(0, 12) == 0x95c) {
+            return nullptr; // trap guards: graphics programs with them are rejected at runtime too
+        }
+    }
+    const auto lowered = Shader::Ampere::LowerToMaxwell(
+        native, {.geometry = false, .tensor = true, .native_code_address = 0,
+                 .verified_traps = {}, .tessellation_stage = Shader::Ampere::TessellationStage::None});
+    if (!lowered) {
+        return nullptr;
+    }
+    auto result = std::make_shared<LoweredNativeCode>();
+    result->native_program_key = Shader::Ampere::NativeProgramKey(native);
+    result->texture_bound = lowered.required_texture_buffer;
+    result->source_size = header_size + lowered.source_size;
+    auto& lowered_code = result->code;
+    lowered_code.resize(sizeof(sph) / sizeof(u64));
+    std::memcpy(lowered_code.data(), &sph, sizeof(sph));
+    for (const u64 instruction : lowered.instructions) {
+        if ((lowered_code.size() * sizeof(u64)) % 32 == 0) {
+            lowered_code.push_back(0);
+        }
+        lowered_code.push_back(instruction);
+    }
+    lowered_code.push_back(0);
+    Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
+    (void)stage;
+    return result;
+}
+
+u64 NativeProgramHash(std::span<const u64> lowered_code) {
+    return NativeShaderHash(lowered_code);
 }
 
 bool FileEnvironment::IsTexturePixelFormatInteger(u32 handle) {
@@ -1768,6 +1900,7 @@ u32 FileEnvironment::SharedMemorySize() const {
 }
 
 u32 FileEnvironment::TextureBoundBuffer() const {
+    texture_bound_queried = true;
     return texture_bound;
 }
 
@@ -1875,6 +2008,192 @@ void LoadPipelines(
         LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
     }
+}
+
+namespace {
+template <typename Map>
+auto ToPairs(const Map& map) {
+    std::vector<std::pair<typename Map::key_type, typename Map::mapped_type>> pairs;
+    pairs.reserve(map.size());
+    for (const auto& [key, value] : map) {
+        pairs.emplace_back(key, value);
+    }
+    return pairs;
+}
+
+// Only the reads the translation made itself: the storage pointer probes are checked by their
+// mapped answer, not by the address they read.
+template <typename Map, typename Set>
+std::vector<std::pair<u64, u32>> DirectCbufValues(const Map& values, const Set& direct) {
+    std::vector<std::pair<u64, u32>> pairs;
+    for (const auto& [key, value] : values) {
+        if (direct.contains(key)) {
+            pairs.emplace_back(key, value);
+        }
+    }
+    return pairs;
+}
+
+// Queries by handle value, except those of handles the location records cover.
+template <typename Map, typename Covered>
+auto UncoveredHandles(const Map& map, const Covered& covered) {
+    std::vector<std::pair<typename Map::key_type, typename Map::mapped_type>> pairs;
+    for (const auto& [handle, value] : map) {
+        if (!covered.contains(handle)) {
+            pairs.emplace_back(handle, value);
+        }
+    }
+    return pairs;
+}
+} // Anonymous namespace
+
+RecordedEnvQueries GenericEnvironment::RecordQueries() const {
+    RecordedEnvQueries queries;
+    queries.texture_types = UncoveredHandles(texture_types, location_handles);
+    queries.texture_pixel_formats = UncoveredHandles(texture_pixel_formats, location_handles);
+    queries.location_texture_types = ToPairs(location_texture_types);
+    queries.location_texture_formats = ToPairs(location_texture_formats);
+    queries.location_integer_formats = ToPairs(location_integer_formats);
+    queries.cbuf_values = DirectCbufValues(cbuf_values, direct_cbuf_reads);
+    queries.storage_pointer_types = ToPairs(storage_pointer_types);
+    queries.cbuf_replacements = ToPairs(cbuf_replacements);
+    // ~0U: the translation never used the bound buffer, so any value fits.
+    queries.texture_bound = texture_bound_queried ? texture_bound : ~0U;
+    queries.viewport_transform_state = viewport_transform_state;
+    queries.has_hle_engine_state = has_hle_engine_state;
+    queries.has_unbound_instructions = has_unbound_instructions;
+    return queries;
+}
+
+RecordedEnvQueries FileEnvironment::RecordQueries() const {
+    RecordedEnvQueries queries;
+    queries.texture_types = UncoveredHandles(texture_types, location_handles);
+    queries.texture_pixel_formats = UncoveredHandles(texture_pixel_formats, location_handles);
+    queries.location_texture_types = ToPairs(location_texture_types);
+    queries.location_texture_formats = ToPairs(location_texture_formats);
+    queries.location_integer_formats = ToPairs(location_integer_formats);
+    queries.cbuf_values = DirectCbufValues(cbuf_values, direct_cbuf_reads);
+    queries.storage_pointer_types = ToPairs(storage_pointer_types);
+    queries.cbuf_replacements = ToPairs(cbuf_replacements);
+    // ~0U: the translation never used the bound buffer, so any value fits.
+    queries.texture_bound = texture_bound_queried ? texture_bound : ~0U;
+    queries.viewport_transform_state = viewport_transform_state;
+    queries.has_hle_engine_state = HasHLEMacroState();
+    queries.has_unbound_instructions = false;
+    return queries;
+}
+
+const char* GenericEnvironment::ReplayQueriesWith(const RecordedEnvQueries& queries,
+                                                  const std::function<bool(u32)>& enabled,
+                                                  bool check_viewport) try {
+    // Engine replacements are recorded only when found, so a lookup that missed then and hits
+    // now could not be told apart: such programs are not reused.
+    if (queries.has_hle_engine_state || has_hle_engine_state) {
+        return "HLE engine state";
+    }
+    if (!queries.cbuf_replacements.empty()) {
+        return "constant buffer replacements";
+    }
+    if (queries.texture_bound != ~0U && queries.texture_bound != texture_bound) {
+        return "texture bound buffer";
+    }
+    for (const auto& [key, value] : queries.cbuf_values) {
+        const u32 index = static_cast<u32>(key >> 32);
+        if (!enabled(index)) {
+            return "constant buffer disabled";
+        }
+        if (ReadCbufValue(index, static_cast<u32>(key)) != value) {
+            return "constant buffer value";
+        }
+    }
+    for (const auto& [key, type] : queries.storage_pointer_types) {
+        const u32 index = static_cast<u32>(key >> 32) & 0xff;
+        const u32 offset = static_cast<u32>(key);
+        if (!enabled(index)) {
+            return "constant buffer disabled";
+        }
+        const bool mapped = (key >> 63) != 0
+                                ? IsCbufIndirectStorageBufferPointer(
+                                      index, offset, static_cast<u32>(key >> 40) & 0x3fffff)
+                                : IsCbufStorageBufferPointer(index, offset);
+        if (mapped != (type != 0)) {
+            return "storage buffer pointer";
+        }
+    }
+    for (const auto& [handle, type] : queries.texture_types) {
+        if (ReadTextureType(handle) != type) {
+            return "texture type";
+        }
+    }
+    for (const auto& [handle, format] : queries.texture_pixel_formats) {
+        if (ReadTexturePixelFormat(handle) != format) {
+            return "texture pixel format";
+        }
+    }
+    // The handle at each recorded location, read the way the texture pass reads it.
+    const auto handle_at = [&](const Shader::HandleKey& at) -> std::optional<u32> {
+        const u32 second_index = at.has_secondary ? at.sec_index : at.index;
+        const u32 second_offset = at.has_secondary ? at.sec_offset : at.offset;
+        if (!enabled(at.index) || !enabled(second_index)) {
+            return std::nullopt;
+        }
+        ++handle_read_depth;
+        const u32 handle = (ReadCbufValue(at.index, at.offset) << at.shift_left) |
+                           (ReadCbufValue(second_index, second_offset) << at.sec_shift_left);
+        --handle_read_depth;
+        return handle;
+    };
+    for (const auto& [at, type] : queries.location_texture_types) {
+        const auto handle = handle_at(at);
+        if (!handle) {
+            return "constant buffer disabled";
+        }
+        if (ReadTextureType(*handle) != type) {
+            return "texture type";
+        }
+    }
+    for (const auto& [at, format] : queries.location_texture_formats) {
+        const auto handle = handle_at(at);
+        if (!handle) {
+            return "constant buffer disabled";
+        }
+        if (ReadTexturePixelFormat(*handle) != format) {
+            return "texture pixel format";
+        }
+    }
+    for (const auto& [at, integer] : queries.location_integer_formats) {
+        const auto handle = handle_at(at);
+        if (!handle) {
+            return "constant buffer disabled";
+        }
+        if (IsTexturePixelFormatInteger(*handle) != integer) {
+            return "texture format class";
+        }
+    }
+    if (check_viewport && ReadViewportTransformState() != queries.viewport_transform_state) {
+        return "viewport transform state";
+    }
+    has_unbound_instructions = queries.has_unbound_instructions;
+    return nullptr;
+} catch (const std::exception&) {
+    return "exception";
+}
+
+const char* GraphicsEnvironment::ReplayQueries(const RecordedEnvQueries& queries) {
+    const auto& const_buffers = maxwell3d->state.shader_stages[stage_index].const_buffers;
+    return ReplayQueriesWith(
+        queries,
+        [&](u32 index) { return index < const_buffers.size() && const_buffers[index].enabled; },
+        true);
+}
+
+const char* ComputeEnvironment::ReplayQueries(const RecordedEnvQueries& queries) {
+    const auto& qmd{kepler_compute->launch_description};
+    const u32 mask = qmd.const_buffer_enable_mask.Value();
+    return ReplayQueriesWith(
+        queries,
+        [&](u32 index) { return index < qmd.const_buffer_config.size() && ((mask >> index) & 1); },
+        false);
 }
 
 } // namespace VideoCommon

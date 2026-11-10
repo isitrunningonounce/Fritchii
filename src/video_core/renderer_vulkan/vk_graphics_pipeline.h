@@ -191,6 +191,11 @@ public:
         return key.state.extended_dynamic_state != 0;
     }
 
+    /// Lichii: drawn as shader objects (known before the build ends; a failed one falls back).
+    [[nodiscard]] bool WantsShaderObjects() const noexcept {
+        return wants_shader_objects;
+    }
+
     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
@@ -303,6 +308,11 @@ public:
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }
+
+    /// Waits at most timeout for the pipeline to be built; true when it is.
+    [[nodiscard]] bool WaitBuiltFor(std::chrono::nanoseconds timeout) const {
+        return build->WaitFor(timeout);
+}
 
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
@@ -460,6 +470,52 @@ private:
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
 
+    /// Lichii (LICHII_SHADER_OBJECTS): the pipeline as shader objects, one per stage, with the
+    /// state a pipeline would bake set at bind time instead (see BindShaderObjects).
+    struct ShaderObjectState {
+        VkPolygonMode polygon_mode{};
+        VkSampleCountFlagBits samples{VK_SAMPLE_COUNT_1_BIT};
+        VkBool32 alpha_to_coverage{};
+        VkBool32 alpha_to_one{};
+        VkBool32 logic_op_enable{};
+        VkLogicOp logic_op{};
+        bool set_logic_op{};
+        VkBool32 depth_clamp{};
+        u32 num_attachments{};
+        bool set_blend{};
+        std::array<VkBool32, 8> blend_enables{};
+        std::array<VkColorBlendEquationEXT, 8> blend_equations{};
+        std::array<VkColorComponentFlags, 8> write_masks{};
+        bool set_color_write_enable{};
+        VkLineRasterizationModeEXT line_mode{};
+        VkBool32 line_stipple{};
+        VkConservativeRasterizationModeEXT conservative{};
+        VkProvokingVertexModeEXT provoking{};
+        VkBool32 ndc_negative_one_to_one{};
+        u32 num_viewports{};
+        std::array<VkViewportSwizzleNV, 16> swizzles{};
+        bool tessellation{};
+        u32 patch_control_points{};
+    };
+    struct ShaderObjects {
+        const Device* device{};
+        std::array<VkShaderEXT, NUM_STAGES> shaders{};
+        ~ShaderObjects();
+    };
+
+    /// True when this pipeline can be shader objects (its state is dynamic enough).
+    bool CanUseShaderObjects() const;
+    /// Makes the shader objects from the stages' SPIR-V; false when one fails.
+    bool MakeShaderObjects();
+    void BindShaderObjects(vk::CommandBuffer cmdbuf) const;
+
+    bool uses_shader_objects{false};
+    bool wants_shader_objects{false};
+    /// Identifies the descriptor set layout, for ShaderObjectCache.
+    u64 shader_object_layout_hash{};
+    ShaderObjectState shader_object_state;
+    // Before build: destroyed after it, once no worker can still be making them.
+    ShaderObjects shader_objects;
     // Mesh emulation (MeshEmulationSetup).
     std::optional<MeshEmulationSetup> mesh_emulation;
     vk::ShaderModule mesh_vertex_module;

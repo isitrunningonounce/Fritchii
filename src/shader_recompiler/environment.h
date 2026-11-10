@@ -174,6 +174,21 @@ public:
     ::Common::unordered_map<CbufWordKey, u32, CbufWordKeyHash> cbuf_word_cache;
     ::Common::unordered_map<HandleKey,  u32, HandleKeyHash> handle_cache;
     ::Common::unordered_map<const IR::Inst*, ConstBufferAddr> track_cache;
+
+    /// Nonzero while the texture pass reads a texture handle from a constant buffer. The handle
+    /// only selects the descriptor whose type and format the translation uses, so those reads
+    /// are recorded by location (below) instead of by value: a translation then fits every
+    /// material that binds textures of the same type and format there.
+    u32 handle_read_depth{};
+    ::Common::unordered_map<HandleKey, TextureType, HandleKeyHash> location_texture_types;
+    ::Common::unordered_map<HandleKey, TexturePixelFormat, HandleKeyHash> location_texture_formats;
+    /// Whether the format at a handle location is an integer one (all a graphics translation
+    /// asks of the format).
+    ::Common::unordered_map<HandleKey, bool, HandleKeyHash> location_integer_formats;
+    /// Whether the translation used the bound texture buffer (only then does it depend on it).
+    mutable bool texture_bound_queried{};
+    /// Handle values whose type and format queries are covered by the location records.
+    ::Common::unordered_map<u32, bool> location_handles;
 };
 
 } // namespace Shader

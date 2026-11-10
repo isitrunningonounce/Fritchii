@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <fmt/format.h>
+#ifdef _MSC_VER
+#pragma warning(disable : 4459) // parameters named like Settings::values
+#endif
 #include "common/frizti_settings.h"
 
 namespace Settings::Frizti {

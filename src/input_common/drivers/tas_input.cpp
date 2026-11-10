@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <fmt/ranges.h>
@@ -50,6 +53,24 @@ constexpr std::array<std::pair<std::string_view, TasButton>, 18> text_to_tas_but
     {"KEY_ZR", TasButton::TRIGGER_ZR},
 };
 
+namespace {
+// LICHII_TAS_AUTOSTART=<seconds>: plays script0-1.txt by itself that many seconds after the
+// first displayed frame, without the TAS setting or a hotkey (automated benchmarks). Its lines
+// count 60 Hz ticks of wall time, not displayed frames, so a route takes the same time at any
+// frame rate. The setting stays as configured (nothing is written to the config).
+double AutostartSeconds() {
+    static const double seconds = [] {
+        const char* value = std::getenv("LICHII_TAS_AUTOSTART");
+        return value != nullptr && value[0] != '\0' ? std::atof(value) : -1.0;
+    }();
+    return seconds;
+}
+
+bool TasEnabled() {
+    return Settings::values.tas_enable.GetValue() || AutostartSeconds() >= 0.0;
+}
+} // namespace
+
 Tas::Tas(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
     for (size_t player_index = 0; player_index < PLAYER_NUMBER; player_index++) {
         PadIdentifier identifier{
@@ -66,7 +87,7 @@ Tas::Tas(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
         }
     }
     ClearInput();
-    if (!Settings::values.tas_enable) {
+    if (!TasEnabled()) {
         needs_reset = true;
         return;
     }
@@ -187,7 +208,7 @@ std::tuple<TasState, size_t, std::array<size_t, PLAYER_NUMBER>> Tas::GetStatus()
 }
 
 void Tas::UpdateThread() {
-    if (!Settings::values.tas_enable) {
+    if (!TasEnabled()) {
         if (is_running) {
             Stop();
         }
@@ -204,9 +225,34 @@ void Tas::UpdateThread() {
         LOG_DEBUG(Input, "tas_reset done");
     }
 
+    const bool timed = AutostartSeconds() >= 0.0;
+    if (timed && !autostarted) {
+        const auto now = std::chrono::steady_clock::now();
+        if (first_update == std::chrono::steady_clock::time_point{}) {
+            first_update = now;
+        }
+        if (now - first_update >= std::chrono::duration<double>(AutostartSeconds())) {
+            autostarted = true;
+            LoadTasFiles();
+            current_command = 0;
+            started = now;
+            is_running = true;
+            LOG_INFO(Input, "LICHII_TAS_AUTOSTART: playing {} ticks", script_length);
+        }
+    }
     if (!is_running) {
         ClearInput();
         return;
+    }
+    if (timed) {
+        // Wall-clock ticks: skip the lines whose time already passed.
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        const size_t tick =
+            static_cast<size_t>(std::chrono::duration<double>(elapsed).count() * 60.0);
+        current_command = (std::max)(current_command, tick);
+        if (current_command >= script_length && is_running) {
+            LOG_INFO(Input, "LICHII_TAS_AUTOSTART: script finished");
+        }
     }
     if (current_command < script_length) {
         LOG_DEBUG(Input, "Playing TAS {}/{}", current_command, script_length);
@@ -315,7 +361,7 @@ void Tas::SetTasAxis(const PadIdentifier& identifier, TasAxis axis, f32 value) {
 }
 
 void Tas::StartStop() {
-    if (!Settings::values.tas_enable) {
+    if (!TasEnabled()) {
         return;
     }
     if (is_running) {
@@ -330,14 +376,14 @@ void Tas::Stop() {
 }
 
 void Tas::Reset() {
-    if (!Settings::values.tas_enable) {
+    if (!TasEnabled()) {
         return;
     }
     needs_reset = true;
 }
 
 bool Tas::Record() {
-    if (!Settings::values.tas_enable) {
+    if (!TasEnabled()) {
         return true;
     }
     is_recording = !is_recording;

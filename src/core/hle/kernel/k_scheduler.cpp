@@ -13,6 +13,7 @@
 #include "common/nx2_timeline.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/lichii_telemetry.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hle/kernel/k_interrupt_manager.h"
@@ -353,6 +354,11 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     cur_thread->AddCpuTime(m_core_id, tick_diff);
     if (cur_process != nullptr) {
         cur_process->AddCpuTime(tick_diff);
+    }
+    // Every switch, the idle thread's too: its time must not land on the next guest thread.
+    if (Core::Telemetry::Enabled()) [[unlikely]] {
+        Core::Telemetry::NoteThreadSwitch(m_core_id, cur_thread->GetThreadId(),
+                                          cur_thread->GetPriority(), next_thread->GetThreadId());
     }
     m_last_context_switch_time = cur_tick;
 

@@ -193,8 +193,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            if (BatchGcDownloads()) {
+                // Swizzled into guest memory after one wait for the whole pass (FinishGcDownloads):
+                // a wait per image drained the GPU every frame while memory stayed high.
+                gc_pending_downloads.push_back({map, copies, image.gpu_addr, image.info});
+            } else {
+                runtime.Finish();
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            }
             ++gc_download_deletes;
             // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
             image.flags &= ~ImageFlagBits::GpuModified;
@@ -286,6 +292,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         Configure(true);
         Collect();
     }
+    FinishGcDownloads();
+}
+
+template <class P>
+void TextureCache<P>::FinishGcDownloads() {
+    if (gc_pending_downloads.empty()) {
+        return;
+    }
+    runtime.Finish();
+    for (auto& pending : gc_pending_downloads) {
+        SwizzleImage(*gpu_memory, pending.gpu_addr, pending.info, pending.copies,
+                     pending.map.mapped_span, swizzle_data_buffer);
+    }
+    gc_pending_downloads.clear();
 }
 
 template <class P>

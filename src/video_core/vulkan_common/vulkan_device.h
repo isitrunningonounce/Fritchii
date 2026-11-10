@@ -50,6 +50,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ShaderDemoteToHelperInvocation, SHADER_DEMOTE_TO_HELPER_INVOCATION,               \
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
+    FEATURE(KHR, DynamicRendering, DYNAMIC_RENDERING, dynamic_rendering)                           \
     FEATURE(KHR, Maintenance4, MAINTENANCE_4, maintenance4)                                        \
     FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)
 
@@ -75,6 +76,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
+    FEATURE(EXT, ShaderObject, SHADER_OBJECT, shader_object)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
@@ -234,6 +236,10 @@ enum class NvidiaArchitecture {
     Arch_AmpereOrNewer,
 };
 
+/// The extended dynamic state level in use: the dyna_state setting, or LICHII_DYNA_STATE (0-3)
+/// when set, which overrides it without touching the saved configuration.
+Settings::ExtendedDynamicState EffectiveDynaState();
+
 /// Handles data specific to a physical device.
 class Device {
 public:
@@ -312,6 +318,17 @@ public:
     /// Returns the main present queue.
     vk::Queue GetPresentQueue() const {
         return present_queue;
+    }
+
+    /// The queue the swapchain copy and present go to: a queue of their own with DLSS Frame
+    /// Generation (it holds its presenting queue), else the present queue.
+    vk::Queue GetSwapchainQueue() const {
+        return has_swapchain_queue ? swapchain_queue : present_queue;
+    }
+
+    /// Whether the swapchain copy and present have a queue of their own.
+    bool HasSwapchainQueue() const {
+        return has_swapchain_queue;
     }
 
     /// Returns main graphics queue family index.
@@ -916,6 +933,17 @@ FN_MAX_LIMIT_LIST
         return extensions.extended_dynamic_state3;
     }
 
+    /// Lichii: dynamic rendering (core in Vulkan 1.3).
+    bool IsDynamicRenderingSupported() const {
+        return features.dynamic_rendering.dynamicRendering;
+    }
+
+    /// Lichii: VK_EXT_shader_object (with dynamic rendering, which it needs).
+    bool IsExtShaderObjectSupported() const {
+        return extensions.shader_object && features.shader_object.shaderObject &&
+               features.dynamic_rendering.dynamicRendering;
+    }
+
     /// Returns true if the device supports VK_EXT_4444_formats.
     bool IsExt4444FormatsSupported() const {
         return features.format_a4b4g4r4.formatA4B4G4R4;
@@ -1321,11 +1349,15 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue swapchain_queue;   ///< DLSS Frame Generation: swapchain copy and present.
+    bool has_swapchain_queue{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
+    /// A queue family with optical flow (VK_QUEUE_OPTICAL_FLOW_BIT_NV), for DLSS Frame Generation.
+    std::optional<u32> optical_flow_family;
     bool graphics_family_sparse_binding{};
 
     struct Extensions {
@@ -1435,6 +1467,7 @@ private:
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
+    bool streamline_optical_flow{}; ///< DLSS Frame Generation needs the optical flow feature.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.

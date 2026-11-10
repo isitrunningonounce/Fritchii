@@ -6,12 +6,14 @@
 
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/lichii_telemetry.h"
 #include "core/hle/service/filesystem/fsp/fs_i_file.h"
 
 namespace Service::FileSystem {
 
 IFile::IFile(Core::System& system_, FileSys::VirtualFile file_)
-    : ServiceFramework{system_, "IFile"}, backend{std::make_unique<FileSys::Fsa::IFile>(file_)} {
+    : ServiceFramework{system_, "IFile"}, backend{std::make_unique<FileSys::Fsa::IFile>(file_)},
+      name{file_ ? file_->GetName() : std::string{}} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IFile::Read>, "Read"},
@@ -33,6 +35,7 @@ Result IFile::Read(
     LOG_DEBUG(Service_FS, "called, option={}, offset={:#x}, length={}", option.value, offset,
               size);
 
+    Core::Telemetry::NoteGuestRead(size, name, offset);
     // Read the data from the Storage backend
     R_RETURN(
         backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));

@@ -126,6 +126,12 @@ public:
         ++num_complete;
     }
 
+    /// What was built until now (while loading) is not reported as building.
+    void ForgetBuilt() noexcept {
+        report_base = num_building.load(std::memory_order::relaxed);
+        completed = false;
+    }
+
     void MarkShaderBuilding() noexcept {
         ++num_building;
     }

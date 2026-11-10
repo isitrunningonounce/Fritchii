@@ -23,6 +23,8 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/lichii_dynamic_rendering.h"
+#include "video_core/renderer_vulkan/lichii_shader_object_cache.h"
 
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
@@ -463,6 +465,10 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
+// Lichii: shader object diagnostics (the log shows how many were made, refused and bound).
+std::atomic<u32> shader_objects_made{};
+std::atomic<u32> shader_objects_refused{};
+std::atomic<u64> shader_objects_bound{};
 std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 } // Anonymous namespace
 
@@ -570,6 +576,7 @@ GraphicsPipeline::GraphicsPipeline(
         DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
         // Mesh emulation binds one descriptor set to both the compute dispatch and the draw.
         uses_push_descriptor = !mesh_emulation && builder.CanUsePushDescriptor();
+        shader_object_layout_hash = builder.LayoutHash(uses_push_descriptor);
         uses_descriptor_buffer = !mesh_emulation && builder.CanUseDescriptorBuffer() &&
                                  descriptor_buffer_ring.IsValid();
         // After every stage's descriptors: the output buffer, then with a task program its
@@ -591,6 +598,7 @@ GraphicsPipeline::GraphicsPipeline(
             }
         }
 
+        wants_shader_objects = !mesh_emulation && UseShaderObjects(device) && CanUseShaderObjects();
         const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
         pipeline_layout = builder.CreatePipelineLayout(set_layout);
         if (!uses_descriptor_buffer) {
@@ -699,7 +707,19 @@ GraphicsPipeline::GraphicsPipeline(
                 for (vk::ShaderModule& module : spv_modules) {
                     module.reset();
                 }
-            } else {
+            } else if (!(UseShaderObjects(device) && CanUseShaderObjects() && MakeShaderObjects())) {
+                if (UseShaderObjects(device)) {
+                    const u32 refused = shader_objects_refused.fetch_add(1) + 1;
+                    if (refused <= 8 || refused % 500 == 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "LICHII_SHADER_OBJECTS: {} pipelines kept as pipelines (this "
+                                 "one: mesh {} eds {} eds2 {} vertex input {} descriptor buffer "
+                                 "{})",
+                                 refused, IsMeshPipeline(), key.state.extended_dynamic_state.Value(),
+                                 key.state.extended_dynamic_state_2.Value(),
+                                 key.state.dynamic_vertex_input.Value(), uses_descriptor_buffer);
+                    }
+                }
                 MakePipeline(render_pass);
             }
         } catch (const Shader::Exception& exception) {
@@ -732,6 +752,9 @@ GraphicsPipeline::GraphicsPipeline(
         // Nothing reads the shader modules once the pipeline exists, and the driver keeps a copy
         // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
         for (vk::ShaderModule& module : spv_modules) {
+            if (module) {
+                ForgetShaderSpirv(*module);
+            }
             module.reset();
         }
         if (worker_only_build) {
@@ -1468,7 +1491,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
-    if (IsBuilt() && (!pipeline || build->Failed())) {
+    if (IsBuilt() && ((!pipeline && !uses_shader_objects) || build->Failed())) {
         return false;
     }
     mark();
@@ -1680,7 +1703,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
     }
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.RequestRendering(texture_cache.GetFramebuffer());
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
@@ -1743,11 +1766,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.BindDescriptorBuffersEXT(binding_info);
         }
         if (bind_pipeline) {
-            scheduler.SetGraphicsPipelineMissing(!pipeline || build->Failed());
-            if (!pipeline || build->Failed()) {
+            const bool missing = (!pipeline && !uses_shader_objects) || build->Failed();
+            scheduler.SetGraphicsPipelineMissing(missing);
+            if (missing) {
                 return;
             }
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            if (uses_shader_objects) {
+                BindShaderObjects(cmdbuf);
+            } else {
+                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            }
         }
         const VkShaderStageFlags push_stages =
             mesh_emulation ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
@@ -2232,6 +2260,19 @@ void GraphicsPipeline::FillStates(PipelineStates& s) const {
                                             }),
                              dynamic_states.end());
     }
+    if (UseShaderObjects(device)) {
+        // Lichii: with shader objects the rasterizer sets viewports and scissors with their
+        // count; the pipelines drawn between them take them the same way.
+        for (VkDynamicState& state : dynamic_states) {
+            if (state == VK_DYNAMIC_STATE_VIEWPORT) {
+                state = VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT;
+            } else if (state == VK_DYNAMIC_STATE_SCISSOR) {
+                state = VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT;
+            }
+        }
+        s.viewport_ci.viewportCount = 0;
+        s.viewport_ci.scissorCount = 0;
+    }
     s.dynamic_state_ci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext = nullptr,
@@ -2354,9 +2395,28 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    // Lichii: drawn inside dynamic rendering, the pipeline names its attachment formats instead
+    // of a render pass (see lichii_dynamic_rendering.h).
+    const bool dynamic_rendering = UseDynamicRendering(device);
+    DynamicRenderingFormats rendering_formats;
+    VkPipelineRenderingCreateInfo rendering_ci{};
+    if (dynamic_rendering) {
+        rendering_formats = MakeDynamicRenderingFormats(device, MakeRenderPassKey(key.state, device));
+        rendering_ci = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+            .pNext = nullptr,
+            .viewMask = 0,
+            // Equal to the blend state's count, as the specification asks.
+            .colorAttachmentCount = static_cast<u32>(states.cb_attachments.size()),
+            .pColorAttachmentFormats = rendering_formats.colors.data(),
+            .depthAttachmentFormat = rendering_formats.depth,
+            .stencilAttachmentFormat = rendering_formats.stencil,
+        };
+    }
+
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = dynamic_rendering ? &rendering_ci : nullptr,
         .flags = flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
@@ -2374,7 +2434,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .pColorBlendState = &states.color_blend_ci,
         .pDynamicState = &states.dynamic_state_ci,
         .layout = *pipeline_layout,
-        .renderPass = render_pass,
+        .renderPass = dynamic_rendering ? VK_NULL_HANDLE : render_pass,
         .subpass = 0,
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
@@ -2747,6 +2807,240 @@ void GraphicsPipeline::Validate() {
         num_images += Shader::NumDescriptors(info.image_descriptors);
     }
     ASSERT(num_images == num_image_elements);
+}
+
+GraphicsPipeline::ShaderObjects::~ShaderObjects() {
+    // ShaderObjectCache owns the shaders (other pipelines share them).
+}
+
+bool GraphicsPipeline::CanUseShaderObjects() const {
+    // The rasterizer sets these states at every draw only with these features; without them a
+    // pipeline bakes them. Mesh pipelines and sample shading stay pipelines.
+    return !IsMeshPipeline() && key.state.extended_dynamic_state != 0 &&
+           key.state.extended_dynamic_state_2 != 0 && key.state.dynamic_vertex_input != 0 &&
+           !uses_descriptor_buffer && Settings::values.sample_shading.GetValue() == 0;
+}
+
+bool GraphicsPipeline::MakeShaderObjects() {
+    static constexpr std::array<VkShaderStageFlagBits, NUM_STAGES> StageBits{
+        VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+        VK_SHADER_STAGE_FRAGMENT_BIT};
+    std::array<std::vector<u32>, NUM_STAGES> code;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!spv_modules[stage]) {
+            continue;
+        }
+        code[stage] = TakeShaderSpirv(*spv_modules[stage]);
+        if (code[stage].empty()) {
+            return false;
+        }
+    }
+    if (code[0].empty()) {
+        return false;
+    }
+    using Shader::Backend::SPIRV::RenderAreaLayout;
+    using Shader::Backend::SPIRV::RescalingLayout;
+    // As the pipeline layout has them (DescriptorLayoutBuilder::CreatePipelineLayout).
+    const VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+        .offset = 0,
+        .size = static_cast<u32>(sizeof(RescalingLayout) + sizeof(RenderAreaLayout)),
+    };
+    const VkDescriptorSetLayout set_layout =
+        descriptor_set_layout ? *descriptor_set_layout : VK_NULL_HANDLE;
+    std::array<VkShaderEXT, NUM_STAGES> made{};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (code[stage].empty()) {
+            continue;
+        }
+        VkShaderStageFlags next_stage = 0;
+        for (size_t next = stage + 1; next < NUM_STAGES; ++next) {
+            if (!code[next].empty()) {
+                next_stage = StageBits[next];
+                break;
+            }
+        }
+        const VkShaderCreateInfoEXT ci{
+            .sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage = StageBits[stage],
+            .nextStage = next_stage,
+            .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+            .codeSize = code[stage].size() * sizeof(u32),
+            .pCode = code[stage].data(),
+            .pName = "main",
+            .setLayoutCount = set_layout != VK_NULL_HANDLE ? 1U : 0U,
+            .pSetLayouts = set_layout != VK_NULL_HANDLE ? &set_layout : nullptr,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+            .pSpecializationInfo = nullptr,
+        };
+        // Shared with every pipeline using the same stage, and stored on the SSD.
+        made[stage] = ShaderObjectCache::Instance().Get(device, ci, shader_object_layout_hash);
+        if (made[stage] == VK_NULL_HANDLE) {
+            LOG_WARNING(Render_Vulkan,
+                        "LICHII_SHADER_OBJECTS: pipeline {:016x} stage {} failed, using a pipeline",
+                        key.Hash(), stage);
+            return false;
+        }
+    }
+    shader_objects.device = &device;
+    shader_objects.shaders = made;
+
+    // The state MakePipeline would bake, as BindShaderObjects sets it.
+    auto& state = shader_object_state;
+    const auto& dynamic = key.state.dynamic_state;
+    state.polygon_mode =
+        MaxwellToVK::PolygonMode(FixedPipelineState::UnpackPolygonMode(key.state.polygon_mode));
+    state.samples = MaxwellToVK::MsaaMode(key.state.msaa_mode);
+    state.alpha_to_coverage =
+        fragment_has_color0_output && key.state.alpha_to_coverage_enabled != 0 ? VK_TRUE : VK_FALSE;
+    state.alpha_to_one = fragment_has_color0_output && device.SupportsAlphaToOne() &&
+                                 key.state.alpha_to_one_enabled != 0
+                             ? VK_TRUE
+                             : VK_FALSE;
+    state.logic_op_enable = dynamic.logic_op_enable != 0 ? VK_TRUE : VK_FALSE;
+    state.logic_op = static_cast<VkLogicOp>(dynamic.logic_op.Value());
+    state.set_logic_op = key.state.extended_dynamic_state_2_logic_op == 0;
+    state.depth_clamp = dynamic.depth_clamp_disabled == 0 ? VK_TRUE : VK_FALSE;
+    state.num_attachments = static_cast<u32>(NumAttachments(key.state));
+    state.set_blend = key.state.extended_dynamic_state_3_blend == 0;
+    for (u32 index = 0; index < state.num_attachments; ++index) {
+        const auto& blend = key.state.attachments[index];
+        const std::array mask{blend.Mask()};
+        static constexpr std::array mask_table{VK_COLOR_COMPONENT_R_BIT, VK_COLOR_COMPONENT_G_BIT,
+                                               VK_COLOR_COMPONENT_B_BIT, VK_COLOR_COMPONENT_A_BIT};
+        VkColorComponentFlags write_mask{};
+        for (size_t i = 0; i < mask_table.size(); ++i) {
+            write_mask |= mask[i] ? mask_table[i] : 0;
+        }
+        state.blend_enables[index] = blend.enable != 0 ? VK_TRUE : VK_FALSE;
+        state.blend_equations[index] = VkColorBlendEquationEXT{
+            .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+            .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
+            .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),
+            .srcAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.SourceAlphaFactor()),
+            .dstAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.DestAlphaFactor()),
+            .alphaBlendOp = MaxwellToVK::BlendEquation(blend.EquationAlpha()),
+        };
+        state.write_masks[index] = write_mask;
+    }
+    state.set_color_write_enable =
+        device.IsExtColorWriteEnableSupported() &&
+        !(key.state.color_write_enable_dynamic != 0 && key.state.extended_dynamic_state_3_blend == 0);
+    const bool smooth_lines =
+        device.IsExtLineRasterizationSupported() && device.SupportsSmoothLines();
+    const bool stippled_lines =
+        device.IsExtLineRasterizationSupported() && device.SupportsStippledRectangularLines();
+    state.line_mode = key.state.smooth_lines != 0 && smooth_lines
+                          ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT
+                          : VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT;
+    state.line_stipple = dynamic.line_stipple_enable != 0 && stippled_lines ? VK_TRUE : VK_FALSE;
+    state.conservative = key.state.conservative_raster_enable != 0
+                             ? VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT
+                             : VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
+    const bool last = key.state.provoking_vertex_last != 0;
+    state.provoking = last ? (device.SupportsProvokingVertexLastMode()
+                                  ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
+                                  : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT)
+                           : (device.SupportsProvokingVertexFirstMode()
+                                  ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
+                                  : VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT);
+    state.ndc_negative_one_to_one = key.state.ndc_minus_one_to_one != 0 ? VK_TRUE : VK_FALSE;
+    state.num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+    std::ranges::transform(key.state.viewport_swizzles, state.swizzles.begin(),
+                           UnpackViewportSwizzle);
+    state.tessellation = !code[1].empty() || !code[2].empty();
+    state.patch_control_points = std::min(key.state.patch_control_points_minus_one.Value() + 1,
+                                          device.GetMaxTessellationPatchSize());
+    uses_shader_objects = true;
+    const u32 made_count = shader_objects_made.fetch_add(1) + 1;
+    if (made_count <= 4 || made_count % 500 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "LICHII_SHADER_OBJECTS: {} pipelines made as shader objects (this one: polygon {} "
+                 "samples {} attachments {} blend {} logic op {} depth clamp {} write mask {:#x})",
+                 made_count, static_cast<u32>(state.polygon_mode), static_cast<u32>(state.samples),
+                 state.num_attachments, state.set_blend, state.logic_op_enable, state.depth_clamp,
+                 state.num_attachments != 0 ? state.write_masks[0] : 0U);
+    }
+    return true;
+}
+
+void GraphicsPipeline::BindShaderObjects(vk::CommandBuffer cmdbuf) const {
+    const vk::DeviceDispatch& dld = cmdbuf.Dispatch();
+    const VkCommandBuffer handle = *cmdbuf;
+    // Every graphics stage gets a shader or none: a stage left unbound fails the draw.
+    static constexpr std::array<VkShaderStageFlagBits, 7> Stages{
+        VK_SHADER_STAGE_VERTEX_BIT,       VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+        VK_SHADER_STAGE_FRAGMENT_BIT,     VK_SHADER_STAGE_TASK_BIT_EXT,
+        VK_SHADER_STAGE_MESH_BIT_EXT};
+    std::array<VkShaderEXT, 7> shaders{};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        shaders[stage] = shader_objects.shaders[stage];
+    }
+    const u32 stage_count = device.IsExtMeshShaderSupported() ? 7U : 5U;
+    cmdbuf.BindShadersEXT(stage_count, Stages.data(), shaders.data());
+    const u64 bound = shader_objects_bound.fetch_add(1) + 1;
+    if (bound == 1 || bound % 20000 == 0) {
+        LOG_INFO(Render_Vulkan, "LICHII_SHADER_OBJECTS: {} binds", bound);
+    }
+
+    const ShaderObjectState& state = shader_object_state;
+    dld.vkCmdSetPolygonModeEXT(handle, state.polygon_mode);
+    dld.vkCmdSetRasterizationSamplesEXT(handle, state.samples);
+    const VkSampleMask sample_mask = 0xFFFFFFFFU;
+    dld.vkCmdSetSampleMaskEXT(handle, state.samples, &sample_mask);
+    dld.vkCmdSetAlphaToCoverageEnableEXT(handle, state.alpha_to_coverage);
+    if (device.SupportsAlphaToOne()) {
+        dld.vkCmdSetAlphaToOneEnableEXT(handle, state.alpha_to_one);
+    }
+    dld.vkCmdSetLogicOpEnableEXT(handle, state.logic_op_enable);
+    if (state.set_logic_op) {
+        dld.vkCmdSetLogicOpEXT(handle, state.logic_op);
+    }
+    dld.vkCmdSetDepthClampEnableEXT(handle, state.depth_clamp);
+    if (state.num_attachments != 0) {
+        if (state.set_blend) {
+            dld.vkCmdSetColorBlendEnableEXT(handle, 0, state.num_attachments,
+                                            state.blend_enables.data());
+            dld.vkCmdSetColorBlendEquationEXT(handle, 0, state.num_attachments,
+                                              state.blend_equations.data());
+            dld.vkCmdSetColorWriteMaskEXT(handle, 0, state.num_attachments,
+                                          state.write_masks.data());
+        }
+        if (state.set_color_write_enable) {
+            static constexpr std::array<VkBool32, 8> AllEnabled{VK_TRUE, VK_TRUE, VK_TRUE, VK_TRUE,
+                                                                VK_TRUE, VK_TRUE, VK_TRUE, VK_TRUE};
+            dld.vkCmdSetColorWriteEnableEXT(handle, state.num_attachments, AllEnabled.data());
+        }
+    }
+    if (device.IsExtLineRasterizationSupported()) {
+        dld.vkCmdSetLineRasterizationModeEXT(handle, state.line_mode);
+        dld.vkCmdSetLineStippleEnableEXT(handle, state.line_stipple);
+    }
+    if (device.IsExtConservativeRasterizationSupported()) {
+        dld.vkCmdSetConservativeRasterizationModeEXT(handle, state.conservative);
+        dld.vkCmdSetExtraPrimitiveOverestimationSizeEXT(handle, 0.0f);
+    }
+    if (device.IsExtProvokingVertexSupported()) {
+        dld.vkCmdSetProvokingVertexModeEXT(handle, state.provoking);
+    }
+    if (device.IsExtDepthClipControlSupported()) {
+        dld.vkCmdSetDepthClipNegativeOneToOneEXT(handle, state.ndc_negative_one_to_one);
+    }
+    if (device.IsNvViewportSwizzleSupported()) {
+        dld.vkCmdSetViewportSwizzleNV(handle, 0, state.num_viewports, state.swizzles.data());
+    }
+    if (device.IsExtTransformFeedbackSupported()) {
+        dld.vkCmdSetRasterizationStreamEXT(handle, 0);
+    }
+    if (state.tessellation) {
+        dld.vkCmdSetTessellationDomainOriginEXT(handle, VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT);
+        dld.vkCmdSetPatchControlPointsEXT(handle, state.patch_control_points);
+    }
 }
 
 } // namespace Vulkan

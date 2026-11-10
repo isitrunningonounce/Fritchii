@@ -8,6 +8,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <iosfwd>
 #include <limits>
 #include <memory>
@@ -16,6 +17,7 @@
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
+#include "common/container/unordered_set.h"
 #include <vector>
 
 #include "common/common_types.h"
@@ -44,6 +46,25 @@ struct LoweredNativeCode {
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
+};
+
+/// The answers an environment gave while its program was translated: everything the translation
+/// depends on besides the code. Asking them again on a new environment of the same program tells
+/// whether that translation would come out the same.
+struct RecordedEnvQueries {
+    std::vector<std::pair<u32, Shader::TextureType>> texture_types;
+    std::vector<std::pair<u32, Shader::TexturePixelFormat>> texture_pixel_formats;
+    std::vector<std::pair<u64, u32>> cbuf_values;
+    std::vector<std::pair<u64, u8>> storage_pointer_types;
+    std::vector<std::pair<u64, Shader::ReplaceConstant>> cbuf_replacements;
+    /// Texture type and format by handle location (Shader::Environment::handle_read_depth).
+    std::vector<std::pair<Shader::HandleKey, Shader::TextureType>> location_texture_types;
+    std::vector<std::pair<Shader::HandleKey, Shader::TexturePixelFormat>> location_texture_formats;
+    std::vector<std::pair<Shader::HandleKey, bool>> location_integer_formats;
+    u32 texture_bound{};
+    u32 viewport_transform_state{};
+    bool has_hle_engine_state{};
+    bool has_unbound_instructions{};
 };
 
 class GenericEnvironment : public Shader::Environment {
@@ -101,6 +122,8 @@ public:
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
+    [[nodiscard]] RecordedEnvQueries RecordQueries() const;
+
     [[nodiscard]] u64 CalculateHash() const;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
@@ -137,6 +160,10 @@ protected:
                               u32 source_header_size = 128, bool geometry_stage = false);
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                           bool geometry_stage);
+    /// ReplayQueries for any engine: enabled(index) tells whether constant buffer index is bound.
+    [[nodiscard]] const char* ReplayQueriesWith(const RecordedEnvQueries& queries,
+                                                const std::function<bool(u32)>& enabled,
+                                                bool check_viewport);
     size_t native_source_size{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
@@ -154,6 +181,8 @@ protected:
     ::Common::unordered_map<u64, u32> cbuf_values;
     ::Common::unordered_map<u64, u8> storage_pointer_types; ///< IsCbufStorageBufferPointer answers
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
+    /// Constant buffer reads made by the translation itself, not by the storage pointer probes.
+    ::Common::unordered_set<u64> direct_cbuf_reads;
 
     u32 local_memory_size{};
     u32 texture_bound{};
@@ -168,6 +197,8 @@ protected:
     u32 initial_offset = 0;
 
     u32 viewport_transform_state = 1;
+    /// Nonzero while the storage pointer probes read constant buffers.
+    u32 pointer_probe_depth = 0;
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
@@ -200,6 +231,9 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
+    /// Asks this environment the recorded queries again; true when every answer matches, so a
+    /// translation of the same program made with those answers is valid here.
+    [[nodiscard]] const char* ReplayQueries(const RecordedEnvQueries& queries);
     /// EDEN_NX2_ASYNC_TRANSLATE: copies what the translation reads from the engine and from
     /// constant buffers (the stage's constant buffer table and the bytes of each enabled buffer,
     /// the texture pool registers, the viewport transform state, the HLE replace entries), so the
@@ -285,6 +319,9 @@ public:
         return std::nullopt;
     }
 
+    /// As GraphicsEnvironment::ReplayQueries, against the bound launch description.
+    [[nodiscard]] const char* ReplayQueries(const RecordedEnvQueries& queries);
+
 private:
     std::optional<u32> ReadTrapGuardConstant(u32 bank, u32 offset) override;
     Tegra::Engines::KeplerCompute* kepler_compute{};
@@ -330,6 +367,35 @@ public:
     /// make Deserialize allocate gigabytes.
     [[nodiscard]] static bool RecordFits(std::istream& file, u64 bytes_left);
 
+    /// LICHII_PRECOMPILE_DIR: an environment for a native program read from the game's shader
+    /// archive instead of the disk cache. Its compiler constants (bank 1) come with the program;
+    /// what only the running game knows is answered with the likeliest value (permissive) and
+    /// recorded, so a reuse of the translation checks it against the game's actual state.
+    void InitializeFromArchive(std::vector<u64> lowered_code, const Shader::ProgramHeader& header,
+                               Shader::Stage program_stage, u32 bound_buffer,
+                               std::span<const u32> bank1_constants);
+    /// The mesh registers and pass-through header a mesh program translates with.
+    void SetMeshState(const std::array<u32, 3>& registers, const Shader::ProgramHeader& header) {
+        mesh_registers = registers;
+        mesh_primitive_header = header;
+        has_mesh_state = true;
+    }
+
+    /// Compute programs read from an archive: the launch values the game's dispatches use.
+    void SetComputeState(const std::array<u32, 3>& workgroup, u32 shared_memory,
+                         u32 local_memory) {
+        workgroup_size = workgroup;
+        shared_memory_size = shared_memory;
+        local_memory_size = local_memory;
+        // As ComputeEnvironment: the code follows the (zeroed) header.
+        start_address = sizeof(sph);
+    }
+
+    /// Task and mesh programs: whether the cache entry carried the mesh state they translate with.
+    [[nodiscard]] bool HasMeshState() const noexcept {
+        return has_mesh_state;
+    }
+
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
@@ -371,6 +437,8 @@ public:
     }
     bool HasNativeInstructions() const override;
 
+    [[nodiscard]] RecordedEnvQueries RecordQueries() const;
+
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
     /// Whether translating this recorded environment gives what translating `live`, the same
@@ -401,6 +469,8 @@ private:
     ::Common::unordered_map<u64, u32> cbuf_values;
     ::Common::unordered_map<u64, u8> storage_pointer_types;
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
+    /// Constant buffer reads made by the translation itself, not by the storage pointer probes.
+    ::Common::unordered_set<u64> direct_cbuf_reads;
     std::array<u32, 3> workgroup_size{};
     u32 local_memory_size{};
     u32 shared_memory_size{};
@@ -408,9 +478,18 @@ private:
     u32 read_lowest{};
     u32 read_highest{};
     u32 initial_offset{};
+    bool has_mesh_state{};
+    bool permissive{}; ///< InitializeFromArchive: default answers for unknown queries
     u32 viewport_transform_state = 1;
     const GuessMissing* guess{};
 };
+
+/// The lowering GenericEnvironment::LowerNativeCode does, for a native graphics program held in
+/// memory (128-byte header + code, as the game uploads it): nullptr when it cannot be lowered.
+std::shared_ptr<const LoweredNativeCode> LowerNativeProgramBytes(std::span<const u8> program,
+                                                                 Shader::Stage stage);
+/// The shader cache key of a native program: the hash of its lowered code.
+u64 NativeProgramHash(std::span<const u64> lowered_code);
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version);

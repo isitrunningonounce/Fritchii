@@ -1009,6 +1009,35 @@ private:
         device_memory.ArmReadTraps(begin, end - begin);
     }
 
+    /// LICHII_HOT_READ_PREFLUSH=<n>: native titles flush GPU-written pages on demand when the guest
+    /// CPU reads them; a page read that way n times is marked Preflushable instead, so it is
+    /// downloaded at every fence and its later reads do not wait for the GPU (0: off).
+    static u32 HotReadPreflushThreshold() {
+        static const u32 threshold = [] {
+            const char* value = std::getenv("LICHII_HOT_READ_PREFLUSH");
+            const int parsed = value != nullptr ? std::atoi(value) : 0;
+            return static_cast<u32>(parsed > 0 ? parsed : 0);
+        }();
+        return threshold;
+    }
+    /// LICHII_HOT_READ_COPY=<n>: a page the guest CPU read n times through an on-demand flush is
+    /// handled like a GPU-written command list page: compute and copy work that writes it records
+    /// a copy right after itself, and a later read waits only for that copy (still the latest GPU
+    /// data) instead of finishing every queued GPU command (0: off).
+    static u32 HotReadCopyThreshold() {
+        static const u32 threshold = [] {
+            const char* value = std::getenv("LICHII_HOT_READ_COPY");
+            const int parsed = value != nullptr ? std::atoi(value) : 0;
+            return static_cast<u32>(parsed > 0 ? parsed : 0);
+        }();
+        return threshold;
+    }
+    /// Serves a CPU read flush of one page from its copy (HotReadCopyThreshold). True when guest
+    /// memory now holds the latest GPU data of the range.
+    bool DownloadFromWriteCopy(DAddr device_addr, u64 size);
+    /// Reads that had to flush, per page, for HotReadPreflushThreshold.
+    std::unordered_map<DAddr, u32> flushed_cpu_reads;
+
     ReadTrapTracker read_trapped_ranges;
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.

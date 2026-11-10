@@ -12,7 +12,10 @@
 
 #include <sl.h>
 #include <sl_dlss.h>
+#include <sl_dlss_g.h>
 #include <sl_helpers_vk.h>
+#include <sl_pcl.h>
+#include <sl_reflex.h>
 
 namespace Vulkan::Streamline {
 
@@ -28,9 +31,23 @@ struct Api {
     PFun_slEvaluateFeature* evaluate_feature{};
     PFun_slFreeResources* free_resources{};
     PFun_slSetVulkanInfo* set_vulkan_info{};
+    PFun_slSetTagForFrame* set_tag_for_frame{};
+    // DLSS Frame Generation (LICHII_DLSS_FG), from slGetFeatureFunction once attached.
+    PFun_slDLSSGSetOptions* dlssg_set_options{};
+    PFun_slDLSSGGetState* dlssg_get_state{};
+    PFun_slReflexSetOptions* reflex_set_options{};
+    PFun_slReflexSleep* reflex_sleep{};
+    PFun_slPCLSetMarker* pcl_set_marker{};
 };
 
 /// The loaded functions; only valid while IsDlssAvailable().
 [[nodiscard]] const Api& GetApi();
+
+/// DLSS Frame Generation, on the Vulkan worker inside a DLSS evaluation's command buffer (after
+/// slSetConstants on the same token): tags the frame's depth and motion and hands the token to
+/// the next present. eOnlyValidNow has Streamline copy them on cmdbuf; eValidUntilPresent is for
+/// the renderer's own copies.
+void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const sl::Resource& motion,
+                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle);
 
 } // namespace Vulkan::Streamline

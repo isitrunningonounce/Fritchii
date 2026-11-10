@@ -12,6 +12,7 @@
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/lichii_telemetry.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc/svc_nx2_oot_poll.h"
@@ -2520,6 +2521,13 @@ void Call(Core::System& system, u32 imm) {
         if (colon == nullptr) return std::pair<u64, u64>{0, ~u64{}};
         return std::pair<u64, u64>{std::strtoull(text, nullptr, 10), std::strtoull(colon + 1, nullptr, 10)};
     }();
+    Core::Telemetry::NoteSvc(GetCurrentThread(kernel).GetThreadId(), imm);
+    // LICHII_TRACE_READ (lichii_telemetry.h): call stacks of the IPC calls after a traced read.
+    if ((imm == 0x21 || imm == 0x22) && Core::Telemetry::TakeIpcBacktrace()) {
+        LOG_INFO(Kernel_SVC, "LICHII_TRACE_READ: svc {:#x} by t{}:", imm,
+                 GetCurrentThread(kernel).GetThreadId());
+        kernel.CurrentPhysicalCore().LogBacktrace(kernel);
+    }
     const u64 presents = Core::g_nx2_present_count.load(std::memory_order_relaxed);
     const bool svc_trace = presents >= trace_range.first && presents <= trace_range.second;
     if (svc_trace) {

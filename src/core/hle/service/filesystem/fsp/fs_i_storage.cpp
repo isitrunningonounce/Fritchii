@@ -10,6 +10,7 @@
 
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/lichii_telemetry.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
 
 namespace Service::FileSystem {
@@ -43,6 +44,18 @@ Result IStorage::Read(
                      std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
                                               1'000'000'000 / ReadBytesPerSecond};
 
+    const s64 read_before = Core::Telemetry::NoteGuestRead(
+        length, backend ? backend->GetName() : std::string{"storage"}, offset, backend);
+    // LICHII_SLOW_REREAD_MS=<ms> (test): holds a range read more than 10 times already for that
+    // long, so a game that keeps loading the same data spends less CPU on it.
+    static const int slow_reread_ms = [] {
+        const char* value = std::getenv("LICHII_SLOW_REREAD_MS");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    if (slow_reread_ms > 0 && read_before > 10) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{slow_reread_ms});
+    }
+    Core::Telemetry::NoteTracedRead(offset);
     // Read the data from the Storage backend
     backend->Read(out_bytes.data(), length, offset);
 

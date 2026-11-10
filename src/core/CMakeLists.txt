@@ -1189,6 +1189,8 @@ add_library(core STATIC
     memory/dmnt_cheat_types.h
     memory/dmnt_cheat_vm.cpp
     memory/dmnt_cheat_vm.h
+    lichii_telemetry.cpp
+    lichii_telemetry.h
     perf_stats.cpp
     perf_stats.h
     reporter.cpp
@@ -1321,3 +1323,19 @@ elseif (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEA
 endif()
 
 create_target_directory_groups(core)
+
+# Lichii mod (MSVC LTO): core.lib with every object in LTCG form passes the 4 GB static library
+# limit (LNK1248). The HLE services, off the emulation's hot path, are compiled without /GL
+# (still /O2; only cross-module inlining is lost there).
+if (MSVC AND ENABLE_LTO)
+    get_target_property(LICHII_CORE_SOURCES core SOURCES)
+    set(LICHII_CORE_NO_LTO)
+    foreach(lichii_source IN LISTS LICHII_CORE_SOURCES)
+        if (lichii_source MATCHES "^hle/service/" AND lichii_source MATCHES "\.cpp$")
+            list(APPEND LICHII_CORE_NO_LTO ${lichii_source})
+        endif()
+    endforeach()
+    set_source_files_properties(${LICHII_CORE_NO_LTO} PROPERTIES COMPILE_OPTIONS "/GL-")
+    list(LENGTH LICHII_CORE_NO_LTO lichii_no_lto_count)
+    message(STATUS "Lichii: ${lichii_no_lto_count} core HLE service sources without /GL")
+endif()

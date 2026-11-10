@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <utility>
 #include <thread>
 
 #include "common/logging.h"
@@ -21,6 +22,9 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -168,7 +172,13 @@ PresentManager::PresentManager(const vk::Instance& instance_,
         free_queue.push_back(&frame);
     }
 
-    present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
+#ifdef EGLANTINE_STREAMLINE
+    const bool frame_gen_drops_ids = Streamline::FrameGenDropsPresentIds();
+#else
+    constexpr bool frame_gen_drops_ids = false;
+#endif
+    present_wait_enabled =
+        use_present_thread && device.IsKhrPresentWaitSupported() && !frame_gen_drops_ids;
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
              present_wait_enabled ? "supported" : "unavailable, frames are not paced");
     if (present_wait_enabled) {
@@ -196,6 +206,18 @@ Frame* PresentManager::GetRenderFrame() {
 
     // The renderer waits for the present thread (tools/nx2/critical_path.py's table).
     Common::Nx2Timeline::Span timeline_span{"present: wait for free frame"};
+#ifdef EGLANTINE_STREAMLINE
+    const auto wait_begin = std::chrono::steady_clock::now();
+    struct NoteWait {
+        std::chrono::steady_clock::time_point begin;
+        ~NoteWait() {
+            Streamline::NoteFrameGenFreeWait(static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin)
+                    .count()));
+        }
+    } note_wait{wait_begin};
+#endif
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -215,6 +237,10 @@ void PresentManager::Present(Frame* frame) {
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
             frame->queued_at = std::chrono::steady_clock::now();
+#ifdef EGLANTINE_STREAMLINE
+            // Right after this frame's commands on the worker: its DLSS evaluation's token.
+            frame->frame_gen_token = Streamline::TakeFrameGenToken();
+#endif
             // What ends the present thread's "present: wait for frame" (on the Vulkan worker).
             if (Common::Nx2Timeline::Active()) {
                 Common::Nx2Timeline::Instant("present: frame queued", {"frame", frame->index});
@@ -225,6 +251,9 @@ void PresentManager::Present(Frame* frame) {
         });
     } else {
         scheduler.WaitWorker();
+#ifdef EGLANTINE_STREAMLINE
+        frame->frame_gen_token = Streamline::TakeFrameGenToken();
+#endif
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
@@ -669,9 +698,29 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         return;
     }
 
+#ifdef EGLANTINE_STREAMLINE
+    const auto acquire_begin = std::chrono::steady_clock::now();
+    // DLSS Frame Generation's pacer takes one present at a time and waits on the GPU for it:
+    // presented before the GPU had rendered it, each present waited a whole GPU frame plus
+    // frame generation plus half a frame of pacing (~42 ms, half the real frame rate). Hand it
+    // rendered frames instead (LICHII_DLSS_FG_PRESENT_WAIT=0 turns this off).
+    static const bool wait_render = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_PRESENT_WAIT");
+        return !value || value[0] != '0';
+    }();
+    if (wait_render && frame->frame_gen_token && frame->render_tick != 0) {
+        scheduler.GetMasterSemaphore().Wait(frame->render_tick);
+    }
+#endif
     while (swapchain.AcquireNextImage(!use_present_thread)) {
         RecreateSwapchain(frame);
     }
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::NoteFrameGenAcquire(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             acquire_begin)
+            .count()));
+#endif
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
     cmdbuf.Begin({
@@ -802,9 +851,13 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
-        std::scoped_lock submit_lock{scheduler.submit_mutex};
+        std::unique_lock submit_lock{scheduler.submit_mutex, std::defer_lock};
+        if (!device.HasSwapchainQueue()) {
+            submit_lock.lock();
+        }
         switch (const VkResult result =
-                    device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
+                    (device.HasSwapchainQueue() ? device.GetSwapchainQueue() : device.GetGraphicsQueue())
+                        .Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
             break;
         case VK_ERROR_DEVICE_LOST:
@@ -817,7 +870,15 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+#ifdef EGLANTINE_STREAMLINE
+    void* const frame_gen_token = std::exchange(frame->frame_gen_token, nullptr);
+    Streamline::FrameGenBeforePresent(frame_gen_token, frame->game_left, frame->game_top,
+                                      frame->game_right, frame->game_bottom);
+#endif
     last_present_id = swapchain.Present(render_semaphore);
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenAfterPresent(frame_gen_token);
+#endif
 }
 
 } // namespace Vulkan

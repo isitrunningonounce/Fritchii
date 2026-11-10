@@ -580,6 +580,13 @@ void BufferCacheRuntime::WaitSubmittedTickImpl(u64 tick) {
     if (master.IsFree(tick)) {
         return;
     }
+    if (VideoCommon::GpuSplit::OnBackThread()) {
+        // The back owns the scheduler: submit a deferred flush itself (LICHII_HOT_READ_COPY reads
+        // copies from here) instead of waiting for a submission only it can make.
+        scheduler.FlushDeferred();
+        scheduler.Wait(tick);
+        return;
+    }
     // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
@@ -676,6 +683,10 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         return;
     }
 
+    if (barrier && Scheduler::BatchCopies()) {
+        scheduler.RecordBatchedCopy(src_buffer, dst_buffer, vk_copies);
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {

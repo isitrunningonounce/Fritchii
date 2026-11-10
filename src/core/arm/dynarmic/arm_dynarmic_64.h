@@ -115,8 +115,13 @@ private:
     friend class DynarmicCallbacks64;
 
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
+    /// Lichii: compiles the blocks an earlier run stored (LICHII_JIT_PRECOMPILE=1), and every
+    /// 10 s logs what the JITs compiled and stores the new blocks (lichii_jit_blocks.bin).
+    void PrecompileStoredBlocks();
+    void ReportCompiledBlocks();
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
+    bool m_blocks_precompiled{};
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
 
