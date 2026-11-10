@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -56,7 +61,7 @@ std::vector<std::vector<u32>> Instructions(const std::vector<u32>& code, u32 opc
 
 // A compute program whose atomic address comes from global memory, so the storage buffer pass
 // tracks the load but not the atomic.
-std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode) {
+std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode, bool descriptor_aliasing) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::IREmitter ir{block};
@@ -82,6 +87,7 @@ std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode) {
                            {{}, IR::AbstractSyntaxNode::Type::Return}};
     HostTranslateInfo host{};
     host.min_ssbo_alignment = 16;
+    host.ApplyDescriptorLimitPolicy();
     StubEnvironment env;
     Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
     REQUIRE(std::ranges::any_of(block.Instructions(), [&](const IR::Inst& inst) {
@@ -94,7 +100,7 @@ std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode) {
     Profile profile{};
     profile.supported_spirv = 0x00010300;
     profile.support_int64 = true;
-    profile.support_descriptor_aliasing = true;
+    profile.support_descriptor_aliasing = descriptor_aliasing;
     profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = 16;
     return Backend::SPIRV::EmitSPIRV(profile, program);
@@ -123,9 +129,24 @@ TEST_CASE("Untracked 32-bit global atomics route to their storage buffer",
     }};
     for (const auto& [opcode, atomic] : cases) {
         CAPTURE(static_cast<u32>(opcode));
-        std::vector<u32> code;
-        REQUIRE_NOTHROW(code = EmitUntrackedAtomic(opcode));
-        CHECK_FALSE(Instructions(code, atomic).empty());
-        CHECK_FALSE(Instructions(code, OpFunctionCall).empty());
+        for (const bool descriptor_aliasing : {false, true}) {
+            CAPTURE(descriptor_aliasing);
+            std::vector<u32> code;
+            REQUIRE_NOTHROW(code = EmitUntrackedAtomic(opcode, descriptor_aliasing));
+            if (const char* directory = std::getenv("EDEN_UPSTREAM_SHADER_TEST_OUTPUT");
+                directory != nullptr && directory[0] != '\0') {
+                std::filesystem::create_directories(directory);
+                const auto filename = "global-atomic-" + std::to_string(static_cast<u32>(opcode)) +
+                                      (descriptor_aliasing ? "-alias.spv" : "-no-alias.spv");
+                std::ofstream file{std::filesystem::path{directory} / filename, std::ios::binary};
+                REQUIRE(file.is_open());
+                file.write(reinterpret_cast<const char*>(code.data()),
+                           static_cast<std::streamsize>(code.size() * sizeof(u32)));
+                file.close();
+                REQUIRE(file.good());
+            }
+            CHECK_FALSE(Instructions(code, atomic).empty());
+            CHECK_FALSE(Instructions(code, OpFunctionCall).empty());
+        }
     }
 }

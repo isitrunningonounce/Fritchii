@@ -715,6 +715,17 @@ TEST_CASE("Per-tap gathers with runtime offsets gather each tap at its own offse
     profile.supported_spirv = 0x00010400;
     const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
     REQUIRE(spirv.size() > 5);
+    if (const char* directory = std::getenv("EDEN_UPSTREAM_SHADER_TEST_OUTPUT");
+        directory != nullptr && directory[0] != '\0') {
+        std::filesystem::create_directories(directory);
+        std::ofstream file{std::filesystem::path{directory} / "dynamic-ptp-gather.spv",
+                           std::ios::binary};
+        REQUIRE(file.is_open());
+        file.write(reinterpret_cast<const char*>(spirv.data()),
+                   static_cast<std::streamsize>(spirv.size() * sizeof(u32)));
+        file.close();
+        REQUIRE(file.good());
+    }
     constexpr u32 OpImageGather = 96;
     constexpr u32 OffsetMask = 0x10, ConstOffsetsMask = 0x20;
     u32 offset_gathers = 0;
