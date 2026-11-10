@@ -267,6 +267,13 @@ public:
 
     [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
 
+    void BeginColorFeedbackDraw() {
+        ++color_feedback_draw;
+        color_feedback_views.clear();
+    }
+
+    [[nodiscard]] ImageViewId CopyColorFeedbackView(ImageViewId view);
+
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
 
@@ -830,6 +837,20 @@ private:
     void TickAsyncUnswizzle();
 
     Runtime& runtime;
+
+    struct FeedbackShadow {
+        ImageId id;
+        u64 draw;
+        u64 last_frame;
+        u64 tick;
+    };
+    std::vector<FeedbackShadow> feedback_shadows;
+    boost::container::small_vector<std::pair<ImageViewId, ImageViewId>, 4> color_feedback_views;
+    u64 color_feedback_draw{};
+    u64 color_feedback_copies{};
+    u64 color_feedback_texels{};
+    u64 color_feedback_bytes{};
+    u64 color_feedback_scaled_copies{};
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
