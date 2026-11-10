@@ -93,7 +93,7 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 /// game_* is the rectangle the game image covers in the backbuffer: frame generation runs inside it
 /// (a little inset) and copies the rest as is (else, scaled to fullscreen, it smeared the edge row).
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
-                           u32 game_bottom);
+                           u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent);
 void FrameGenAfterPresent(void* token);
 /// Time the present thread spent acquiring the swapchain image (for the frame generation log).
 void NoteFrameGenAcquire(u64 ns);

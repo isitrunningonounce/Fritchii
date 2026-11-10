@@ -8,8 +8,10 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 
 #include "common/common_types.h"
+#include "video_core/temporal_camera.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -41,6 +43,7 @@ public:
         bool reset;
         bool depth_inverted = true;
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
+        std::optional<VideoCommon::TemporalCameraConstants> camera;
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.

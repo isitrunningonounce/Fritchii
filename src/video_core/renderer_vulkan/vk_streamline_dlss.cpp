@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <string_view>
+#include <fmt/ranges.h>
 
 #include "common/frame_gen_stats.h"
 #include "common/logging.h"
@@ -402,8 +403,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
         };
 
-        // DLSS super resolution only reads the jitter, motion and depth conventions; the camera
-        // fields are for frame generation, which this doesn't use.
+        // Keep the existing defaults for callers without a measured camera contract.
         const f32 rw = static_cast<f32>(in.render_size.width);
         const f32 rh = static_cast<f32>(in.render_size.height);
         sl::Constants constants{};
@@ -429,6 +429,47 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         constants.motionVectors3D = sl::eFalse;
         constants.reset = reset ? sl::eTrue : sl::eFalse;
         constants.motionVectorsJittered = sl::eFalse;
+        if (in.camera) {
+            const auto& camera = *in.camera;
+            const auto matrix = [](const std::array<f32, 16>& values) {
+                sl::float4x4 result;
+                for (u32 row = 0; row < 4; ++row) {
+                    result.setRow(row, {values[row * 4], values[row * 4 + 1],
+                                        values[row * 4 + 2], values[row * 4 + 3]});
+                }
+                return result;
+            };
+            const auto vector = [](const std::array<f32, 3>& values) {
+                return sl::float3{values[0], values[1], values[2]};
+            };
+            constants.cameraViewToClip = matrix(camera.view_to_clip);
+            constants.clipToCameraView = matrix(camera.clip_to_view);
+            constants.clipToPrevClip = matrix(camera.clip_to_previous_clip);
+            constants.prevClipToClip = matrix(camera.previous_clip_to_clip);
+            constants.cameraPos = vector(camera.position);
+            constants.cameraRight = vector(camera.right);
+            constants.cameraUp = vector(camera.up);
+            constants.cameraFwd = vector(camera.forward);
+            constants.cameraNear = camera.near_plane;
+            constants.cameraFar = camera.far_plane;
+            constants.cameraFOV = camera.vertical_fov;
+            constants.cameraAspectRatio = camera.aspect_ratio;
+            static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
+            if (trace || index == 0 || reset || index % 120 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Mario Kart World temporal: FG camera frame={} render={}x{} "
+                         "near={} far={} fov={} aspect={} position=({},{},{}) "
+                         "projection={:g} clip_to_previous={:g} "
+                         "jitter=({},{}) mv_scale=({},{}) depth_inverted={}",
+                         index, in.render_size.width, in.render_size.height,
+                         camera.near_plane, camera.far_plane, camera.vertical_fov, camera.aspect_ratio,
+                         camera.position[0], camera.position[1], camera.position[2],
+                         fmt::join(camera.view_to_clip, ","),
+                         fmt::join(camera.clip_to_previous_clip, ","),
+                         in.jitter[0], in.jitter[1], constants.mvecScale.x, constants.mvecScale.y,
+                         in.depth_inverted);
+            }
+        }
 
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,

@@ -173,3 +173,178 @@ TEST_CASE("MKW camera rejects other views and unavailable camera data", "[video_
     SECTION("Nonfinite previous matrix") { block[0x180 / 4] = std::numeric_limits<f32>::infinity(); }
     CHECK_FALSE(ReadMarioKartCamera(block, 2560, 1440, false));
 }
+
+namespace {
+
+std::array<f64, 4> RowTransform(const std::array<f64, 4>& vector,
+                               const std::array<f32, 16>& matrix) {
+    std::array<f64, 4> result{};
+    for (size_t col = 0; col < 4; ++col) {
+        for (size_t row = 0; row < 4; ++row) {
+            result[col] += vector[row] * matrix[row * 4 + col];
+        }
+    }
+    return result;
+}
+
+std::array<f64, 4> ColumnTransform(const std::array<f32, 16>& matrix,
+                                  const std::array<f64, 4>& vector) {
+    std::array<f64, 4> result{};
+    for (size_t row = 0; row < 4; ++row) {
+        for (size_t col = 0; col < 4; ++col) {
+            result[row] += matrix[row * 4 + col] * vector[col];
+        }
+    }
+    return result;
+}
+
+} // namespace
+
+TEST_CASE("MKW FG camera uses captured pose and shifted perspective", "[video_core][mkw]") {
+    for (const auto& block : {Camera2910, Camera2911}) {
+        const auto camera = VideoCommon::ReadMarioKartCamera(block, 2560, 1440, false);
+        REQUIRE(camera);
+        const auto constants = VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440);
+        REQUIRE(constants);
+        CHECK(std::abs(constants->near_plane - 1.0f) < 0.00001f);
+        CHECK(std::abs(constants->far_plane - 10000.0f) < 1.0f);
+        CHECK(std::abs(constants->vertical_fov - 1.13446408f) < 0.000001f);
+        CHECK(std::abs(constants->aspect_ratio - 16.0f / 9.0f) < 0.000001f);
+        CHECK(constants->view_to_clip[1 * 4 + 1] == block[0x84 / 4]);
+        CHECK(constants->view_to_clip[2 * 4 + 1] == block[0x88 / 4]);
+        CHECK(constants->view_to_clip[2 * 4 + 1] == -0.18f);
+        CHECK(constants->view_to_clip[2 * 4 + 3] == -1.0f);
+        for (size_t i = 0; i < 3; ++i) {
+            CHECK(constants->position[i] == block[0xb0 / 4 + i * 4 + 3]);
+            CHECK(std::abs(constants->right[i] - camera->view[i]) < 0.000001f);
+            CHECK(std::abs(constants->up[i] - camera->view[4 + i]) < 0.000001f);
+            CHECK(std::abs(constants->forward[i] + camera->view[8 + i]) < 0.000001f);
+        }
+        const std::array axes{constants->right, constants->up, constants->forward};
+        for (size_t i = 0; i < 3; ++i) {
+            for (size_t j = 0; j < 3; ++j) {
+                f64 dot{};
+                for (size_t k = 0; k < 3; ++k) {
+                    dot += static_cast<f64>(axes[i][k]) * axes[j][k];
+                }
+                CHECK(std::abs(dot - (i == j ? 1.0 : 0.0)) < 0.000001);
+            }
+        }
+    }
+}
+
+TEST_CASE("MKW FG projection maps near and far to device depth", "[video_core][mkw]") {
+    const auto camera = VideoCommon::ReadMarioKartCamera(Camera2911, 2560, 1440, false);
+    REQUIRE(camera);
+    const auto constants = VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440);
+    REQUIRE(constants);
+    for (const f64 distance : {1.0, 10.0, 100.0, 10000.0}) {
+        const std::array<f64, 4> view{0.25, -0.5, -distance, 1.0};
+        const auto gl_clip = ColumnTransform(camera->projection, view);
+        const auto device_clip = RowTransform(view, constants->view_to_clip);
+        CHECK(std::abs(device_clip[0] - gl_clip[0]) < 1e-6);
+        CHECK(std::abs(device_clip[1] - gl_clip[1]) < 1e-6);
+        CHECK(std::abs(device_clip[2] - (gl_clip[2] + gl_clip[3]) * 0.5) < 1e-6);
+        CHECK(device_clip[3] == gl_clip[3]);
+        const f64 depth = device_clip[2] / device_clip[3];
+        if (distance == 1.0) {
+            CHECK(std::abs(depth) < 1e-7);
+        } else if (distance == 10000.0) {
+            CHECK(std::abs(depth - 1.0) < 1e-6);
+        }
+        const auto roundtrip = RowTransform(device_clip, constants->clip_to_view);
+        for (size_t i = 0; i < 4; ++i) {
+            CHECK(std::abs(roundtrip[i] - view[i]) < 0.002);
+        }
+    }
+}
+
+TEST_CASE("MKW FG reprojection agrees with captured camera motion", "[video_core][mkw]") {
+    const auto camera = VideoCommon::ReadMarioKartCamera(Camera2911, 2560, 1440, false);
+    REQUIRE(camera);
+    const auto constants = VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440);
+    REQUIRE(constants);
+    struct Sample { f64 u, v, depth, motion_x, motion_y; };
+    // Independent double-precision evaluation of prevVP * inverse(VP), then clip-to-pixel.
+    constexpr std::array samples{
+        Sample{0.0, 0.0, 0.99, 12.2196466934, 3.1533631130},
+        Sample{0.5, 0.5, 0.99, 3.1683319465, -0.9800911542},
+        Sample{1.0, 1.0, 0.99, 2.3126639271, -0.4973171023},
+        Sample{0.05, 0.9, 0.999, 6.8290175181, -2.8038837076},
+        Sample{0.05, 0.9, 0.5, 183.3525894026, -131.1608600647},
+    };
+    for (const auto& sample : samples) {
+        const std::array<f64, 4> clip{sample.u * 2.0 - 1.0, 1.0 - sample.v * 2.0,
+                                     sample.depth, 1.0};
+        const auto previous = RowTransform(clip, constants->clip_to_previous_clip);
+        REQUIRE(previous[3] > 0);
+        const f64 motion_x = ((previous[0] / previous[3] + 1.0) * 0.5 - sample.u) * 2560;
+        const f64 motion_y = ((1.0 - previous[1] / previous[3]) * 0.5 - sample.v) * 1440;
+        CHECK(std::abs(motion_x - sample.motion_x) < 0.001);
+        CHECK(std::abs(motion_y - sample.motion_y) < 0.001);
+        const auto roundtrip = RowTransform(previous, constants->previous_clip_to_clip);
+        for (size_t i = 0; i < 4; ++i) {
+            CHECK(std::abs(roundtrip[i] - clip[i]) < 1e-6);
+        }
+    }
+}
+
+TEST_CASE("MKW FG stationary camera keeps reprojection identity", "[video_core][mkw]") {
+    auto camera = VideoCommon::ReadMarioKartCamera(Camera2910, 2560, 1440, false);
+    REQUIRE(camera);
+    camera->previous = camera->current;
+    const auto constants = VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440);
+    REQUIRE(constants);
+    for (size_t row = 0; row < 4; ++row) {
+        for (size_t col = 0; col < 4; ++col) {
+            CHECK(std::abs(constants->clip_to_previous_clip[row * 4 + col] -
+                           (row == col ? 1.0 : 0.0)) < 1e-6);
+        }
+    }
+    CHECK(constants->view_to_clip[2 * 4 + 1] == -0.18f);
+}
+
+TEST_CASE("MKW FG rejects inconsistent camera contracts", "[video_core][mkw]") {
+    auto camera = VideoCommon::ReadMarioKartCamera(Camera2911, 2560, 1440, false);
+    REQUIRE(camera);
+    REQUIRE(VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440));
+    SECTION("Projection does not match the captured VP") { camera->projection[6] = 0.0f; }
+    SECTION("View does not match the captured VP") { camera->view[3] += 10.0f; }
+    SECTION("Pose is not the inverse view") { camera->camera_to_world[7] += 10.0f; }
+    SECTION("Nonfinite projection") { camera->projection[5] = std::numeric_limits<f32>::infinity(); }
+    SECTION("Nonfinite pose") { camera->camera_to_world[0] = std::numeric_limits<f32>::quiet_NaN(); }
+    SECTION("Singular previous camera") { camera->previous.fill(0.0f); }
+    SECTION("Nonfinite previous camera") { camera->previous[0] = std::numeric_limits<f32>::quiet_NaN(); }
+    CHECK_FALSE(VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440));
+}
+
+TEST_CASE("MKW FG camera validation tolerates distant-world float rounding", "[video_core][mkw]") {
+    auto camera = VideoCommon::ReadMarioKartCamera(Camera2911, 2560, 1440, false);
+    REQUIRE(camera);
+    camera->camera_to_world[3] += 1000000.0f;
+    camera->camera_to_world[7] -= 2000000.0f;
+    camera->camera_to_world[11] += 3000000.0f;
+    for (size_t row = 0; row < 3; ++row) {
+        f64 translation{};
+        for (size_t k = 0; k < 3; ++k) {
+            translation -= static_cast<f64>(camera->view[row * 4 + k]) *
+                           camera->camera_to_world[k * 4 + 3];
+        }
+        camera->view[row * 4 + 3] = static_cast<f32>(translation);
+    }
+    for (size_t row = 0; row < 4; ++row) {
+        for (size_t col = 0; col < 4; ++col) {
+            f64 value{};
+            for (size_t k = 0; k < 4; ++k) {
+                value += static_cast<f64>(camera->projection[row * 4 + k]) *
+                         camera->view[k * 4 + col];
+            }
+            camera->current[row * 4 + col] = static_cast<f32>(value);
+        }
+    }
+    camera->previous = camera->current;
+    REQUIRE(VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440));
+    SECTION("A mismatched far-away pose still fails") { camera->camera_to_world[3] += 1000.0f; }
+    SECTION("Linear checks remain tight") { camera->camera_to_world[0] += 0.01f; }
+    CHECK_FALSE(VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440));
+}

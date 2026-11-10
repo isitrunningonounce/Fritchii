@@ -5,10 +5,12 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "common/common_types.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/temporal_camera.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -62,7 +64,8 @@ public:
                 VkExtent2D output_extent, VkExtent2D target_extent, const std::array<f32, 16>& current,
                 const std::array<f32, 16>& previous, const OcarinaActorMesh& mesh,
                 VkImage depth_image, u64 frame, std::array<f32, 2> jitter = {},
-                VkFormat depth_format = VK_FORMAT_D32_SFLOAT);
+                VkFormat depth_format = VK_FORMAT_D32_SFLOAT,
+                std::optional<VideoCommon::TemporalCameraConstants> camera = std::nullopt);
 
 private:
     struct Impl;

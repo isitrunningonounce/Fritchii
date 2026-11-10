@@ -3191,8 +3191,14 @@ void RasterizerVulkan::TrackMarioKartCamera() {
         if (!camera) {
             return;
         }
+        const auto constants = VideoCommon::MakeMarioKartTemporalCamera(
+            *camera, color.size.width, color.size.height);
+        if (!constants) {
+            return;
+        }
         mkw_motion = {gpu_memory, render_trace_frame, targets.depth_buffer_id, depth.gpu_addr,
-                      {color.size.width, color.size.height}, camera->current, camera->previous};
+                      {color.size.width, color.size.height}, camera->current, camera->previous,
+                      *constants};
     });
 }
 
@@ -3310,7 +3316,7 @@ bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, boo
             ? mkw_jitter_offset : std::array<f32, 2>{};
         if (!mkw_upscaler->Record(color_view, depth_view, target_view, extent, extent, extent,
                                   mkw_motion.current, mkw_motion.previous, {}, depth.ImageHandle(),
-                                  render_trace_frame, jitter, depth_format)) {
+                                  render_trace_frame, jitter, depth_format, mkw_motion.camera)) {
             return fail("temporal upscaler declined the frame");
         }
         mkw_temporal_frame = render_trace_frame;

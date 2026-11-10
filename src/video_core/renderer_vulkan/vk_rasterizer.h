@@ -20,6 +20,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/temporal_camera.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -320,6 +321,7 @@ private:
         VkExtent2D extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
+        VideoCommon::TemporalCameraConstants camera{};
     } mkw_motion;
     std::optional<VideoCommon::OcarinaUpscaleBackend> mkw_backend;
     std::unique_ptr<class OcarinaUpscaler> mkw_upscaler;

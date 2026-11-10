@@ -25,6 +25,7 @@
 #include "common/frame_gen_stats.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -82,6 +83,7 @@ struct State {
     std::chrono::steady_clock::time_point fg_last_present{};
     bool fg_on{};         ///< Present thread from here on
     u32 fg_frames{};      ///< Generated frames per rendered one while on
+    std::optional<std::array<u32, 12>> fg_mkw_geometry;
     u32 fg_max_frames{1}; ///< DLSSGState::numFramesToGenerateMax
     u64 fg_presents{};
     u64 fg_generated_presents{};
@@ -865,7 +867,7 @@ void* TakeFrameGenToken() {
 }
 
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
-                           u32 game_bottom) {
+                           u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent) {
     State& state = GetState();
     if (!IsFrameGenAvailable()) {
         return;
@@ -915,13 +917,29 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         const char* const value = std::getenv("LICHII_DLSS_FG_INSET");
         return value ? static_cast<u32>(std::atoi(value)) : 4u;
     }();
+    sl::Extent subrect{};
     if (game_right > game_left + 2 * inset && game_bottom > game_top + 2 * inset) {
-        const sl::Extent subrect{game_top + inset, game_left + inset,
-                                 game_right - game_left - 2 * inset,
-                                 game_bottom - game_top - 2 * inset};
+        subrect = {game_top + inset, game_left + inset,
+                   game_right - game_left - 2 * inset, game_bottom - game_top - 2 * inset};
         sl::ResourceTag backbuffer{nullptr, sl::kBufferTypeBackbuffer,
                                    sl::ResourceLifecycle::eValidUntilPresent, &subrect};
         api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &backbuffer, 1, nullptr);
+    }
+    if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
+        const std::array geometry{frame_extent.width, frame_extent.height,
+                                  swapchain_extent.width, swapchain_extent.height,
+                                  game_left, game_top, game_right, game_bottom,
+                                  subrect.left, subrect.top, subrect.width, subrect.height};
+        if (state.fg_mkw_geometry != geometry) {
+            state.fg_mkw_geometry = geometry;
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart World temporal: FG geometry frame={}x{} swapchain={}x{} "
+                     "game_rect=({},{},{},{}) subrect=({},{},{}x{}) inset={}",
+                     frame_extent.width, frame_extent.height,
+                     swapchain_extent.width, swapchain_extent.height,
+                     game_left, game_top, game_right, game_bottom,
+                     subrect.left, subrect.top, subrect.width, subrect.height, inset);
+        }
     }
     api.pcl_set_marker(sl::PCLMarker::ePresentStart, frame);
     state.fg_present_begin = std::chrono::steady_clock::now();
@@ -1016,6 +1034,7 @@ void Stop() {
     const sl::Result result = state.api.shutdown();
     state.started = false;
     state.attached = false;
+    state.fg_mkw_geometry.reset();
     Common::FrameGenStats::active.store(false, std::memory_order_relaxed);
     Common::FrameGenStats::available.store(false, std::memory_order_relaxed);
     // The next game start sets frame generation up again.
