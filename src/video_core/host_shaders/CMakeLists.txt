@@ -107,6 +107,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_color.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/mkw_temporal_output.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/mkw_ui_alpha.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/mkw_hudless_present.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_output.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_composite.comp
@@ -183,6 +184,9 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
         endif()
         if (FILENAME STREQUAL "mkw_hudless_present.comp")
             list(APPEND SPIRV_DEPENDENCIES ${CMAKE_CURRENT_SOURCE_DIR}/mkw_hudless_srgb.glsl)
+        endif()
+        if (FILENAME STREQUAL "mkw_ui_alpha.comp")
+            list(APPEND SPIRV_DEPENDENCIES ${CMAKE_CURRENT_SOURCE_DIR}/mkw_ui_alpha.glsl)
         endif()
         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
         set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)

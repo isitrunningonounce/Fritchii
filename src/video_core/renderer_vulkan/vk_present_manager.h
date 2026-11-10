@@ -18,10 +18,11 @@
 #include "common/common_types.h"
 #include "common/math_util.h"
 #include "common/polyfill_thread.h"
+#include "video_core/renderer_vulkan/present/mkw_ui_alpha.h"
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
+#include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/vulkan_common/streamline.h"
 
 namespace Core::Frontend {
 class EmuWindow;
@@ -51,6 +52,8 @@ struct Frame {
     VkExtent2D hudless_present_extent{};
     VkFormat hudless_present_format{};
     Streamline::FrameGenInputFence hudless_fence;
+    MarioKartUiImages ui_images;
+    bool ui_alpha_valid{};
     bool hudless_valid{};
     bool hudless_available{true};
     vk::Buffer hudless_check;
@@ -117,6 +120,7 @@ private:
 
     void CopyToSwapchainImpl(Frame* frame);
     void PrepareHudlessPresent(Frame* frame, VkExtent2D extent);
+    void RecordUiAlpha(Frame* frame, vk::CommandBuffer cmdbuf, VkExtent2D extent);
     void RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, VkExtent2D extent);
     void ReportHudlessCheck(Frame* frame);
 
@@ -147,6 +151,10 @@ private:
     bool blit_supported;
     bool storage_supported;
     bool use_present_thread;
+    std::unique_ptr<MarioKartUiAlpha> ui_alpha;
+    const char* ui_alpha_reason{"not prepared"};
+    VkFormat ui_alpha_checked_format{VK_FORMAT_UNDEFINED};
+    bool ui_alpha_supported{};
     u64 hudless_check_frames{};
     bool hudless_allocation_failed{};
     const char* hudless_check_reason{};

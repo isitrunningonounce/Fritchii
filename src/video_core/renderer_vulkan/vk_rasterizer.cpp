@@ -3275,7 +3275,8 @@ void RasterizerVulkan::TrackMarioKartPresent(const GraphicsPipeline& pipeline, b
         mkw_hudless_present = VK_NULL_HANDLE;
         return;
     }
-    if (pipeline.ShaderHashes()[5] != VideoCommon::MarioKartPresentFragment ||
+    if (pipeline.ShaderHashes()[1] != VideoCommon::MarioKartPresentVertex ||
+        pipeline.ShaderHashes()[5] != VideoCommon::MarioKartPresentFragment ||
         mkw_hudless.frame != render_trace_frame || !mkw_hudless_source) {
         return;
     }

@@ -549,3 +549,71 @@ TEST_CASE("MKW FG rectangle follows the final image blit or copy", "[video_core]
     CHECK_FALSE(MapMarioKartPresentRect({0, 0, 4, 4}, 0, 4, 7, 7, true));
     CHECK_FALSE(MapMarioKartPresentRect({0, 0, 4, 4}, 4, 4, 0, 7, true));
 }
+
+namespace {
+using std::abs;
+using std::round;
+#include "video_core/host_shaders/mkw_ui_alpha.glsl"
+} // namespace
+
+TEST_CASE("MKW UI alpha compares encoded bytes at the exact two-byte boundary",
+          "[video_core][mkw]") {
+    for (int value = 0; value <= 255; ++value) {
+        CHECK(MkwEncodedByte(static_cast<float>(value) / 255.0f) == value);
+        for (const int delta : {-3, -2, 0, 2, 3}) {
+            const int other = value + delta;
+            if (other < 0 || other > 255) {
+                continue;
+            }
+            const int a = MkwEncodedByte(static_cast<float>(value) / 255.0f);
+            const int b = MkwEncodedByte(static_cast<float>(other) / 255.0f);
+            CHECK(MkwUiAlphaPixel(0, 0, 0, 0, 1, 1, a, 0, 0, b, 0, 0) == (std::abs(delta) > 2));
+            CHECK(MkwUiAlphaPixel(0, 0, 0, 0, 1, 1, 0, a, 0, 0, b, 0) == (std::abs(delta) > 2));
+            CHECK(MkwUiAlphaPixel(0, 0, 0, 0, 1, 1, 0, 0, a, 0, 0, b) == (std::abs(delta) > 2));
+        }
+    }
+}
+
+TEST_CASE("MKW UI alpha excludes letterbox pixels and ignores color alpha", "[video_core][mkw]") {
+    const auto alpha = [](int x, int y, std::array<u8, 4> a, std::array<u8, 4> b) {
+        return MkwUiAlphaPixel(x, y, 160, 90, 2400, 1350, a[0], a[1], a[2], b[0], b[1], b[2]);
+    };
+    CHECK_FALSE(alpha(160, 90, {10, 20, 30, 0}, {10, 20, 30, 255}));
+    CHECK(alpha(160, 90, {10, 20, 30, 0}, {13, 20, 30, 255}));
+    CHECK(alpha(2399, 1349, {10, 20, 30, 0}, {10, 20, 33, 255}));
+    CHECK_FALSE(alpha(159, 90, {0, 0, 0, 0}, {255, 255, 255, 255}));
+    CHECK_FALSE(alpha(160, 89, {0, 0, 0, 0}, {255, 255, 255, 255}));
+    CHECK_FALSE(alpha(2400, 90, {0, 0, 0, 0}, {255, 255, 255, 255}));
+    CHECK_FALSE(alpha(160, 1350, {0, 0, 0, 0}, {255, 255, 255, 255}));
+    CHECK_FALSE(MkwUiAlphaPixel(0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 0));
+}
+
+TEST_CASE("MKW recomposition follows successful tags and option fallback", "[video_core][mkw]") {
+    using Vulkan::Streamline::FrameGenUiOptionsState;
+    FrameGenUiOptionsState state;
+    CHECK(state.NeedsUpdate(false));
+    state.Applied(false, false);
+    CHECK_FALSE(state.NeedsUpdate(false));
+    for (bool enabled : {false, true}) {
+        for (bool hudless : {false, true}) {
+            for (bool alpha : {false, true}) {
+                CHECK(FrameGenUiOptionsState::Desired(enabled, hudless, alpha) ==
+                      (enabled && hudless && alpha));
+            }
+        }
+    }
+    CHECK(state.NeedsUpdate(true));
+    state.Applied(true, true);
+    CHECK(state.active);
+    CHECK_FALSE(state.NeedsUpdate(true));
+    // Input loss updates options even when FG mode and multiplier have not changed.
+    CHECK(state.NeedsUpdate(FrameGenUiOptionsState::Desired(true, true, false)));
+    state.Applied(false, false);
+    CHECK_FALSE(state.active);
+    CHECK(state.NeedsUpdate(true));
+    // A failed enable with a successful off fallback must not claim recomposition is active.
+    state.Applied(true, false);
+    CHECK_FALSE(state.active);
+    CHECK_FALSE(state.NeedsUpdate(true));
+    CHECK(state.NeedsUpdate(false));
+}

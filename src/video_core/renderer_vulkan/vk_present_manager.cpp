@@ -741,20 +741,22 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
     const u32 height = rect->GetHeight();
     const VkDeviceSize bytes = VkDeviceSize{width} * height * 4;
     try {
-        // The swapchain does not allow transfer reads. Reproduce its exact final blit/copy once.
-        frame->hudless_check_color = memory_allocator.CreateImage({
-            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .imageType = VK_IMAGE_TYPE_2D,
-            .format = format,
-            .extent = {extent.width, extent.height, 1},
-            .mipLevels = 1,
-            .arrayLayers = 1,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        });
+        // Reuse the production mask input, or reproduce the final copy for diagnostics alone.
+        if (!frame->ui_alpha_valid) {
+            frame->hudless_check_color = memory_allocator.CreateImage({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = format,
+                .extent = {extent.width, extent.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+        }
         frame->hudless_check = memory_allocator.CreateBuffer({
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = bytes * 2,
@@ -769,6 +771,8 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
         }
         return;
     }
+    const VkImage color =
+        frame->ui_alpha_valid ? *frame->ui_images.color : *frame->hudless_check_color;
     const auto barrier = [](VkImage image, VkAccessFlags src, VkAccessFlags dst,
                             VkImageLayout before, VkImageLayout after) {
         return VkImageMemoryBarrier{
@@ -789,34 +793,44 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
     const std::array before{
         barrier(*frame->image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT, GENERAL, SRC),
-        barrier(*frame->hudless_present, VK_ACCESS_TRANSFER_WRITE_BIT,
+        barrier(*frame->hudless_present, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT, GENERAL, SRC),
-        barrier(*frame->hudless_check_color, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED, DST),
+        barrier(color, frame->ui_alpha_valid ? VK_ACCESS_SHADER_READ_BIT : 0,
+                frame->ui_alpha_valid ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT,
+                frame->ui_alpha_valid ? GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                frame->ui_alpha_valid ? SRC : DST),
     };
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, {}, {}, before);
-    if (blit_supported) {
-        cmdbuf.BlitImage(*frame->image, SRC, *frame->hudless_check_color, DST,
-            MakeImageBlit(frame->width, frame->height, extent.width, extent.height), VK_FILTER_LINEAR);
-    } else {
-        cmdbuf.CopyImage(*frame->image, SRC, *frame->hudless_check_color, DST,
-            MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
+    if (!frame->ui_alpha_valid) {
+        if (blit_supported) {
+            cmdbuf.BlitImage(
+                *frame->image, SRC, color, DST,
+                MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
+                VK_FILTER_LINEAR);
+        } else {
+            cmdbuf.CopyImage(
+                *frame->image, SRC, color, DST,
+                MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
+        }
+        cmdbuf.PipelineBarrier(
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            barrier(color, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, DST, SRC));
     }
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-        barrier(*frame->hudless_check_color, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, DST, SRC));
     VkBufferImageCopy copy{
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .imageOffset = {static_cast<s32>(rect->left), static_cast<s32>(rect->top), 0},
         .imageExtent = {width, height, 1},
     };
-    cmdbuf.CopyImageToBuffer(*frame->hudless_check_color, SRC, *frame->hudless_check, copy);
+    cmdbuf.CopyImageToBuffer(color, SRC, *frame->hudless_check, copy);
     copy.bufferOffset = bytes;
     cmdbuf.CopyImageToBuffer(*frame->hudless_present, SRC, *frame->hudless_check, copy);
     const std::array after{
+        barrier(color, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, SRC, GENERAL),
         barrier(*frame->image, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, SRC, GENERAL),
-        barrier(*frame->hudless_present, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, SRC, GENERAL),
+        barrier(*frame->hudless_present, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                SRC, GENERAL),
     };
     const VkMemoryBarrier host{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -830,6 +844,51 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
     frame->hudless_check_extent = extent;
     frame->hudless_check_rect = *rect;
     frame->hudless_check_pending = true;
+}
+
+void PresentManager::RecordUiAlpha(Frame* frame, vk::CommandBuffer cmdbuf, VkExtent2D extent) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MKW_FG_UI_ALPHA");
+        return !value || value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    const auto rect = VideoCommon::MapMarioKartPresentRect(
+        {frame->game_left, frame->game_top, frame->game_right, frame->game_bottom}, frame->width,
+        frame->height, extent.width, extent.height, blit_supported);
+    const auto format = swapchain.GetImageFormat();
+    const char* reason = !rect ? "invalid game rectangle" : nullptr;
+    try {
+        if (ui_alpha_checked_format != format) {
+            ui_alpha_supported = MarioKartUiAlpha::Supported(device, format);
+            ui_alpha_checked_format = format;
+        }
+        if (!reason && !ui_alpha_supported) {
+            reason = "unsupported encoded color format or compute/storage capabilities";
+        }
+        if (!reason) {
+            if (!ui_alpha) {
+                ui_alpha = std::make_unique<MarioKartUiAlpha>(device, MAX_FRAMES_IN_FLIGHT);
+            }
+            ui_alpha->Prepare(device, memory_allocator, frame->ui_images, extent, format,
+                              *frame->hudless_present_view, frame->index);
+            ui_alpha->Record(
+                cmdbuf, frame->ui_images, *frame->image, *frame->hudless_present,
+                MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
+                MakeImageCopy(frame->width, frame->height, extent.width, extent.height),
+                blit_supported, *rect, frame->index);
+            frame->ui_alpha_valid = true;
+        }
+    } catch (const std::exception&) {
+        reason = "allocation or pipeline unavailable";
+    }
+    if (reason != ui_alpha_reason) {
+        LOG_INFO(Render_Vulkan, "Mario Kart World temporal: UI alpha {} extent={}x{} format={}",
+                 reason ? reason : "enabled", extent.width, extent.height,
+                 static_cast<u32>(format));
+        ui_alpha_reason = reason;
+    }
 }
 
 void PresentManager::PrepareHudlessPresent(Frame* frame, VkExtent2D extent) {
@@ -926,6 +985,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     const VkImage image{swapchain.CurrentImage()};
     const VkExtent2D extent = swapchain.GetExtent();
+    frame->ui_alpha_valid = false;
     PrepareHudlessPresent(frame, extent);
     const bool copy_hudless = frame->hudless_available && frame->hudless_valid &&
                              frame->frame_gen_token && frame->hudless_present;
@@ -1063,6 +1123,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         };
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                0, {}, {}, after);
+        RecordUiAlpha(frame, cmdbuf, extent);
         RecordHudlessCheck(frame, cmdbuf, extent);
     }
     cmdbuf.End();
@@ -1121,9 +1182,12 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         valid_game_rect = mapped.has_value();
         game_rect = mapped.value_or(Common::Rectangle<u32>{});
     }
-    Streamline::FrameGenBeforePresent(frame_gen_token, game_rect.left, game_rect.top,
-                                      game_rect.right, game_rect.bottom, {frame->width, frame->height}, extent,
-                                      copy_hudless && valid_game_rect ? &hudless : nullptr);
+    const Streamline::FrameGenHudlessImage alpha{
+        *frame->ui_images.alpha, *frame->ui_images.alpha_view, VK_FORMAT_R8_UNORM, extent};
+    Streamline::FrameGenBeforePresent(
+        frame_gen_token, game_rect.left, game_rect.top, game_rect.right, game_rect.bottom,
+        {frame->width, frame->height}, extent, copy_hudless && valid_game_rect ? &hudless : nullptr,
+        frame->ui_alpha_valid && valid_game_rect ? &alpha : nullptr);
 #endif
     try {
         last_present_id = swapchain.Present(render_semaphore);
