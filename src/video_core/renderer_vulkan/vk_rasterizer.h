@@ -267,9 +267,11 @@ private:
     void TrackMarioKartCamera();
     bool BananzaTemporalEnabled();
     void TrackBananzaCamera();
-    void TrackBananzaBlend(const GraphicsPipeline& pipeline, bool indexed, bool indirect,
-                           u32 instances);
-    void TrackBananzaUpscale(const ComputePipeline& pipeline, bool indirect);
+    bool TryBananzaBlend(const GraphicsPipeline& pipeline, bool indexed, bool indirect,
+                         u32 instances);
+    bool TrackBananzaUpscale(const ComputePipeline& pipeline, bool indirect);
+    bool RecordBananzaUpscale(ImageView& target, VideoCommon::BananzaFrameShape shape);
+    void UpdateBananzaJitter(const GraphicsPipeline& pipeline, bool indexed, bool indirect);
     void LogBananzaFallback(const char* reason);
     bool MarioKartHudlessEnabled() const;
     void TrackMarioKartPresent(const GraphicsPipeline& pipeline, bool indexed, bool indirect, u32 instances);
@@ -356,14 +358,25 @@ private:
         const Tegra::MemoryManager* channel{};
         std::optional<u64> camera_frame;
         VideoCommon::BananzaCamera camera{};
+        VideoCommon::ImageViewId depth;
         VideoCommon::Extent2D depth_extent{};
         GPUVAddr depth_address{};
         std::optional<u64> blend_frame;
         VideoCommon::BananzaFrameShape shape{};
+        VideoCommon::ImageViewId tonemapped;
         GPUVAddr tonemapped_address{};
         GPUVAddr blend_address{};
     } bananza_scene;
     std::optional<VideoCommon::OcarinaUpscaleBackend> bananza_backend;
+    std::unique_ptr<class OcarinaUpscaler> bananza_upscaler;
+    std::optional<u64> bananza_temporal_frame;
+    bool bananza_failed{};
+    std::array<bool, 2> bananza_replacement_logged{};
+    const Tegra::MemoryManager* bananza_jitter_channel{};
+    GPUVAddr bananza_jitter_depth{};
+    std::array<f32, 2> bananza_jitter_applied{};
+    std::array<f32, 2> bananza_jitter_offset{};
+    std::optional<u64> bananza_jitter_frame;
     const char* bananza_fallback_reason{};
     bool bananza_depth_logged{};
     bool bananza_dispatch_logged{};

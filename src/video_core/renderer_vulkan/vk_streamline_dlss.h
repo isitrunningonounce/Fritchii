@@ -44,6 +44,8 @@ public:
         bool depth_inverted = true;
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
         std::optional<VideoCommon::TemporalCameraConstants> camera;
+        bool bananza_dynamic{};
+        VkExtent2D depth_allocation_size{};
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.
@@ -83,7 +85,14 @@ private:
     };
     static constexpr size_t FRAME_GEN_COPIES = 4;
 
+    struct DynamicMode {
+        u32 mode;
+        VkExtent2D minimum;
+        VkExtent2D maximum;
+    };
+
     void CreateOutput(VkExtent2D upscale_size);
+    void CreateBananzaExposure();
     void CreateFrameGenCopies(const Inputs& inputs);
 
     const Device& device;
@@ -96,6 +105,9 @@ private:
     u32 frame_index{};
     vk::Image output_image;
     vk::ImageView output_view;
+    vk::Image bananza_exposure;
+    vk::ImageView bananza_exposure_view;
+    std::optional<DynamicMode> bananza_mode; ///< Worker thread only.
     vk::Sampler point_sampler;
     std::array<FrameGenCopy, FRAME_GEN_COPIES> fg_copies;
     VkExtent2D fg_copy_extent{};

@@ -4718,12 +4718,21 @@ void CustomBorderColorBudget::Release() noexcept {
 
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     if (!ocarina_fsr_lod_bias) {
-        const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+        const u64 program_id = Settings::GetCurrentProgramID();
+        const bool ocarina = program_id == 0x0400486024DEC000ULL;
         ocarina_fsr_lod_bias =
             ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
-        if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId &&
-            ResolveMarioKartUpscaler(device) != VideoCommon::OcarinaUpscaleBackend::Native) {
-            if (const char* value = std::getenv("EDEN_NX2_MKW_LOD_BIAS")) {
+        using Backend = VideoCommon::OcarinaUpscaleBackend;
+        const char* variable = nullptr;
+        if (program_id == Settings::MarioKartWorldProgramId &&
+            ResolveMarioKartUpscaler(device) != Backend::Native) {
+            variable = "EDEN_NX2_MKW_LOD_BIAS";
+        } else if (program_id == Settings::DonkeyKongBananzaProgramId &&
+                   ResolveBananzaUpscaler(device) != Backend::Native) {
+            variable = "EDEN_NX2_DKB_LOD_BIAS";
+        }
+        if (variable) {
+            if (const char* value = std::getenv(variable)) {
                 char* end{};
                 const f32 bias = std::strtof(value, &end);
                 if (end != value && *end == '\0' && std::isfinite(bias)) {

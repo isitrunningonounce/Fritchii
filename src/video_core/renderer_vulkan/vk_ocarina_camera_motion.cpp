@@ -11,7 +11,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr.h"
-#include "video_core/mkw_upscale.h"
+#include "video_core/dkb_upscale.h"
 #include "video_core/host_shaders/mkw_temporal_output_comp_spv.h"
 #include "video_core/host_shaders/mkw_hudless_present_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
@@ -464,19 +464,20 @@ public:
     }
     void RecordOutput(Scheduler& scheduler, const void* descriptors,
                       const OcarinaUpscaler& upscaler, VkExtent2D extent, u64 frame,
-                      bool reset, const void* fallback = nullptr) {
-        scheduler.Record([this, descriptors, &upscaler, extent, frame, reset, fallback](vk::CommandBuffer cmd) {
+                      bool reset, const void* fallback, bool bananza) {
+        scheduler.Record([this, descriptors, &upscaler, extent, frame, reset, fallback, bananza](vk::CommandBuffer cmd) {
             const bool failed = upscaler.EvaluationFailed();
             if (failed && !fallback) {
                 return;
             }
+            const bool guest_color_read = fallback || bananza;
             const VkMemoryBarrier before{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = fallback ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+                .srcAccessMask = guest_color_read ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
                                           : VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
             };
-            cmd.PipelineBarrier(fallback ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+            cmd.PipelineBarrier(guest_color_read ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
                                         : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
             const VkDescriptorSet set = descriptor_allocator.Commit();
@@ -497,7 +498,12 @@ public:
                 LOG_INFO(Render_Vulkan, "Mario Kart World temporal: writeback frame={} history_reset={} native_color_fallback={}",
                          frame, reset, failed);
             } else if (!fallback && (trace || reset || frame % 120 == 0)) {
-                LOG_INFO(Render_Vulkan, "Ocarina temporal writeback frame={} history_reset={}", frame, reset);
+                if (bananza) {
+                    LOG_INFO(Render_Vulkan,
+                             "Bananza temporal: writeback frame={} history_reset={}", frame, reset);
+                } else {
+                    LOG_INFO(Render_Vulkan, "Ocarina temporal writeback frame={} history_reset={}", frame, reset);
+                }
             }
         });
     }
@@ -660,10 +666,12 @@ vk::ImageView CreateOcarinaView(const Device& device, VkImage image, VkFormat fo
 }
 
 struct OcarinaFrameSlot {
-    OcarinaFrameSlot(const Device& device, MemoryAllocator& allocator, VkExtent2D extent_)
+    OcarinaFrameSlot(const Device& device, MemoryAllocator& allocator, VkExtent2D extent_,
+                     bool transfer_motion)
         : extent{extent_}, motion{CreateOcarinaImage(
                               allocator, extent, MOTION_FORMAT, VK_IMAGE_USAGE_STORAGE_BIT |
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                  (transfer_motion ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0))},
           motion_view{CreateOcarinaView(device, *motion, MOTION_FORMAT)},
           color{CreateOcarinaImage(allocator, extent, LIVE_COLOR_FORMAT,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
@@ -712,12 +720,15 @@ struct OcarinaEffects {
 struct OcarinaUpscaler::Impl {
     Impl(const Device& device_, Scheduler& scheduler_, DescriptorPool& pool,
          ComputePassDescriptorQueue& queue_, MemoryAllocator& allocator_, StagingBufferPool& staging,
-         VideoCommon::OcarinaUpscaleBackend backend, bool mario_kart_)
-        : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool}, mario_kart{mario_kart_},
+         VideoCommon::OcarinaUpscaleBackend backend, Profile profile_)
+        : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool},
+          profile{profile_},
           motion_pass{device, scheduler, pool},
           color_pass{device, scheduler, pool},
-          output_pass{device, scheduler, pool, mario_kart ? std::span<const u32>{MKW_TEMPORAL_OUTPUT_COMP_SPV}
-                                                        : std::span<const u32>{OCARINA_DLSS_OUTPUT_COMP_SPV}} {
+          output_pass{device, scheduler, pool,
+                      profile == Profile::Ocarina
+                          ? std::span<const u32>{OCARINA_DLSS_OUTPUT_COMP_SPV}
+                          : std::span<const u32>{MKW_TEMPORAL_OUTPUT_COMP_SPV}} {
 #ifdef EGLANTINE_STREAMLINE
         if (backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
             dlss = std::make_unique<StreamlineDlssUpscaler>(device, scheduler, allocator);
@@ -726,7 +737,7 @@ struct OcarinaUpscaler::Impl {
 #endif
         // FSR 4 when it's turned on and AMD's runtime offers it; FSR 3.1 stays the fallback (it
         // takes over if FSR 4 fails to create or dispatch).
-        if (!mario_kart && Fsr4Upscaler::IsWanted(device)) {
+        if (profile == Profile::Ocarina && Fsr4Upscaler::IsWanted(device)) {
             try {
                 fsr4 = std::make_unique<Fsr4Upscaler>(device, scheduler, allocator);
             } catch (const vk::Exception& error) {
@@ -746,7 +757,7 @@ struct OcarinaUpscaler::Impl {
     ComputePassDescriptorQueue& queue;
     MemoryAllocator& allocator;
     DescriptorPool& pool;
-    const bool mario_kart;
+    const Profile profile;
 #ifdef EGLANTINE_STREAMLINE
     std::unique_ptr<StreamlineDlssUpscaler> dlss;
 #endif
@@ -787,6 +798,7 @@ struct OcarinaUpscaler::Impl {
     OcarinaColorPass output_pass;
     std::array<std::unique_ptr<OcarinaFrameSlot>, 4> slots;
     std::optional<u64> last_frame;
+    VkExtent2D last_extent{};
     Matrix last_view_projection{};
     vk::Image mkw_scene;
     vk::ImageView mkw_scene_view;
@@ -828,8 +840,8 @@ struct OcarinaUpscaler::Impl {
 OcarinaUpscaler::OcarinaUpscaler(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
                                ComputePassDescriptorQueue& queue, MemoryAllocator& allocator,
                                StagingBufferPool& staging, VideoCommon::OcarinaUpscaleBackend backend,
-                               bool mario_kart)
-    : impl{std::make_unique<Impl>(device, scheduler, pool, queue, allocator, staging, backend, mario_kart)} {}
+                               Profile profile)
+    : impl{std::make_unique<Impl>(device, scheduler, pool, queue, allocator, staging, backend, profile)} {}
 
 OcarinaUpscaler::~OcarinaUpscaler() = default;
 
@@ -1027,8 +1039,11 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                             const Matrix& current, const Matrix& previous,
                             const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame,
                             std::array<f32, 2> jitter, VkFormat depth_format,
-                            std::optional<VideoCommon::TemporalCameraConstants> camera) {
+                            std::optional<VideoCommon::TemporalCameraConstants> camera,
+                            VkExtent2D depth_allocation_size) {
     auto& state = *impl;
+    const bool bananza = state.profile == Profile::Bananza;
+    const bool mario_kart = state.profile == Profile::MarioKart;
     if (state.last_frame == frame || state.Failed()) {
         return false;
     }
@@ -1045,7 +1060,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         return false;
     }
     if (!*slot || (*slot)->extent.width != extent.width || (*slot)->extent.height != extent.height) {
-        *slot = std::make_unique<OcarinaFrameSlot>(state.device, state.allocator, extent);
+        *slot = std::make_unique<OcarinaFrameSlot>(state.device, state.allocator, extent, bananza);
     }
     auto& resources = **slot;
     const VkSampler sampler = state.PointSampler();
@@ -1119,11 +1134,15 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .depth_inverted = false,
             .hdr = false,
             .camera = camera,
+            .bananza_dynamic = bananza,
+            .depth_allocation_size = depth_allocation_size,
         })) {
         state.scheduler.InvalidateState();
         return false;
     }
 #endif
+    const bool bananza_fsr_resize = bananza && state.fsr &&
+        (extent.width != state.last_extent.width || extent.height != state.last_extent.height);
     bool used_fsr4 = false;
     if (state.UsesFsr4()) {
         const auto now = std::chrono::steady_clock::now();
@@ -1167,7 +1186,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         const f32 sharpness = FSR::RcasSharpnessFromStops(
             static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
         // Taking over from FSR 4: FSR 3.1 has no history of the frames FSR 4 drew.
-        const bool fsr_reset = reset || elapsed > 250.0f || state.output_fsr4;
+        const bool fsr_reset = reset || elapsed > 250.0f || state.output_fsr4 || bananza_fsr_resize;
         state.fsr->Upscale({
             .color = *resources.color_view,
             .depth = depth,
@@ -1183,8 +1202,8 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .reactive_mask = bias_view,
             .transparency_mask = bias_view,
             .vertical_fov = 2.0f * std::atan(1.0f / projection_y),
-            .camera_near = state.mario_kart ? 1.0f : 0.1f,
-            .camera_far = state.mario_kart ? 10000.0f : 25000.0f,
+            .camera_near = bananza && camera ? camera->near_plane : mario_kart ? 1.0f : 0.1f,
+            .camera_far = bananza && camera ? camera->far_plane : mario_kart ? 10000.0f : 25000.0f,
         });
         state.last_evaluation = now;
         static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
@@ -1192,7 +1211,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             LOG_INFO(Render_Vulkan,
                      "{} FSR 3.1 evaluated frame={} {}x{} -> {}x{} reset={} effects={} "
                      "jitter=({:.3f},{:.3f})",
-                     state.mario_kart ? "Mario Kart World temporal:" : "Ocarina",
+                     bananza ? "Bananza temporal:" : mario_kart ? "Mario Kart World temporal:" : "Ocarina",
                      frame, extent.width, extent.height, output_extent.width, output_extent.height,
                      fsr_reset, bias_view != VK_NULL_HANDLE, jitter[0], jitter[1]);
         }
@@ -1201,7 +1220,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     // A resize can submit the inputs before recording evaluation, so keep the later tick.
     resources.tick = state.scheduler.CurrentTick();
     if (target) {
-        state.queue.Acquire(state.scheduler, state.mario_kart ? 4 : 2);
+        state.queue.Acquire(state.scheduler, mario_kart ? 4 : 2);
         const bool same_size = output_extent.width == target_extent.width &&
                                output_extent.height == target_extent.height;
         const auto output_sampler = same_size ? sampler : state.LinearSampler();
@@ -1209,16 +1228,17 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         state.queue.AddImage(target);
         const auto* descriptors = state.queue.UpdateData();
         const void* fallback = nullptr;
-        if (state.mario_kart) {
+        if (mario_kart) {
             state.queue.AddSampledImage(color, sampler);
             state.queue.AddImage(target);
             fallback = descriptors + 2;
         }
         state.output_pass.RecordOutput(state.scheduler, descriptors, *this,
-                                        target_extent, frame, reset, fallback);
+                                        target_extent, frame, reset || bananza_fsr_resize, fallback, bananza);
     }
     state.scheduler.InvalidateState();
     state.last_frame = frame;
+    state.last_extent = extent;
     state.last_view_projection = current;
     return true;
 }
@@ -1245,6 +1265,18 @@ VideoCommon::OcarinaUpscaleBackend ResolveMarioKartUpscaler(const Device& device
 #endif
     const auto backend = VideoCommon::SelectMarioKartUpscaler(
         Settings::NvidiaDlssEnabled(), dlss_available, value ? value : "");
+    return backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)
+        ? VideoCommon::OcarinaUpscaleBackend::Native : backend;
+}
+
+VideoCommon::OcarinaUpscaleBackend ResolveBananzaUpscaler(const Device& device) {
+    const char* override = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    bool dlss_available = false;
+#ifdef EGLANTINE_STREAMLINE
+    dlss_available = Streamline::IsDlssAvailable();
+#endif
+    const auto backend = VideoCommon::SelectBananzaUpscaler(
+        Settings::NvidiaDlssEnabled(), dlss_available, override ? override : "");
     return backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)
         ? VideoCommon::OcarinaUpscaleBackend::Native : backend;
 }
