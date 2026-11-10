@@ -3426,6 +3426,8 @@ u64 SpirvSettingsStamp() {
             << 17;
     bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
     bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
+    // Translation revision: global atomics and dynamic per-tap gathers changed.
+    bits |= u64{2} << 32;
     return bits;
 }
 
@@ -4643,7 +4645,8 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
     // NX2KEPT5 (v5.6): F32->S32 conversions saturate in range (zortos293/Lichii#1051), and the
     // fragment output masks are kept with the infos (Fritchii #29, AMD horizon rainbow).
-    return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+    // NX2KEPT6: updated global atomic routing, register shadowing and per-tap gathers.
+    return fmt::format("{}kept NX2KEPT6 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
