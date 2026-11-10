@@ -20,7 +20,7 @@ void SetOtherBuildValues(Settings::Values& values) {
     values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
     values.scaling_filter.SetValue(Settings::ScalingFilter::Fsr3);
     values.resolution_setup.SetValue(Settings::ResolutionSetup::Res2X);
-    values.anti_aliasing.SetValue(Settings::AntiAliasing::None);
+    values.anti_aliasing.SetValue(Settings::AntiAliasing::Fxaa);
     values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Accurate);
     values.use_disk_shader_cache.SetValue(false);
     values.use_vulkan_driver_pipeline_cache.SetValue(false);
@@ -40,7 +40,7 @@ void CheckFriztiValues(const Settings::Values& values) {
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
     CHECK(values.resolution_setup.GetValue() == Settings::ResolutionSetup::Res1X);
-    CHECK(values.anti_aliasing.GetValue() == Settings::AntiAliasing::Fxaa);
+    CHECK(values.anti_aliasing.GetValue() == Settings::AntiAliasing::None);
     CHECK(values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Auto);
     CHECK(values.use_disk_shader_cache.GetValue());
     CHECK(values.use_vulkan_driver_pipeline_cache.GetValue());
