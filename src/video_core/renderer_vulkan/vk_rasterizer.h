@@ -21,6 +21,7 @@
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/temporal_camera.h"
+#include "video_core/mkw_hudless.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -263,6 +264,8 @@ private:
     void FrameDumpPass(const Framebuffer* framebuffer);
     bool MarioKartTemporalEnabled();
     void TrackMarioKartCamera();
+    bool MarioKartHudlessEnabled() const;
+    void TrackMarioKartPresent(const GraphicsPipeline& pipeline, bool indexed, bool indirect, u32 instances);
     void UpdateMarioKartJitter();
     bool TryMarioKartUpscale(const GraphicsPipeline& pipeline, bool is_indexed, bool is_indirect,
                               u32 instance_count);
@@ -326,6 +329,10 @@ private:
     std::optional<VideoCommon::OcarinaUpscaleBackend> mkw_backend;
     std::unique_ptr<class OcarinaUpscaler> mkw_upscaler;
     std::optional<u64> mkw_temporal_frame;
+    VideoCommon::MarioKartHudlessScene mkw_hudless;
+    VkImage mkw_hudless_source{};
+    VkImage mkw_hudless_present{};
+    const char* mkw_hudless_reason{};
     bool mkw_failed{};
     bool mkw_logged{};
     const char* mkw_fallback_reason{};

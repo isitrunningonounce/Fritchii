@@ -6,6 +6,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/mkw_upscale.h"
+#include "video_core/mkw_hudless.h"
+#include "video_core/renderer_vulkan/present/present_push_constants.h"
+#include "video_core/vulkan_common/streamline.h"
 
 namespace {
 
@@ -347,4 +350,148 @@ TEST_CASE("MKW FG camera validation tolerates distant-world float rounding", "[v
     SECTION("A mismatched far-away pose still fails") { camera->camera_to_world[3] += 1000.0f; }
     SECTION("Linear checks remain tight") { camera->camera_to_world[0] += 0.01f; }
     CHECK_FALSE(VideoCommon::MakeMarioKartTemporalCamera(*camera, 2560, 1440));
+}
+
+namespace {
+using std::pow;
+#include "video_core/host_shaders/mkw_hudless_srgb.glsl"
+} // namespace
+
+TEST_CASE("MKW HUD-less recognizes the captured final copy", "[video_core][mkw]") {
+    using VideoCore::Surface::PixelFormat;
+    const VideoCommon::MarioKartBlendImage scene{0x8122aff000, PixelFormat::B10G11R11_FLOAT, 2560, 1440};
+    VideoCommon::MarioKartHudlessScene saved{2910, scene};
+    auto source = scene;
+    VideoCommon::MarioKartBlendImage target{0x2109d23000, PixelFormat::A8B8G8R8_SRGB, 3840, 2160};
+    u64 frame = 2910, vertex = VideoCommon::MarioKartPresentVertex;
+    u64 fragment = VideoCommon::MarioKartPresentFragment;
+    u32 elements = 6, instances = 1;
+    REQUIRE(saved.MatchCopy(frame, vertex, fragment, elements, instances, source, target));
+    SECTION("Previous scene") { ++frame; }
+    SECTION("Different scene allocation") { ++source.identity; }
+    SECTION("Different vertex shader") { ++vertex; }
+    SECTION("Different fragment shader") { ++fragment; }
+    SECTION("Only one triangle") { elements = 3; }
+    SECTION("No actual work") { instances = 0; }
+    SECTION("Instanced copy") { instances = 2; }
+    SECTION("Unencoded destination") { target.format = PixelFormat::A8B8G8R8_UNORM; }
+    SECTION("Copy is scaled") { source.width = 1920; }
+    SECTION("Scene does not fit") { target.height = 1080; }
+    CHECK_FALSE(saved.MatchCopy(frame, vertex, fragment, elements, instances, source, target));
+}
+
+TEST_CASE("MKW HUD-less never associates another present or frame", "[video_core][mkw]") {
+    VideoCommon::MarioKartHudlessScene saved{
+        2910, {0x8122aff000, VideoCore::Surface::PixelFormat::B10G11R11_FLOAT, 2560, 1440}};
+    CHECK_FALSE(saved.MatchesPresent(2910, 0));
+    saved.present = 0x2109d23000;
+    CHECK(saved.MatchesPresent(2910, 0x2109d23000));
+    CHECK_FALSE(saved.MatchesPresent(2911, 0x2109d23000));
+    CHECK_FALSE(saved.MatchesPresent(2910, 0x210bd03000));
+    saved.present = 0;
+    CHECK_FALSE(saved.MatchesPresent(2910, 0x2109d23000));
+}
+
+TEST_CASE("MKW HUD-less supports only reproducible presentation", "[video_core][mkw]") {
+    Tegra::FramebufferConfig config{};
+    config.width = 3840;
+    config.height = 2160;
+    config.crop_rect = {0, 0, 2560, 1440};
+    config.blending = Tegra::BlendMode::Opaque;
+    size_t layers = 1;
+    bool effects = false, temporal = false;
+    REQUIRE(VideoCommon::CanComposeMarioKartHudless(config, 2560, 1440, layers, effects, temporal));
+    SECTION("Extra layer") { layers = 2; }
+    SECTION("Real post effect") { effects = true; }
+    SECTION("Temporal presentation filter") { temporal = true; }
+    SECTION("Blended layer") { config.blending = Tegra::BlendMode::Coverage; }
+    SECTION("Rotation") { config.transform_flags = Service::android::BufferTransformFlags::Rotate90; }
+    SECTION("Crop includes guest padding") { config.crop_rect.right = 2561; }
+    SECTION("Empty crop defaults to full padded allocation") { config.crop_rect = {}; }
+    CHECK_FALSE(VideoCommon::CanComposeMarioKartHudless(config, 2560, 1440, layers, effects, temporal));
+}
+
+TEST_CASE("MKW HUD-less shares crop flip and letterbox coordinates", "[video_core][mkw]") {
+    Tegra::FramebufferConfig config{};
+    config.width = 3840;
+    config.height = 2160;
+    config.crop_rect = {0, 0, 2560, 1440};
+    const Common::Rectangle<u32> screen{240, 135, 3600, 2025};
+    for (const auto flags : {Service::android::BufferTransformFlags::Unset,
+                            Service::android::BufferTransformFlags::FlipH,
+                            Service::android::BufferTransformFlags::FlipV,
+                            Service::android::BufferTransformFlags::Rotate180}) {
+        config.transform_flags = flags;
+        REQUIRE(VideoCommon::CanComposeMarioKartHudless(config, 2560, 1440, 1, false, false));
+        const auto crop = Tegra::NormalizeCrop(config, 3840, 2160);
+        const auto vertices = Vulkan::MakeScreenVertices(screen, crop);
+        CHECK((vertices[0].position == std::array<f32, 2>{240, 135}));
+        CHECK((vertices[3].position == std::array<f32, 2>{3600, 2025}));
+        const bool flip_h = (static_cast<u32>(flags) & 1) != 0;
+        const bool flip_v = (static_cast<u32>(flags) & 2) != 0;
+        CHECK(vertices[0].tex_coord[0] == (flip_h ? 2.0f / 3 : 0));
+        CHECK(vertices[3].tex_coord[0] == (flip_h ? 0 : 2.0f / 3));
+        CHECK(vertices[0].tex_coord[1] == (flip_v ? 2.0f / 3 : 0));
+        CHECK(vertices[3].tex_coord[1] == (flip_v ? 0 : 2.0f / 3));
+    }
+}
+
+TEST_CASE("MKW HUD-less shader encoding matches captured present bytes", "[video_core][mkw]") {
+    // Exact B10G11R11 samples and corresponding pass119 bytes in captured frame2910.
+    struct Sample { std::array<f32, 3> linear; std::array<u8, 3> encoded; };
+    const std::array samples{
+        Sample{{0.197265625f, 0.7421875f, 0.828125f}, {123, 224, 235}},
+        Sample{{0.181640625f, 0.193359375f, 0.1484375f}, {118, 122, 108}},
+        Sample{{0.072265625f, 0.0673828125f, 0.0556640625f}, {76, 74, 67}},
+        Sample{{0.328125f, 0.30078125f, 0.24609375f}, {155, 149, 136}},
+        Sample{{0.1875f, 0.1640625f, 0.115234375f}, {120, 113, 95}},
+        Sample{{0.109375f, 0.1484375f, 0.1328125f}, {93, 108, 102}},
+    };
+    for (const auto& sample : samples) {
+        for (size_t channel = 0; channel < 3; ++channel) {
+            const auto encoded = std::lround(MarioKartHudlessSrgb(sample.linear[channel]) * 255);
+            CHECK(std::abs(encoded - sample.encoded[channel]) <= 1);
+        }
+    }
+    CHECK(MarioKartHudlessSrgb(-1) == 0);
+    CHECK(std::abs(MarioKartHudlessSrgb(2) - 1) < 1e-6);
+    CHECK(std::abs(MarioKartHudlessSrgb(0.0031308f) - 0.0404499f) < 1e-6);
+}
+
+TEST_CASE("MKW HUD-less diagnostic counts pixels and ignores alpha", "[video_core][mkw]") {
+    const std::array<u8, 16> final_color{10, 20, 30, 255, 40, 50, 60, 255,
+                                        70, 80, 90, 255, 255, 0, 0, 255};
+    const std::array<u8, 16> hudless{10, 20, 30, 0, 42, 48, 62, 0,
+                                    70, 83, 90, 255, 0, 0, 0, 255};
+    const auto result = VideoCommon::CompareMarioKartHudless(final_color, hudless);
+    CHECK(result.pixels == 4);
+    CHECK(result.changed == 2);
+    CHECK(result.maximum == 255);
+}
+
+TEST_CASE("MKW HUD-less fence retirement preserves unconsumed resources", "[video_core][mkw]") {
+    using Vulkan::Streamline::FrameGenInputFence;
+    auto semaphore = reinterpret_cast<VkSemaphore>(uintptr_t{0x1234});
+    FrameGenInputFence fence{semaphore, 42, true};
+    size_t waits{};
+    bool consumed = false;
+    const auto wait = [&](VkSemaphore actual, u64 value) {
+        ++waits;
+        CHECK(actual == semaphore);
+        CHECK(value == 42);
+        return consumed;
+    };
+    CHECK_FALSE(fence.Retire(wait));
+    CHECK(fence.pending);
+    CHECK(fence.semaphore == semaphore);
+    CHECK(fence.value == 42);
+    consumed = true;
+    CHECK(fence.Retire(wait));
+    CHECK_FALSE(fence.pending);
+    CHECK(fence.Retire(wait));
+    CHECK(waits == 2);
+    fence = {.pending = true};
+    CHECK_FALSE(fence.Retire(wait));
+    CHECK(fence.pending);
+    CHECK(waits == 2);
 }

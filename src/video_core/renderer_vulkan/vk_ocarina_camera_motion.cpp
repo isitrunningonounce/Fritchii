@@ -13,6 +13,7 @@
 #include "video_core/fsr.h"
 #include "video_core/mkw_upscale.h"
 #include "video_core/host_shaders/mkw_temporal_output_comp_spv.h"
+#include "video_core/host_shaders/mkw_hudless_present_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
@@ -787,6 +788,13 @@ struct OcarinaUpscaler::Impl {
     std::array<std::unique_ptr<OcarinaFrameSlot>, 4> slots;
     std::optional<u64> last_frame;
     Matrix last_view_projection{};
+    vk::Image mkw_scene;
+    vk::ImageView mkw_scene_view;
+    VkExtent2D mkw_scene_extent{};
+    vk::Image mkw_present;
+    vk::ImageView mkw_present_view;
+    VkExtent2D mkw_present_extent{};
+    std::unique_ptr<OcarinaColorPass> mkw_present_pass;
     vk::Image native_scene;
     vk::ImageView native_scene_view;
     vk::Image composite;
@@ -827,6 +835,91 @@ OcarinaUpscaler::~OcarinaUpscaler() = default;
 
 bool OcarinaUpscaler::EvaluationFailed() const {
     return impl->Failed();
+}
+
+void OcarinaUpscaler::SaveMarioKartScene(VkImage color, VkExtent2D extent) {
+    auto& state = *impl;
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    if (!state.mkw_scene || state.mkw_scene_extent.width != extent.width ||
+        state.mkw_scene_extent.height != extent.height) {
+        state.scheduler.Finish();
+        state.mkw_scene_view.reset();
+        constexpr auto format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        state.mkw_scene = CreateOcarinaImage(state.allocator, extent, format,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        state.mkw_scene_view = CreateOcarinaView(state.device, *state.mkw_scene, format);
+        state.mkw_scene_extent = extent;
+    }
+    const VkImage snapshot = *state.mkw_scene;
+    state.scheduler.RecordNamed("Mario Kart World HUD-less scene snapshot",
+        [color, snapshot, extent](vk::CommandBuffer cmd, vk::CommandBuffer) {
+        const std::array before{
+            ProbeBarrier(color, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+            ProbeBarrier(snapshot, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, {}, {}, before);
+        const VkImageCopy copy{
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .extent = {extent.width, extent.height, 1},
+        };
+        cmd.CopyImage(color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snapshot,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+        const std::array after{
+            ProbeBarrier(color, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT |
+                             VK_ACCESS_MEMORY_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+            ProbeBarrier(snapshot, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, {}, {}, after);
+    });
+    state.scheduler.InvalidateState();
+}
+
+void OcarinaUpscaler::MakeMarioKartHudlessPresent(VkExtent2D extent) {
+    auto& state = *impl;
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    if (!state.mkw_present || state.mkw_present_extent.width != extent.width ||
+        state.mkw_present_extent.height != extent.height) {
+        state.scheduler.Finish();
+        state.mkw_present_view.reset();
+        constexpr auto format = VK_FORMAT_R8G8B8A8_UNORM;
+        state.mkw_present = CreateOcarinaImage(state.allocator, extent, format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        state.mkw_present_view = CreateOcarinaView(state.device, *state.mkw_present, format);
+        state.mkw_present_extent = extent;
+    }
+    if (!state.mkw_present_pass) {
+        state.mkw_present_pass = std::make_unique<OcarinaColorPass>(
+            state.device, state.scheduler, state.pool, MKW_HUDLESS_PRESENT_COMP_SPV);
+    }
+    state.queue.Acquire(state.scheduler, 2);
+    state.queue.AddSampledImage(*state.mkw_scene_view, state.PointSampler());
+    state.queue.AddImage(*state.mkw_present_view);
+    state.mkw_present_pass->Record(state.scheduler, state.queue.UpdateData(), *state.mkw_present, extent);
+    state.scheduler.Record([](vk::CommandBuffer cmd) {
+        const VkMemoryBarrier ready{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, ready);
+    });
+    state.scheduler.InvalidateState();
+}
+
+VkImage OcarinaUpscaler::MarioKartHudlessImage() const {
+    return *impl->mkw_present;
+}
+
+VkImageView OcarinaUpscaler::MarioKartHudlessView() const {
+    return *impl->mkw_present_view;
 }
 
 void OcarinaUpscaler::SaveSceneReference(VkImageView color) {

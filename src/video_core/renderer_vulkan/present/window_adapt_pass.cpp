@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/present/window_adapt_pass.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
+#include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -34,7 +35,9 @@ WindowAdaptPass::~WindowAdaptPass() = default;
 void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, Scheduler& scheduler, size_t image_index,
                            std::list<Layer>& layers,
                            std::span<const Tegra::FramebufferConfig> configs,
-                           const Layout::FramebufferLayout& layout, Frame* dst) {
+                           const Layout::FramebufferLayout& layout, Frame* dst,
+                           std::span<const FramebufferTextureInfo> overrides,
+                           FramebufferTextureInfo* first_texture) {
 
     const VkFramebuffer host_framebuffer{*dst->framebuffer};
     const VkRenderPass renderpass{*render_pass};
@@ -65,11 +68,13 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
         }
 
         layer_it->ConfigureDraw(device, &push_constants[i], &descriptor_sets[i], rasterizer, *sampler,
-                                image_index, configs[i], layout);
+                                image_index, configs[i], layout,
+                                overrides.empty() ? nullptr : &overrides[i],
+                                i == 0 ? first_texture : nullptr);
         layer_it++;
     }
 
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+    const auto draw = [=](vk::CommandBuffer cmdbuf) {
         const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
         const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
         const f32 bg_blue = Settings::values.bg_blue.GetValue() / 255.0f;
@@ -104,7 +109,13 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
         }
 
         cmdbuf.EndRenderPass();
-    });
+    };
+    if (overrides.empty()) {
+        scheduler.Record(draw);
+    } else {
+        scheduler.RecordNamed("Mario Kart World HUD-less window composition",
+            [draw](vk::CommandBuffer cmdbuf, vk::CommandBuffer) { draw(cmdbuf); });
+    }
 }
 
 VkDescriptorSetLayout WindowAdaptPass::GetDescriptorSetLayout() {

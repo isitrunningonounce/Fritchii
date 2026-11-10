@@ -41,6 +41,7 @@ enum class AntiAliasing : u32;
 
 namespace Vulkan {
 
+struct FramebufferTextureInfo;
 class AntiAliasPass;
 class Device;
 class MemoryAllocator;
@@ -60,7 +61,9 @@ public:
                        VkDescriptorSet* out_descriptor_set, RasterizerVulkan& rasterizer,
                        VkSampler sampler, size_t image_index,
                        const Tegra::FramebufferConfig& framebuffer,
-                       const Layout::FramebufferLayout& layout);
+                       const Layout::FramebufferLayout& layout,
+                       const FramebufferTextureInfo* source_override = nullptr,
+                       FramebufferTextureInfo* texture_result = nullptr);
 
 private:
     void CreateDescriptorPool(const Device& device);

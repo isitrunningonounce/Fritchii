@@ -39,6 +39,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/game_presets.h"
+#include "common/frame_gen_stats.h"
 #include "video_core/mkw_upscale.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -1004,6 +1005,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
     }
     submitted = true;
+    if (program_id == Settings::MarioKartWorldProgramId && MarioKartHudlessEnabled()) {
+        TrackMarioKartPresent(*pipeline, is_indexed, is_indirect, instance_count);
+    }
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
     const auto hashes = pipeline->ShaderHashes();
@@ -1880,6 +1884,17 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.ResetRenderTargetStats();
     texture_cache.UpdateRenderTargets(true);
+    if (use_color && mkw_hudless.frame == render_trace_frame && mkw_hudless_source) {
+        const auto target = texture_cache.GetRenderTargets().color_buffer_ids[regs.clear_surface.RT];
+        if (target) {
+            const auto image = texture_cache.GetImageView(target).ImageHandle();
+            if (image == mkw_hudless_source || image == mkw_hudless_present) {
+                mkw_hudless = {};
+                mkw_hudless_source = VK_NULL_HANDLE;
+                mkw_hudless_present = VK_NULL_HANDLE;
+            }
+        }
+    }
     clear_targets_ready = std::chrono::steady_clock::now();
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     clear_tc_stats = texture_cache.TakeRenderTargetStats();
@@ -3233,6 +3248,97 @@ void RasterizerVulkan::UpdateMarioKartJitter() {
     }
 }
 
+bool RasterizerVulkan::MarioKartHudlessEnabled() const {
+#ifdef EGLANTINE_STREAMLINE
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MKW_FG_HUDLESS");
+        return !value || value[0] != '0';
+    }();
+    return enabled && program_id == Settings::MarioKartWorldProgramId &&
+           Streamline::IsFrameGenAvailable() &&
+           Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
+void RasterizerVulkan::TrackMarioKartPresent(const GraphicsPipeline& pipeline, bool indexed,
+                                             bool indirect, u32 instances) {
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0]) {
+        return;
+    }
+    const auto& target = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    // Any later draw into the recognized present invalidates the scene-only counterpart.
+    if (mkw_hudless.MatchesPresent(render_trace_frame, target.gpu_addr)) {
+        mkw_hudless.present = 0;
+        mkw_hudless_present = VK_NULL_HANDLE;
+        return;
+    }
+    if (pipeline.ShaderHashes()[5] != VideoCommon::MarioKartPresentFragment ||
+        mkw_hudless.frame != render_trace_frame || !mkw_hudless_source) {
+        return;
+    }
+    const auto reject = [&](const char* reason) {
+        if (mkw_hudless_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Mario Kart World temporal: HUD-less omitted ({})", reason);
+            mkw_hudless_reason = reason;
+        }
+    };
+    const auto sampled = pipeline.SampledImages();
+    if (mesh_draw || indirect || sampled.size() != 1 || sampled[0].stage != 4 || !sampled[0].id ||
+        std::ranges::any_of(targets.color_buffer_ids | std::views::drop(1),
+                           [](auto id) { return static_cast<bool>(id); })) {
+        return reject("unrecognized final-copy bindings");
+    }
+    const auto& source = texture_cache.GetImageView(sampled[0].id);
+    const auto describe = [](const ImageView& image) {
+        return VideoCommon::MarioKartBlendImage{image.gpu_addr, image.format,
+                                               image.size.width, image.size.height};
+    };
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& regs = maxwell3d->regs;
+    const u32 elements = indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
+    if (!mkw_hudless.MatchCopy(render_trace_frame, pipeline.ShaderHashes()[1],
+                              pipeline.ShaderHashes()[5], elements, instances,
+                              describe(source), describe(target)) ||
+        source.ImageHandle() != mkw_hudless_source || source.IsRescaled() || target.IsRescaled() ||
+        source.range != VideoCommon::SubresourceRange{} ||
+        target.range != VideoCommon::SubresourceRange{} ||
+        source.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        !regs.framebuffer_srgb || regs.blend.enable[0] || regs.depth_test_enable) {
+        return reject("unrecognized final-copy images or state");
+    }
+    const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+    const auto scissor = GetScissorState(regs, 0);
+    const f32 top = std::min(viewport.y, viewport.y + viewport.height);
+    if (viewport.x != 0 || top != 0 || viewport.width != source.size.width ||
+        std::abs(viewport.height) != source.size.height || scissor.offset.x != 0 ||
+        scissor.offset.y != 0 || scissor.extent.width < source.size.width ||
+        scissor.extent.height < source.size.height) {
+        return reject("unrecognized final-copy rectangle");
+    }
+    try {
+        mkw_upscaler->MakeMarioKartHudlessPresent({target.size.width, target.size.height});
+        mkw_hudless.present = target.gpu_addr;
+        mkw_hudless_present = target.ImageHandle();
+        if (mkw_hudless_reason || render_trace_frame % 120 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart World temporal: HUD-less guest frame={} scene={}x{} present={}x{} srgb=true",
+                     render_trace_frame, source.size.width, source.size.height,
+                     target.size.width, target.size.height);
+        }
+        mkw_hudless_reason = nullptr;
+    } catch (const vk::Exception& error) {
+        if (!mkw_hudless_reason || std::string_view{mkw_hudless_reason} != "present allocation failed") {
+            LOG_WARNING(Render_Vulkan, "Mario Kart World temporal: HUD-less unavailable ({})", error.what());
+        }
+        mkw_hudless_reason = "present allocation failed";
+        mkw_hudless.present = 0;
+        scheduler.InvalidateState();
+    }
+}
+
 bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, bool is_indexed,
                                            bool is_indirect, u32 instance_count) {
     const auto fail = [&](const char* reason) {
@@ -3247,6 +3353,9 @@ bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, boo
         return fail("no scene camera and depth this frame");
     }
     if (mkw_temporal_frame == render_trace_frame) {
+        mkw_hudless = {};
+        mkw_hudless_source = VK_NULL_HANDLE;
+        mkw_hudless_present = VK_NULL_HANDLE;
         return fail("more than one blend draw this frame");
     }
     const auto& targets = texture_cache.GetRenderTargets();
@@ -3320,6 +3429,22 @@ bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, boo
             return fail("temporal upscaler declined the frame");
         }
         mkw_temporal_frame = render_trace_frame;
+        if (MarioKartHudlessEnabled() &&
+            (target.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            try {
+                mkw_upscaler->SaveMarioKartScene(target.ImageHandle(), extent);
+                mkw_hudless = {render_trace_frame, describe(target), 0};
+                mkw_hudless_source = target.ImageHandle();
+                mkw_hudless_present = VK_NULL_HANDLE;
+            } catch (const vk::Exception& error) {
+                mkw_hudless = {};
+                mkw_hudless_source = VK_NULL_HANDLE;
+                if (!mkw_hudless_reason || std::string_view{mkw_hudless_reason} != "snapshot allocation failed") {
+                    LOG_WARNING(Render_Vulkan, "Mario Kart World temporal: HUD-less snapshot unavailable ({})", error.what());
+                }
+                mkw_hudless_reason = "snapshot allocation failed";
+            }
+        }
         mkw_jitter_scene = {gpu_memory, mkw_motion.depth_address, extent};
         mkw_fallback_reason = nullptr;
         const char* backend = *mkw_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1";
@@ -3981,6 +4106,15 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
             oot_live_failed = true;
             texture_cache_runtime.ocarina_fsr_failed = true; // samplers drop the FSR LOD bias
         }
+    }
+    if (MarioKartHudlessEnabled() && !scaled &&
+        mkw_hudless.MatchesPresent(render_trace_frame, image_view->gpu_addr) &&
+        info.image == mkw_hudless_present &&
+        image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM) {
+        info.hudless_image = mkw_upscaler->MarioKartHudlessImage();
+        info.hudless_view = mkw_upscaler->MarioKartHudlessView();
+        info.hudless_scene_width = mkw_hudless.scene.width;
+        info.hudless_scene_height = mkw_hudless.scene.height;
     }
     return info;
 }

@@ -47,6 +47,10 @@ public:
     [[nodiscard]] bool EvaluationFailed() const;
     /// Save the 1440p temporal scene copy before the game adds its HUD.
     void SaveSceneReference(VkImageView color);
+    void SaveMarioKartScene(VkImage color, VkExtent2D extent);
+    void MakeMarioKartHudlessPresent(VkExtent2D extent);
+    VkImage MarioKartHudlessImage() const;
+    VkImageView MarioKartHudlessView() const;
     /// Composite the HUD from the guest image over the matching 4K scene.
     void Composite4k(VkImageView native_composite, u64 frame);
     /// Copy the scene colour once the fog is drawn, before the glows and particles that have no

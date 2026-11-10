@@ -866,8 +866,36 @@ void* TakeFrameGenToken() {
     return const_cast<sl::FrameToken*>(state.fg_tagged.exchange(nullptr, std::memory_order_acq_rel));
 }
 
+bool WaitFrameGenInputs(FrameGenInputFence& fence) {
+    State& state = GetState();
+    const bool retired = fence.Retire([&](VkSemaphore semaphore, u64 value) {
+        if (!state.started || !state.device || !semaphore || !state.wait_semaphores) {
+            return false;
+        }
+        const VkSemaphoreWaitInfo wait{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &value,
+        };
+        const auto result = state.wait_semaphores(state.device, &wait,
+                                                  fence.timed_out ? 0 : 100'000'000);
+        return result == VK_SUCCESS;
+    });
+    if (!retired) {
+        static std::atomic<bool> warned{};
+        if (!warned.exchange(true)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Mario Kart World temporal: HUD-less inputs fence wait timed out or unavailable; image quarantined");
+        }
+        fence.timed_out = true;
+    }
+    return retired;
+}
+
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
-                           u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent) {
+                           u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent,
+                           const FrameGenHudlessImage* hudless) {
     State& state = GetState();
     if (!IsFrameGenAvailable()) {
         return;
@@ -926,6 +954,32 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &backbuffer, 1, nullptr);
     }
     if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
+        const bool valid_hudless = hudless && hudless->image && hudless->view &&
+            hudless->extent.width == swapchain_extent.width &&
+            hudless->extent.height == swapchain_extent.height && subrect.width && subrect.height &&
+            subrect.left + subrect.width <= swapchain_extent.width &&
+            subrect.top + subrect.height <= swapchain_extent.height;
+        sl::Resource resource{};
+        if (valid_hudless) {
+            resource = {sl::ResourceType::eTex2d, hudless->image, nullptr, hudless->view,
+                        static_cast<u32>(VK_IMAGE_LAYOUT_GENERAL)};
+            resource.width = hudless->extent.width;
+            resource.height = hudless->extent.height;
+            resource.nativeFormat = static_cast<u32>(hudless->format);
+            resource.mipLevels = 1;
+            resource.arrayLayers = 1;
+            resource.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        }
+        sl::ResourceTag tag{valid_hudless ? &resource : nullptr, sl::kBufferTypeHUDLessColor,
+                            sl::ResourceLifecycle::eValidUntilPresent,
+                            valid_hudless ? &subrect : nullptr};
+        const sl::Result result = api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &tag, 1, nullptr);
+        if (state.fg_presents % 120 == 0 || result != sl::Result::eOk) {
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart World temporal: FG HUD-less tagged={} extent={}x{} format={} result={}",
+                     valid_hudless, swapchain_extent.width, swapchain_extent.height,
+                     valid_hudless ? static_cast<u32>(hudless->format) : 0, static_cast<int>(result));
+        }
         const std::array geometry{frame_extent.width, frame_extent.height,
                                   swapchain_extent.width, swapchain_extent.height,
                                   game_left, game_top, game_right, game_bottom,
@@ -945,10 +999,13 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     state.fg_present_begin = std::chrono::steady_clock::now();
 }
 
-void FrameGenAfterPresent(void* token) {
+void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs) {
     State& state = GetState();
     if (!IsFrameGenAvailable() || !token) {
         return;
+    }
+    if (inputs) {
+        *inputs = {.pending = true};
     }
     const Api& api = state.api;
     api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *static_cast<const sl::FrameToken*>(token));
@@ -966,6 +1023,10 @@ void FrameGenAfterPresent(void* token) {
     sl::DLSSGState fg_state{};
     if (api.dlssg_get_state(sl::ViewportHandle{0u}, fg_state, nullptr) != sl::Result::eOk) {
         return;
+    }
+    if (inputs && fg_state.inputsProcessingCompletionFence) {
+        inputs->semaphore = static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence);
+        inputs->value = fg_state.lastPresentInputsProcessingCompletionFenceValue;
     }
     if (fg_state.inputsProcessingCompletionFence) {
         state.fg_inputs_value.store(fg_state.lastPresentInputsProcessingCompletionFenceValue,
