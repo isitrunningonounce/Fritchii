@@ -11,6 +11,10 @@ repository root:
     pwsh tools/release-local.ps1 -Draft      # also push the tag and upload a draft release
     pwsh tools/release-local.ps1 -Publish    # also publish it as the latest release
 
+The release notes are src/yuzu/fritchii/whats-new.md, which the app also shows after the update:
+write and commit this build's notes there first. -Draft and -Publish refuse notes that are empty
+or unchanged since the previous build.
+
 The tag is the build-N already on HEAD, or one past the highest build-N on the remote. It is made
 here when the build starts and pushed only with -Draft or -Publish. The files go to
 build/release-local/<tag>, and a later run for the same tag and commit reuses them, so -Publish
@@ -99,6 +103,33 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 $windowsZip = Join-Path $stage $WindowsAsset
 $linuxFiles = $LinuxAssets | ForEach-Object { Join-Path $stage $_ }
 
+# The notes go under the download links. Like the app (FritchiiUi::CleanReleaseNotes), drop the
+# file's leading comment and a download header above a rule in its first 20 lines.
+$notesSource = 'src/yuzu/fritchii/whats-new.md'
+$lines = (Get-Content (Join-Path $root $notesSource) -Raw -Encoding utf8) -replace '(?s)^\s*<!--.*?-->', '' -split '\r?\n'
+for ($i = 0; $i -lt [math]::Min($lines.Count, 20); $i++) {
+    if ($lines[$i].Trim() -ne '---') { continue }
+    if ((($lines | Select-Object -First $i) -join "`n") -match 'download') {
+        $lines = @($lines | Select-Object -Skip ($i + 1))
+    }
+    break
+}
+$changes = ($lines -join "`n").Trim()
+# The binaries bundle the same file, so stale notes have to be caught before the build.
+$problem = $null
+$previous = $remoteTags.Keys | Where-Object { [int]$_.Substring(6) -lt [int]$number } |
+    Sort-Object { [int]$_.Substring(6) } | Select-Object -Last 1
+if (-not $changes) {
+    $problem = "$notesSource has no notes for this build"
+} elseif ($previous) {
+    git -C $root diff --quiet $remoteTags[$previous] $commit -- $notesSource 2>$null
+    if ($LASTEXITCODE -eq 0) { $problem = "$notesSource is unchanged since $previous" }
+}
+if ($problem) {
+    if ($push) { throw "${problem}: write this build's notes there and commit them first." }
+    Write-Warning "${problem}. A release needs them."
+}
+
 # Files of a finished build carry a stamp with their commit; a build that stopped half way has none.
 function Test-Built([string]$Platform, [string[]]$Files) {
     $stamp = Join-Path $stage "$Platform.commit"
@@ -135,8 +166,9 @@ $branch = (git -C $root branch --show-current).Trim()
 if (-not $branch) { $branch = 'a detached HEAD' } else { $branch = "``$branch``" }
 $base = "https://github.com/$Repo/releases/download/$Tag"
 $notesFile = Join-Path $stage 'notes.md'
+# The update dialog drops everything above the rule, which has to stay within the first 20 lines.
 @"
-Fritchii build $number, from $branch at $commit.
+Fritchii build $number, from $branch at $commit. Download the file for your system:
 
 ## Windows (x86_64)
 
@@ -146,6 +178,10 @@ Fritchii build $number, from $branch at $commit.
 
 - [AppImage]($base/$($LinuxAssets[0])): self-contained, needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). Make it executable (``chmod +x``) and run it.
 - [tar.gz]($base/$($LinuxAssets[1])): uses your system libraries, so Qt 6 and the usual libraries must be installed.
+
+---
+
+$changes
 "@ | Set-Content $notesFile
 
 $files = @($windowsZip) + $linuxFiles
