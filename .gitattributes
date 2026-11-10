@@ -5,3 +5,5 @@ dist/languages/* linguist-vendored
 dist/qt_themes/* linguist-vendored
 externals/* linguist-vendored
 *.h linguist-language=cpp
+# Run by WSL's sh straight from a Windows checkout.
+tools/linux/*.sh text eol=lf

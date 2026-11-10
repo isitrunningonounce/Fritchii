@@ -2,7 +2,9 @@ name: release-binaries
 
 # Started by hand from the Actions tab. It tags the commit build-<run number>, builds Linux x86_64
 # and leaves a draft release. tools/windows/release-pgo.ps1 then builds the Windows zip on the
-# owner's PC from that tag, uploads it and publishes the release.
+# owner's PC from that tag, uploads it and publishes the release. tools/release-local.ps1 makes a
+# whole release on that PC instead; its tags take build numbers too, and a run whose number is
+# already a tag on another commit stops at "Prepare release tag".
 on:
   workflow_dispatch:
     inputs:
