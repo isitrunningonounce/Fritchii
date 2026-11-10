@@ -25,6 +25,7 @@
 #include "common/frame_gen_stats.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -82,6 +83,9 @@ struct State {
     std::chrono::steady_clock::time_point fg_last_present{};
     bool fg_on{};         ///< Present thread from here on
     u32 fg_frames{};      ///< Generated frames per rendered one while on
+    std::optional<std::array<u32, 12>> fg_mkw_geometry;
+    FrameGenUiOptionsState fg_ui;
+    std::optional<std::array<s32, 4>> fg_ui_log;
     u32 fg_max_frames{1}; ///< DLSSGState::numFramesToGenerateMax
     u64 fg_presents{};
     u64 fg_generated_presents{};
@@ -864,8 +868,37 @@ void* TakeFrameGenToken() {
     return const_cast<sl::FrameToken*>(state.fg_tagged.exchange(nullptr, std::memory_order_acq_rel));
 }
 
+bool WaitFrameGenInputs(FrameGenInputFence& fence) {
+    State& state = GetState();
+    const bool retired = fence.Retire([&](VkSemaphore semaphore, u64 value) {
+        if (!state.started || !state.device || !semaphore || !state.wait_semaphores) {
+            return false;
+        }
+        const VkSemaphoreWaitInfo wait{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &value,
+        };
+        const auto result = state.wait_semaphores(state.device, &wait,
+                                                  fence.timed_out ? 0 : 100'000'000);
+        return result == VK_SUCCESS;
+    });
+    if (!retired) {
+        static std::atomic<bool> warned{};
+        if (!warned.exchange(true)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Mario Kart World temporal: HUD-less inputs fence wait timed out or unavailable; image quarantined");
+        }
+        fence.timed_out = true;
+    }
+    return retired;
+}
+
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
-                           u32 game_bottom) {
+                           u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent,
+                           const FrameGenHudlessImage* hudless,
+                           const FrameGenHudlessImage* ui_alpha) {
     State& state = GetState();
     if (!IsFrameGenAvailable()) {
         return;
@@ -874,7 +907,12 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     const bool want_on = token != nullptr;
     const u32 multiplier = Common::FrameGenStats::multiplier.load(std::memory_order_relaxed);
     const u32 frames = want_on ? std::clamp<u32>(multiplier, 2, state.fg_max_frames + 1) - 1 : 0;
-    if (want_on != state.fg_on || frames != state.fg_frames) {
+    const bool mario_kart = Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId;
+    const auto update_options = [&](bool recompose) {
+        if (want_on == state.fg_on && frames == state.fg_frames &&
+            (!mario_kart || !state.fg_ui.NeedsUpdate(recompose))) {
+            return;
+        }
         // Off for frames without a DLSS evaluation (menus, loading): nothing to generate from.
         sl::DLSSGOptions options{};
         options.mode = want_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
@@ -887,7 +925,33 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         options.queueParallelismMode = block && block[0] == '1'
                                            ? sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue
                                            : sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
-        const sl::Result result = api.dlssg_set_options(sl::ViewportHandle{0u}, options);
+        options.enableUserInterfaceRecomposition =
+            recompose ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        sl::Result result = api.dlssg_set_options(sl::ViewportHandle{0u}, options);
+        const auto requested_result = result;
+        const bool applied_recomposition = recompose && result == sl::Result::eOk;
+        if (mario_kart && recompose && result != sl::Result::eOk) {
+            options.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
+            result = api.dlssg_set_options(sl::ViewportHandle{0u}, options);
+        }
+        if (mario_kart) {
+            if (result == sl::Result::eOk) {
+                state.fg_ui.Applied(recompose, applied_recomposition);
+            }
+            const std::array log{static_cast<s32>(recompose), static_cast<s32>(state.fg_ui.active),
+                                 static_cast<s32>(requested_result), static_cast<s32>(result)};
+            if (state.fg_ui_log != log) {
+                state.fg_ui_log = log;
+                LOG_INFO(Render_Vulkan,
+                         "Mario Kart World temporal: FG UI recomposition requested={} active={} "
+                         "option_result={} fallback_result={}",
+                         recompose, state.fg_ui.active, static_cast<int>(requested_result),
+                         static_cast<int>(result));
+            }
+            if (result != sl::Result::eOk) {
+                return;
+            }
+        }
         if (want_on) {
             LOG_INFO(Render_Vulkan, "DLSS Frame Generation on, {}x (result {})", frames + 1,
                      static_cast<int>(result));
@@ -902,6 +966,9 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         state.fg_window_shown = 0;
         state.fg_window_generated = 0;
         state.fg_window_presents = 0;
+    };
+    if (!mario_kart || !token) {
+        update_options(false);
     }
     if (!token) {
         return;
@@ -915,22 +982,111 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         const char* const value = std::getenv("LICHII_DLSS_FG_INSET");
         return value ? static_cast<u32>(std::atoi(value)) : 4u;
     }();
+    sl::Extent subrect{};
     if (game_right > game_left + 2 * inset && game_bottom > game_top + 2 * inset) {
-        const sl::Extent subrect{game_top + inset, game_left + inset,
-                                 game_right - game_left - 2 * inset,
-                                 game_bottom - game_top - 2 * inset};
+        subrect = {game_top + inset, game_left + inset,
+                   game_right - game_left - 2 * inset, game_bottom - game_top - 2 * inset};
         sl::ResourceTag backbuffer{nullptr, sl::kBufferTypeBackbuffer,
                                    sl::ResourceLifecycle::eValidUntilPresent, &subrect};
         api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &backbuffer, 1, nullptr);
+    }
+    if (mario_kart) {
+        const bool valid_hudless = hudless && hudless->image && hudless->view &&
+            hudless->extent.width == swapchain_extent.width &&
+            hudless->extent.height == swapchain_extent.height && subrect.width && subrect.height &&
+            subrect.left + subrect.width <= swapchain_extent.width &&
+            subrect.top + subrect.height <= swapchain_extent.height;
+        sl::Resource resource{};
+        if (valid_hudless) {
+            resource = {sl::ResourceType::eTex2d, hudless->image, nullptr, hudless->view,
+                        static_cast<u32>(VK_IMAGE_LAYOUT_GENERAL)};
+            resource.width = hudless->extent.width;
+            resource.height = hudless->extent.height;
+            resource.nativeFormat = static_cast<u32>(hudless->format);
+            resource.mipLevels = 1;
+            resource.arrayLayers = 1;
+            resource.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT;
+        }
+        sl::ResourceTag tag{valid_hudless ? &resource : nullptr, sl::kBufferTypeHUDLessColor,
+                            sl::ResourceLifecycle::eValidUntilPresent,
+                            valid_hudless ? &subrect : nullptr};
+        const sl::Result result = api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &tag, 1, nullptr);
+        if (state.fg_presents % 120 == 0 || result != sl::Result::eOk) {
+            LOG_INFO(
+                Render_Vulkan,
+                "Mario Kart World temporal: FG HUD-less tagged={} extent={}x{} format={} result={}",
+                valid_hudless && result == sl::Result::eOk, swapchain_extent.width,
+                swapchain_extent.height, valid_hudless ? static_cast<u32>(hudless->format) : 0,
+                static_cast<int>(result));
+        }
+        const bool valid_alpha = valid_hudless && result == sl::Result::eOk && ui_alpha &&
+                                 ui_alpha->image && ui_alpha->view &&
+                                 ui_alpha->format == VK_FORMAT_R8_UNORM &&
+                                 ui_alpha->extent.width == swapchain_extent.width &&
+                                 ui_alpha->extent.height == swapchain_extent.height;
+        sl::Resource alpha_resource{};
+        if (valid_alpha) {
+            alpha_resource = {sl::ResourceType::eTex2d, ui_alpha->image, nullptr, ui_alpha->view,
+                              static_cast<u32>(VK_IMAGE_LAYOUT_GENERAL)};
+            alpha_resource.width = ui_alpha->extent.width;
+            alpha_resource.height = ui_alpha->extent.height;
+            alpha_resource.nativeFormat = static_cast<u32>(ui_alpha->format);
+            alpha_resource.mipLevels = 1;
+            alpha_resource.arrayLayers = 1;
+            alpha_resource.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        }
+        sl::ResourceTag alpha_tag{valid_alpha ? &alpha_resource : nullptr, sl::kBufferTypeUIAlpha,
+                                  sl::ResourceLifecycle::eValidUntilPresent,
+                                  valid_alpha ? &subrect : nullptr};
+        const auto alpha_result =
+            api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &alpha_tag, 1, nullptr);
+        if (valid_alpha && alpha_result != sl::Result::eOk) {
+            sl::ResourceTag clear{nullptr, sl::kBufferTypeUIAlpha,
+                                  sl::ResourceLifecycle::eValidUntilPresent};
+            api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &clear, 1, nullptr);
+        }
+        static const bool recompose = [] {
+            const char* value = std::getenv("EDEN_NX2_MKW_FG_UI_RECOMPOSITION");
+            return value && value[0] == '1';
+        }();
+        const bool alpha_tagged = valid_alpha && alpha_result == sl::Result::eOk;
+        update_options(FrameGenUiOptionsState::Desired(
+            recompose, valid_hudless && result == sl::Result::eOk, alpha_tagged));
+        if (state.fg_presents % 120 == 0 || alpha_result != sl::Result::eOk) {
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart World temporal: FG UI alpha tagged={} extent={}x{} format={} "
+                     "result={} recomposition={}",
+                     alpha_tagged, swapchain_extent.width, swapchain_extent.height,
+                     valid_alpha ? static_cast<u32>(ui_alpha->format) : 0,
+                     static_cast<int>(alpha_result), state.fg_ui.active);
+        }
+        const std::array geometry{frame_extent.width, frame_extent.height,
+                                  swapchain_extent.width, swapchain_extent.height,
+                                  game_left, game_top, game_right, game_bottom,
+                                  subrect.left, subrect.top, subrect.width, subrect.height};
+        if (state.fg_mkw_geometry != geometry) {
+            state.fg_mkw_geometry = geometry;
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart World temporal: FG geometry frame={}x{} swapchain={}x{} "
+                     "game_rect=({},{},{},{}) subrect=({},{},{}x{}) inset={}",
+                     frame_extent.width, frame_extent.height,
+                     swapchain_extent.width, swapchain_extent.height,
+                     game_left, game_top, game_right, game_bottom,
+                     subrect.left, subrect.top, subrect.width, subrect.height, inset);
+        }
     }
     api.pcl_set_marker(sl::PCLMarker::ePresentStart, frame);
     state.fg_present_begin = std::chrono::steady_clock::now();
 }
 
-void FrameGenAfterPresent(void* token) {
+void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs) {
     State& state = GetState();
     if (!IsFrameGenAvailable() || !token) {
         return;
+    }
+    if (inputs) {
+        *inputs = {.pending = true};
     }
     const Api& api = state.api;
     api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *static_cast<const sl::FrameToken*>(token));
@@ -948,6 +1104,10 @@ void FrameGenAfterPresent(void* token) {
     sl::DLSSGState fg_state{};
     if (api.dlssg_get_state(sl::ViewportHandle{0u}, fg_state, nullptr) != sl::Result::eOk) {
         return;
+    }
+    if (inputs && fg_state.inputsProcessingCompletionFence) {
+        inputs->semaphore = static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence);
+        inputs->value = fg_state.lastPresentInputsProcessingCompletionFenceValue;
     }
     if (fg_state.inputsProcessingCompletionFence) {
         state.fg_inputs_value.store(fg_state.lastPresentInputsProcessingCompletionFenceValue,
@@ -1016,6 +1176,9 @@ void Stop() {
     const sl::Result result = state.api.shutdown();
     state.started = false;
     state.attached = false;
+    state.fg_mkw_geometry.reset();
+    state.fg_ui = {};
+    state.fg_ui_log.reset();
     Common::FrameGenStats::active.store(false, std::memory_order_relaxed);
     Common::FrameGenStats::available.store(false, std::memory_order_relaxed);
     // The next game start sets frame generation up again.

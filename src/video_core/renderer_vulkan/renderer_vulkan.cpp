@@ -294,7 +294,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     frame->game_bottom = frame_layout.screen.bottom;
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers, frame_layout,
                                present_manager.SwapchainImageCount(),
-                               swapchain.GetImageViewFormat());
+                               swapchain.GetImageViewFormat(), true);
 
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));

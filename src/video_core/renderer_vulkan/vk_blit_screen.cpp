@@ -8,6 +8,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vulkan/vulkan_core.h>
+#include <cstdlib>
+#include <exception>
+#include "common/frame_gen_stats.h"
+#include "common/game_presets.h"
+#include "common/logging.h"
+#include "video_core/mkw_hudless.h"
+#ifdef HAS_RESHADE
+#include "video_core/post_processing/fx_chain.h"
+#endif
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 #include "common/settings.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/present.h"
@@ -40,6 +52,8 @@ void BlitScreen::WaitIdle(const Device& device) {
 
 void BlitScreen::SetWindowAdaptPass(const Device& device) {
     layers.clear();
+    hudless_layers.clear();
+    hudless_failed = false;
     scaling_filter = filters.get_scaling_filter();
 
     switch (scaling_filter) {
@@ -107,7 +121,7 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
                              std::span<const Tegra::FramebufferConfig> framebuffers,
                              const Layout::FramebufferLayout& layout,
                              size_t current_swapchain_image_count,
-                             VkFormat current_swapchain_view_format) {
+                             VkFormat current_swapchain_view_format, bool prepare_hudless) {
     bool resource_update_required = false;
     bool presentation_recreate_required = false;
 
@@ -156,7 +170,64 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
         }
     }
 
-    window_adapt->Draw(device, rasterizer, scheduler, image_index, layers, framebuffers, layout, frame);
+    bool hudless_wanted = false;
+#ifdef EGLANTINE_STREAMLINE
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MKW_FG_HUDLESS");
+        return !value || value[0] != '0';
+    }();
+    hudless_wanted = prepare_hudless && frame->hudless_available && !hudless_failed && enabled &&
+        Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId &&
+        Streamline::IsFrameGenAvailable() &&
+        Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed);
+#endif
+    frame->hudless_valid = false;
+    FramebufferTextureInfo source;
+    window_adapt->Draw(device, rasterizer, scheduler, image_index, layers, framebuffers, layout, frame,
+                       {}, hudless_wanted ? &source : nullptr);
+    if (hudless_wanted) {
+        bool effects = false;
+#ifdef HAS_RESHADE
+        effects = Settings::values.post_shader_enabled.GetValue() && VideoCore::FxChain::Instance().Size() != 0;
+#endif
+        const bool supported = !framebuffers.empty() && source.hudless_image && source.hudless_view &&
+            VideoCommon::CanComposeMarioKartHudless(framebuffers.front(), source.hudless_scene_width,
+                source.hudless_scene_height, framebuffers.size(), effects,
+                filters.get_scaling_filter() == Settings::ScalingFilter::Fsr3);
+        const char* reason = supported ? nullptr : "missing scene or unsupported layers/crop/effects";
+        if (reason != hudless_reason) {
+            LOG_INFO(Render_Vulkan, "Mario Kart World temporal: HUD-less compositor {}",
+                     reason ? reason : "enabled");
+            hudless_reason = reason;
+        }
+        if (supported) {
+            try {
+                if (!frame->hudless) {
+                    frame->hudless = std::make_unique<Frame>();
+                }
+                if (!frame->hudless->image || frame->hudless->width != layout.width ||
+                    frame->hudless->height != layout.height ||
+                    frame->hudless_format != current_swapchain_view_format || presentation_recreate_required) {
+                    present_manager.RecreateFrame(frame->hudless.get(), layout.width, layout.height,
+                        current_swapchain_view_format, window_adapt->GetRenderPass(), false);
+                    frame->hudless_format = current_swapchain_view_format;
+                }
+                if (hudless_layers.empty()) {
+                    hudless_layers.emplace_back(device, memory_allocator, scheduler, device_memory,
+                        image_count, window_size, window_adapt->GetDescriptorSetLayout(), filters);
+                }
+                source.image = source.hudless_image;
+                source.image_view = source.hudless_view;
+                scheduler.RequestOutsideRenderPassOperationContext();
+                window_adapt->Draw(device, rasterizer, scheduler, image_index, hudless_layers,
+                    framebuffers, layout, frame->hudless.get(), std::span{&source, 1});
+                frame->hudless_valid = true;
+            } catch (const std::exception& error) {
+                hudless_failed = true;
+                LOG_WARNING(Render_Vulkan, "Mario Kart World temporal: HUD-less compositor unavailable ({})", error.what());
+            }
+        }
+    }
 
     if (++image_index >= image_count) {
         image_index = 0;

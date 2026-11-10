@@ -478,7 +478,7 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
     constants.max_render_size = constants.render_size;
     constants.max_upscale_size = constants.upscale_size;
     {
-        const f32 near_plane = CAMERA_NEAR;
+        const f32 near_plane = profile == Profile::OcarinaLdr ? in.camera_near : CAMERA_NEAR;
         const f32 fov = in.vertical_fov;
         const f32 aspect = static_cast<f32>(rw) / static_cast<f32>(rh);
         const f32 cot_half_fov = std::cos(0.5f * fov) / std::sin(0.5f * fov);
@@ -487,7 +487,7 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
         if (profile == Profile::OcarinaLdr) {
             // Vulkan device depth is [0,1], despite the camera's GL [-1,1] clip projection.
             // z_view = near*far / (far - device_depth*(far-near)).
-            constexpr f32 far_plane = 25000.0f;
+            const f32 far_plane = in.camera_far;
             constants.device_to_view_depth[0] = far_plane / (far_plane - near_plane);
             constants.device_to_view_depth[1] = -far_plane * near_plane / (far_plane - near_plane);
         }

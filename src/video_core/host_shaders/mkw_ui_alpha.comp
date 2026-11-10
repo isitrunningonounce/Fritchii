@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "mkw_ui_alpha.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D final_color;
+layout(binding = 1) uniform sampler2D hudless_color;
+layout(binding = 2, r8) uniform writeonly image2D ui_alpha;
+layout(push_constant) uniform Constants { ivec4 game_rect; } constants;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, imageSize(ui_alpha)))) {
+        return;
+    }
+    ivec4 r = constants.game_rect;
+    if (p.x < r.x || p.y < r.y || p.x >= r.z || p.y >= r.w) {
+        imageStore(ui_alpha, p, vec4(0.0));
+        return;
+    }
+    vec3 ca = texelFetch(final_color, p, 0).rgb;
+    vec3 cb = texelFetch(hudless_color, p, 0).rgb;
+    ivec3 a = ivec3(MkwEncodedByte(ca.r), MkwEncodedByte(ca.g), MkwEncodedByte(ca.b));
+    ivec3 b = ivec3(MkwEncodedByte(cb.r), MkwEncodedByte(cb.g), MkwEncodedByte(cb.b));
+    bool ui = MkwUiAlphaPixel(p.x, p.y, r.x, r.y, r.z, r.w,
+                             a.r, a.g, a.b, b.r, b.g, b.b);
+    imageStore(ui_alpha, p, vec4(ui ? 1.0 : 0.0));
+}

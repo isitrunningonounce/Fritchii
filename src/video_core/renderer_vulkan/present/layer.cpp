@@ -91,9 +91,15 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
                           VkDescriptorSet* out_descriptor_set, RasterizerVulkan& rasterizer,
                           VkSampler sampler, size_t image_index,
                           const Tegra::FramebufferConfig& framebuffer,
-                          const Layout::FramebufferLayout& layout) {
-    const auto texture_info = rasterizer.AccelerateDisplay(
-        framebuffer, framebuffer.address + framebuffer.offset, framebuffer.stride);
+                          const Layout::FramebufferLayout& layout,
+                          const FramebufferTextureInfo* source_override,
+                          FramebufferTextureInfo* texture_result) {
+    const auto texture_info = source_override ? std::optional{*source_override} :
+        rasterizer.AccelerateDisplay(framebuffer, framebuffer.address + framebuffer.offset,
+                                    framebuffer.stride);
+    if (texture_result) {
+        *texture_result = texture_info.value_or(FramebufferTextureInfo{});
+    }
     const u32 texture_width = texture_info ? texture_info->width : framebuffer.width;
     const u32 texture_height = texture_info ? texture_info->height : framebuffer.height;
     const u32 scaled_width = texture_info ? texture_info->scaled_width : texture_width;
@@ -103,7 +109,17 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
         (framebuffer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
 
-    RefreshResources(device, framebuffer);
+    if (source_override) {
+        if (raw_width != framebuffer.width || raw_height != framebuffer.height) {
+            ReleaseRawImages();
+            anti_alias.emplace<std::monostate>();
+            raw_width = framebuffer.width;
+            raw_height = framebuffer.height;
+        }
+        resource_ticks.resize(image_count);
+    } else {
+        RefreshResources(device, framebuffer);
+    }
     SetAntiAliasPass(device);
 #ifdef HAS_RESHADE
     SetPostProcessPass(device, is_applet);
@@ -312,17 +328,7 @@ void Layer::SetMatrixData(const Device& device, PresentPushConstants& data, cons
 }
 
 void Layer::SetVertexData(const Device& device, PresentPushConstants& data, const Layout::FramebufferLayout& layout, const Common::Rectangle<f32>& crop) const {
-    // Map the coordinates to the screen.
-    const auto& screen = layout.screen;
-    const auto x = f32(screen.left);
-    const auto y = f32(screen.top);
-    const auto w = f32(screen.GetWidth());
-    const auto h = f32(screen.GetHeight());
-
-    data.vertices[0] = ScreenRectVertex(x, y, crop.left, crop.top);
-    data.vertices[1] = ScreenRectVertex(x + w, y, crop.right, crop.top);
-    data.vertices[2] = ScreenRectVertex(x, y + h, crop.left, crop.bottom);
-    data.vertices[3] = ScreenRectVertex(x + w, y + h, crop.right, crop.bottom);
+    data.vertices = MakeScreenVertices(layout.screen, crop);
 }
 
 void Layer::UpdateDescriptorSet(const Device& device, VkImageView image_view, VkSampler sampler, size_t image_index) {

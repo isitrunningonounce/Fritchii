@@ -48,6 +48,9 @@ struct FramebufferTextureInfo {
     u32 scaled_height{};
     bool already_upscaled{};
     bool anti_aliased{};
+    VkImage hudless_image{};
+    VkImageView hudless_view{};
+    u32 hudless_scene_width{}, hudless_scene_height{};
 };
 
 class BlitScreen {
@@ -60,7 +63,7 @@ public:
     void DrawToFrame(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
                      std::span<const Tegra::FramebufferConfig> framebuffers,
                      const Layout::FramebufferLayout& layout, size_t current_swapchain_image_count,
-                     VkFormat current_swapchain_view_format);
+                     VkFormat current_swapchain_view_format, bool prepare_hudless = false);
 
     void PrepareFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
 
@@ -86,6 +89,9 @@ private:
     Settings::ScalingFilter scaling_filter{};
     std::unique_ptr<WindowAdaptPass> window_adapt{};
     std::list<Layer> layers{};
+    std::list<Layer> hudless_layers{};
+    const char* hudless_reason{"not initialized"};
+    bool hudless_failed{};
 };
 
 } // namespace Vulkan
