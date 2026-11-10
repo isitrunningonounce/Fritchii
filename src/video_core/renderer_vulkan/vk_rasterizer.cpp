@@ -3279,13 +3279,43 @@ void RasterizerVulkan::TrackMarioKartPresent(const GraphicsPipeline& pipeline, b
         mkw_hudless.frame != render_trace_frame || !mkw_hudless_source) {
         return;
     }
+    const auto sampled = pipeline.SampledImages();
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& regs = maxwell3d->regs;
+    const u32 elements = indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
+    const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+    const auto scissor = GetScissorState(regs, 0);
     const auto reject = [&](const char* reason) {
         if (mkw_hudless_reason != reason) {
-            LOG_INFO(Render_Vulkan, "Mario Kart World temporal: HUD-less omitted ({})", reason);
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart World temporal: HUD-less omitted ({}) frame={} "
+                     "vertex={:016x} fragment={:016x} mesh={} indirect={} indexed={} "
+                     "elements={} instances={} sampled={} first_stage={} first_valid={} targets={} "
+                     "srgb={} blend={} depth={} viewport=({},{},{}x{}) scissor=({},{},{}x{})",
+                     reason, render_trace_frame, pipeline.ShaderHashes()[1], pipeline.ShaderHashes()[5],
+                     mesh_draw, indirect, indexed, elements, instances, sampled.size(),
+                     sampled.empty() ? ~0u : sampled[0].stage,
+                     !sampled.empty() && static_cast<bool>(sampled[0].id),
+                     std::ranges::count_if(targets.color_buffer_ids, [](auto id) { return static_cast<bool>(id); }),
+                     regs.framebuffer_srgb, regs.blend.enable[0], regs.depth_test_enable,
+                     viewport.x, viewport.y, viewport.width, viewport.height,
+                     scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height);
+            if (!sampled.empty() && sampled[0].id) {
+                const auto& source = texture_cache.GetImageView(sampled[0].id);
+                LOG_INFO(Render_Vulkan,
+                         "Mario Kart World temporal: HUD-less copy source={:#x} format={} {}x{} "
+                         "target={:#x} format={} {}x{} expected_source={:#x} {}x{} "
+                         "source_handle_match={} rescaled=({},{}) samples=({},{}) base_ranges=({},{})",
+                         source.gpu_addr, static_cast<u32>(source.format), source.size.width, source.size.height,
+                         target.gpu_addr, static_cast<u32>(target.format), target.size.width, target.size.height,
+                         mkw_hudless.scene.identity, mkw_hudless.scene.width, mkw_hudless.scene.height,
+                         source.ImageHandle() == mkw_hudless_source, source.IsRescaled(), target.IsRescaled(),
+                         static_cast<u32>(source.Samples()), static_cast<u32>(target.Samples()),
+                         source.range == VideoCommon::SubresourceRange{}, target.range == VideoCommon::SubresourceRange{});
+            }
             mkw_hudless_reason = reason;
         }
     };
-    const auto sampled = pipeline.SampledImages();
     if (mesh_draw || indirect || sampled.size() != 1 || sampled[0].stage != 4 || !sampled[0].id ||
         std::ranges::any_of(targets.color_buffer_ids | std::views::drop(1),
                            [](auto id) { return static_cast<bool>(id); })) {
@@ -3296,9 +3326,6 @@ void RasterizerVulkan::TrackMarioKartPresent(const GraphicsPipeline& pipeline, b
         return VideoCommon::MarioKartBlendImage{image.gpu_addr, image.format,
                                                image.size.width, image.size.height};
     };
-    const auto& draw = maxwell3d->draw_manager.draw_state;
-    const auto& regs = maxwell3d->regs;
-    const u32 elements = indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
     if (!mkw_hudless.MatchCopy(render_trace_frame, pipeline.ShaderHashes()[1],
                               pipeline.ShaderHashes()[5], elements, instances,
                               describe(source), describe(target)) ||
@@ -3309,8 +3336,6 @@ void RasterizerVulkan::TrackMarioKartPresent(const GraphicsPipeline& pipeline, b
         !regs.framebuffer_srgb || regs.blend.enable[0] || regs.depth_test_enable) {
         return reject("unrecognized final-copy images or state");
     }
-    const auto viewport = GetViewportState(device, regs, 0, 1.0f);
-    const auto scissor = GetScissorState(regs, 0);
     const f32 top = std::min(viewport.y, viewport.y + viewport.height);
     if (viewport.x != 0 || top != 0 || viewport.width != source.size.width ||
         std::abs(viewport.height) != source.size.height || scissor.offset.x != 0 ||

@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
+#include "common/game_presets.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #ifdef HAS_LSFG
@@ -701,12 +702,16 @@ void PresentManager::ReportHudlessCheck(Frame* frame) {
     const size_t size = frame->hudless_check_pixels * 4;
     const auto difference = VideoCommon::CompareMarioKartHudless(bytes.first(size), bytes.subspan(size, size));
     LOG_INFO(Render_Vulkan,
-             "Mario Kart World temporal: HUD-less check pre_blit=true extent={}x{} pixels={} differing_over_2_255={} share={:.6f} max_rgb_difference={:.6f}",
-             frame->width, frame->height, difference.pixels, difference.changed,
+             "Mario Kart World temporal: HUD-less check post_blit=true extent={}x{} rect=({},{},{},{}) "
+             "pixels={} differing_over_2_255={} share={:.6f} max_rgb_difference={:.6f}",
+             frame->hudless_check_extent.width, frame->hudless_check_extent.height,
+             frame->hudless_check_rect.left, frame->hudless_check_rect.top,
+             frame->hudless_check_rect.right, frame->hudless_check_rect.bottom, difference.pixels, difference.changed,
              static_cast<double>(difference.changed) / difference.pixels,
              static_cast<double>(difference.maximum) / 255.0);
     frame->hudless_check_pending = false;
     frame->hudless_check.reset();
+    frame->hudless_check_color.reset();
 }
 
 void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, VkExtent2D extent) {
@@ -718,13 +723,12 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
         return;
     }
     const auto format = swapchain.GetImageFormat();
-    const bool matching_extent = extent.width == frame->width && extent.height == frame->height;
-    const bool valid_rect = frame->game_right > frame->game_left && frame->game_bottom > frame->game_top &&
-                           frame->game_right <= frame->width && frame->game_bottom <= frame->height;
+    const auto rect = VideoCommon::MapMarioKartPresentRect(
+        {frame->game_left, frame->game_top, frame->game_right, frame->game_bottom},
+        frame->width, frame->height, extent.width, extent.height, blit_supported);
     const bool byte_color = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ||
                             format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB;
-    const char* reason = !matching_extent ? "frame and swapchain extents differ" :
-                         !valid_rect ? "invalid game rectangle" : !byte_color ? "unsupported format" : nullptr;
+    const char* reason = !rect ? "invalid mapped game rectangle" : !byte_color ? "unsupported format" : nullptr;
     if (reason != hudless_check_reason) {
         LOG_INFO(Render_Vulkan, "Mario Kart World temporal: HUD-less check {}",
                  reason ? reason : "resumed");
@@ -733,10 +737,24 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
     if (reason) {
         return;
     }
-    const u32 width = frame->game_right - frame->game_left;
-    const u32 height = frame->game_bottom - frame->game_top;
+    const u32 width = rect->GetWidth();
+    const u32 height = rect->GetHeight();
     const VkDeviceSize bytes = VkDeviceSize{width} * height * 4;
     try {
+        // The swapchain does not allow transfer reads. Reproduce its exact final blit/copy once.
+        frame->hudless_check_color = memory_allocator.CreateImage({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = {extent.width, extent.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
         frame->hudless_check = memory_allocator.CreateBuffer({
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = bytes * 2,
@@ -744,39 +762,62 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         }, MemoryUsage::Download);
     } catch (const vk::Exception&) {
+        frame->hudless_check_color.reset();
         static bool warned{};
         if (!std::exchange(warned, true)) {
             LOG_WARNING(Render_Vulkan, "Mario Kart World temporal: HUD-less check readback unavailable");
         }
         return;
     }
-    const auto barrier = [](VkImage image, bool before) {
+    const auto barrier = [](VkImage image, VkAccessFlags src, VkAccessFlags dst,
+                            VkImageLayout before, VkImageLayout after) {
         return VkImageMemoryBarrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = before ? VK_ACCESS_MEMORY_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
-            .dstAccessMask = before ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_MEMORY_WRITE_BIT,
-            .oldLayout = before ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .newLayout = before ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+            .srcAccessMask = src,
+            .dstAccessMask = dst,
+            .oldLayout = before,
+            .newLayout = after,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = image,
             .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
         };
     };
-    const std::array before{barrier(*frame->image, true), barrier(*frame->hudless->image, true)};
+    constexpr auto SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    constexpr auto DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    constexpr auto GENERAL = VK_IMAGE_LAYOUT_GENERAL;
+    const std::array before{
+        barrier(*frame->image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, GENERAL, SRC),
+        barrier(*frame->hudless_present, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, GENERAL, SRC),
+        barrier(*frame->hudless_check_color, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED, DST),
+    };
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, {}, {}, before);
+    if (blit_supported) {
+        cmdbuf.BlitImage(*frame->image, SRC, *frame->hudless_check_color, DST,
+            MakeImageBlit(frame->width, frame->height, extent.width, extent.height), VK_FILTER_LINEAR);
+    } else {
+        cmdbuf.CopyImage(*frame->image, SRC, *frame->hudless_check_color, DST,
+            MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
+    }
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        barrier(*frame->hudless_check_color, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, DST, SRC));
     VkBufferImageCopy copy{
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .imageOffset = {static_cast<s32>(frame->game_left), static_cast<s32>(frame->game_top), 0},
+        .imageOffset = {static_cast<s32>(rect->left), static_cast<s32>(rect->top), 0},
         .imageExtent = {width, height, 1},
     };
-    cmdbuf.CopyImageToBuffer(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             *frame->hudless_check, copy);
+    cmdbuf.CopyImageToBuffer(*frame->hudless_check_color, SRC, *frame->hudless_check, copy);
     copy.bufferOffset = bytes;
-    cmdbuf.CopyImageToBuffer(*frame->hudless->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             *frame->hudless_check, copy);
-    const std::array after{barrier(*frame->image, false), barrier(*frame->hudless->image, false)};
+    cmdbuf.CopyImageToBuffer(*frame->hudless_present, SRC, *frame->hudless_check, copy);
+    const std::array after{
+        barrier(*frame->image, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, SRC, GENERAL),
+        barrier(*frame->hudless_present, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, SRC, GENERAL),
+    };
     const VkMemoryBarrier host{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -786,6 +827,8 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                            0, host, {}, after);
     frame->hudless_check_pixels = static_cast<size_t>(bytes / 4);
+    frame->hudless_check_extent = extent;
+    frame->hudless_check_rect = *rect;
     frame->hudless_check_pending = true;
 }
 
@@ -808,7 +851,8 @@ void PresentManager::PrepareHudlessPresent(Frame* frame, VkExtent2D extent) {
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         });
@@ -1069,9 +1113,17 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     void* const frame_gen_token = std::exchange(frame->frame_gen_token, nullptr);
     const Streamline::FrameGenHudlessImage hudless{
         *frame->hudless_present, *frame->hudless_present_view, frame->hudless_present_format, extent};
-    Streamline::FrameGenBeforePresent(frame_gen_token, frame->game_left, frame->game_top,
-                                      frame->game_right, frame->game_bottom,
-                                      {frame->width, frame->height}, extent, copy_hudless ? &hudless : nullptr);
+    Common::Rectangle<u32> game_rect{frame->game_left, frame->game_top, frame->game_right, frame->game_bottom};
+    bool valid_game_rect = true;
+    if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
+        const auto mapped = VideoCommon::MapMarioKartPresentRect(game_rect, frame->width, frame->height,
+                                                                extent.width, extent.height, blit_supported);
+        valid_game_rect = mapped.has_value();
+        game_rect = mapped.value_or(Common::Rectangle<u32>{});
+    }
+    Streamline::FrameGenBeforePresent(frame_gen_token, game_rect.left, game_rect.top,
+                                      game_rect.right, game_rect.bottom, {frame->width, frame->height}, extent,
+                                      copy_hudless && valid_game_rect ? &hudless : nullptr);
 #endif
     try {
         last_present_id = swapchain.Present(render_semaphore);

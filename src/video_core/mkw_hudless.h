@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <span>
 #include "common/common_types.h"
 #include "video_core/mkw_upscale.h"
@@ -14,6 +15,12 @@ namespace VideoCommon {
 
 inline constexpr u64 MarioKartPresentVertex = 0xa11ab97193a0ba8aULL;
 inline constexpr u64 MarioKartPresentFragment = 0x52402d8e8ab55263ULL;
+
+inline bool ShouldTrackMarioKartSampledImages(bool frame_dump, bool mario_kart,
+                                               u64 vertex, u64 fragment) {
+    return frame_dump || (mario_kart && (fragment == MarioKartBlendFragment ||
+        (vertex == MarioKartPresentVertex && fragment == MarioKartPresentFragment)));
+}
 
 struct MarioKartHudlessScene {
     u64 frame{};
@@ -50,6 +57,38 @@ inline bool CanComposeMarioKartHudless(const Tegra::FramebufferConfig& config,
     return crop.left != crop.right && crop.top != crop.bottom &&
            std::min(crop.left, crop.right) >= 0 && std::max(crop.left, crop.right) <= 1 &&
            std::min(crop.top, crop.bottom) >= 0 && std::max(crop.top, crop.bottom) <= 1;
+}
+
+inline std::optional<Common::Rectangle<u32>> MapMarioKartPresentRect(
+    Common::Rectangle<u32> rect, u32 frame_width, u32 frame_height,
+    u32 swapchain_width, u32 swapchain_height, bool blit) {
+    if (!frame_width || !frame_height || !swapchain_width || !swapchain_height ||
+        rect.right <= rect.left || rect.bottom <= rect.top) {
+        return std::nullopt;
+    }
+    rect.left = std::min(rect.left, frame_width);
+    rect.top = std::min(rect.top, frame_height);
+    rect.right = std::min(rect.right, frame_width);
+    rect.bottom = std::min(rect.bottom, frame_height);
+    if (blit) {
+        // Cover the destination pixels touched by the source rectangle; the inset follows this.
+        const auto lower = [](u32 value, u32 source, u32 target) {
+            return static_cast<u32>(u64{value} * target / source);
+        };
+        const auto upper = [](u32 value, u32 source, u32 target) {
+            return static_cast<u32>((u64{value} * target + source - 1) / source);
+        };
+        rect = {lower(rect.left, frame_width, swapchain_width),
+                lower(rect.top, frame_height, swapchain_height),
+                upper(rect.right, frame_width, swapchain_width),
+                upper(rect.bottom, frame_height, swapchain_height)};
+    } else {
+        rect.left = std::min(rect.left, swapchain_width);
+        rect.top = std::min(rect.top, swapchain_height);
+        rect.right = std::min(rect.right, swapchain_width);
+        rect.bottom = std::min(rect.bottom, swapchain_height);
+    }
+    return rect.right > rect.left && rect.bottom > rect.top ? std::optional{rect} : std::nullopt;
 }
 
 struct MarioKartHudlessDifference {

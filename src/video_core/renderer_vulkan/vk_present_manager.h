@@ -16,6 +16,7 @@
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
+#include "common/math_util.h"
 #include "common/polyfill_thread.h"
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -53,6 +54,9 @@ struct Frame {
     bool hudless_valid{};
     bool hudless_available{true};
     vk::Buffer hudless_check;
+    vk::Image hudless_check_color;
+    VkExtent2D hudless_check_extent{};
+    Common::Rectangle<u32> hudless_check_rect{};
     size_t hudless_check_pixels{};
     bool hudless_check_pending{};
     bool storage_capable{};

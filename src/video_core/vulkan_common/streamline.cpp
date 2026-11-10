@@ -968,7 +968,8 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
             resource.nativeFormat = static_cast<u32>(hudless->format);
             resource.mipLevels = 1;
             resource.arrayLayers = 1;
-            resource.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            resource.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT;
         }
         sl::ResourceTag tag{valid_hudless ? &resource : nullptr, sl::kBufferTypeHUDLessColor,
                             sl::ResourceLifecycle::eValidUntilPresent,

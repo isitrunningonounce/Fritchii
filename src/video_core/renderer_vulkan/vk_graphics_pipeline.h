@@ -155,7 +155,7 @@ public:
         VideoCommon::SamplerId sampler;
     };
 
-    /// The last draw's sampled textures, kept for frame dumps and the MKW blend replacement.
+    /// The last draw's sampled textures, for frame dumps and MKW blend/final-copy recognition.
     std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }

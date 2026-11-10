@@ -495,3 +495,57 @@ TEST_CASE("MKW HUD-less fence retirement preserves unconsumed resources", "[vide
     CHECK(fence.pending);
     CHECK(waits == 2);
 }
+
+TEST_CASE("MKW final-copy bindings are tracked without frame dumping", "[video_core][mkw]") {
+    using VideoCommon::ShouldTrackMarioKartSampledImages;
+    using VideoCommon::MarioKartBlendFragment;
+    using VideoCommon::MarioKartPresentFragment;
+    using VideoCommon::MarioKartPresentVertex;
+    CHECK(ShouldTrackMarioKartSampledImages(false, true, MarioKartPresentVertex, MarioKartPresentFragment));
+    CHECK(ShouldTrackMarioKartSampledImages(false, true, 0, MarioKartBlendFragment));
+    CHECK_FALSE(ShouldTrackMarioKartSampledImages(false, false, MarioKartPresentVertex, MarioKartPresentFragment));
+    CHECK_FALSE(ShouldTrackMarioKartSampledImages(false, false, 0, MarioKartBlendFragment));
+    CHECK_FALSE(ShouldTrackMarioKartSampledImages(false, true, MarioKartPresentVertex + 1, MarioKartPresentFragment));
+    CHECK_FALSE(ShouldTrackMarioKartSampledImages(false, true, MarioKartPresentVertex, MarioKartPresentFragment + 1));
+    CHECK(ShouldTrackMarioKartSampledImages(true, false, 0, 0));
+}
+
+TEST_CASE("MKW FG rectangle follows the final image blit or copy", "[video_core][mkw]") {
+    using VideoCommon::MapMarioKartPresentRect;
+    const auto full = MapMarioKartPresentRect({0, 0, 3839, 1986}, 3839, 1986, 3840, 1986, true);
+    REQUIRE(full);
+    CHECK(full->left == 0);
+    CHECK(full->top == 0);
+    CHECK(full->right == 3840);
+    CHECK(full->bottom == 1986);
+    const auto letterbox = MapMarioKartPresentRect({240, 135, 3600, 2025}, 3840, 2160, 2560, 1440, true);
+    REQUIRE(letterbox);
+    CHECK(letterbox->left == 160);
+    CHECK(letterbox->top == 90);
+    CHECK(letterbox->right == 2400);
+    CHECK(letterbox->bottom == 1350);
+    const auto coverage = MapMarioKartPresentRect({1, 1, 3, 3}, 4, 4, 7, 7, true);
+    REQUIRE(coverage);
+    CHECK(coverage->left == 1);
+    CHECK(coverage->top == 1);
+    CHECK(coverage->right == 6);
+    CHECK(coverage->bottom == 6);
+    const auto copy = MapMarioKartPresentRect({240, 135, 3600, 2025}, 3840, 2160, 2560, 1440, false);
+    REQUIRE(copy);
+    CHECK(copy->left == 240);
+    CHECK(copy->top == 135);
+    CHECK(copy->right == 2560);
+    CHECK(copy->bottom == 1440);
+    const auto padded_copy = MapMarioKartPresentRect({0, 0, 3839, 1986}, 3839, 1986, 3840, 1986, false);
+    REQUIRE(padded_copy);
+    CHECK(padded_copy->right == 3839);
+    const auto bounded = MapMarioKartPresentRect({0, 0, 4000, 2200}, 3840, 2160, 2560, 1440, true);
+    REQUIRE(bounded);
+    CHECK(bounded->right == 2560);
+    CHECK(bounded->bottom == 1440);
+    CHECK_FALSE(MapMarioKartPresentRect({1, 0, 1, 4}, 4, 4, 7, 7, true));
+    CHECK_FALSE(MapMarioKartPresentRect({5, 0, 6, 4}, 4, 4, 7, 7, true));
+    CHECK_FALSE(MapMarioKartPresentRect({3, 0, 4, 4}, 4, 4, 2, 2, false));
+    CHECK_FALSE(MapMarioKartPresentRect({0, 0, 4, 4}, 0, 4, 7, 7, true));
+    CHECK_FALSE(MapMarioKartPresentRect({0, 0, 4, 4}, 4, 4, 0, 7, true));
+}
