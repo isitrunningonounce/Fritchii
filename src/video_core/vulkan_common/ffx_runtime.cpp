@@ -187,11 +187,15 @@ std::shared_ptr<const Api> Acquire() {
     auto loaded = std::make_unique<Loaded>();
     loaded->module = module;
     loaded->create_context =
-        reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(module, "ffxCreateContext"));
+        reinterpret_cast<PfnFfxCreateContext>(
+            reinterpret_cast<void*>(GetProcAddress(module, "ffxCreateContext")));
     loaded->destroy_context =
-        reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(module, "ffxDestroyContext"));
-    loaded->query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(module, "ffxQuery"));
-    loaded->dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(module, "ffxDispatch"));
+        reinterpret_cast<PfnFfxDestroyContext>(
+            reinterpret_cast<void*>(GetProcAddress(module, "ffxDestroyContext")));
+    loaded->query =
+        reinterpret_cast<PfnFfxQuery>(reinterpret_cast<void*>(GetProcAddress(module, "ffxQuery")));
+    loaded->dispatch =
+        reinterpret_cast<PfnFfxDispatch>(reinterpret_cast<void*>(GetProcAddress(module, "ffxDispatch")));
     if (!loaded->create_context || !loaded->destroy_context || !loaded->query ||
         !loaded->dispatch) {
         LOG_WARNING(Render_Vulkan, "AMD FSR 4: the FidelityFX loader lacks its exports");

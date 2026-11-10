@@ -51,7 +51,8 @@ bool QueryVideoMemory(double& used_gb, double& left_gb) {
     using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
     static const CreateFactory create = [] {
         const HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
-        return dxgi ? reinterpret_cast<CreateFactory>(GetProcAddress(dxgi, "CreateDXGIFactory1"))
+        return dxgi ? reinterpret_cast<CreateFactory>(
+                          reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
                     : nullptr;
     }();
     if (create == nullptr) {
