@@ -42,25 +42,29 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(Settings::OotAntiAliasing 
     return SelectOcarinaUpscaler(fsr, dlss_enabled && !fsr, dlss_available, override);
 }
 
-/// EDEN_NX2_DLSS_JITTER (boot, 0 = off): DLSS gets the camera jitter and the texture LOD bias
-/// the FSR path uses (a player's request; DLSS is made for jittered input). 1 = the jitter as FSR
-/// gets it, 2 = with its vertical sign flipped (Streamline's convention is unverified here).
+/// DLSS gets the camera jitter and the texture LOD bias the FSR path uses: DLSS is made for
+/// jittered input, and without it a still camera gives it nothing to reconstruct (2026-11-10).
+/// NVIDIA's guide (3.7.3) gives the jitter in render pixels in the motion vectors' direction, as
+/// FSR takes it. EDEN_NX2_DLSS_JITTER (boot): 1 = on (default), 0 = off, 2 = vertical sign
+/// flipped, to check the sign in play (right is sharper, wrong shakes).
 inline int OcarinaDlssJitterMode() {
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_DLSS_JITTER");
-        return value != nullptr ? std::atoi(value) : 0;
+        return value != nullptr && value[0] != '\0' ? std::atoi(value) : 1;
     }();
     return mode;
 }
 
-/// Texture LOD bias added to Ocarina's mipmapped samplers while FSR upscales. AMD recommends
-/// log2(render / output) - 1: -1.58 for docked 1440p -> 4K. With EDEN_NX2_DLSS_JITTER, DLSS gets
-/// NVIDIA's log2(render / output): -0.58.
-inline float OcarinaFsrLodBias(OcarinaUpscaleBackend backend) {
-    if (backend == OcarinaUpscaleBackend::Fsr) {
+/// Texture LOD bias added to Ocarina's mipmapped samplers while FSR or jittered DLSS upscales.
+/// AMD and NVIDIA (DLSS guide 3.5) both recommend log2(render / output) - 1: -1.58 for docked
+/// 1440p -> 4K.
+inline float OcarinaFsrLodBias(OcarinaUpscaleBackend backend,
+                               bool dlss_jitter = OcarinaDlssJitterMode() != 0) {
+    if (backend == OcarinaUpscaleBackend::Fsr ||
+        (backend == OcarinaUpscaleBackend::Dlss && dlss_jitter)) {
         return -1.58f;
     }
-    return backend == OcarinaUpscaleBackend::Dlss && OcarinaDlssJitterMode() != 0 ? -0.58f : 0.0f;
+    return 0.0f;
 }
 
 /// Whether a sampler with that bias keeps it for an image: only docked (handheld isn't measured),

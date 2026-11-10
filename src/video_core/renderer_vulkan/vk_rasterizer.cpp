@@ -3086,13 +3086,14 @@ f32 Halton(u32 index, u32 base) {
 
 void RasterizerVulkan::UpdateOcarinaJitter() {
     std::array<f32, 2> want{};
-    // Only while FSR replaced the previous frame's upscale: a frame the game upscales itself
-    // would show the offset as a shake. Only draws that depth-test against the scene depth at
-    // the scene size, so a depth pre-pass and the colour passes move together; shadow maps,
-    // half-size passes and full-screen passes (which keep the depth bound without using it, as
-    // #678 found, some with depth writes on: with the test off nothing writes depth) stay put.
+    // Only while FSR or DLSS replaced the previous frame's upscale: a frame the game upscales
+    // itself would show the offset as a shake. Only draws that depth-test against the scene
+    // depth at the scene size, so a depth pre-pass and the colour passes move together; shadow
+    // maps, half-size passes and full-screen passes (which keep the depth bound without using
+    // it, as #678 found, some with depth writes on: with the test off nothing writes depth) stay
+    // put.
     const auto& regs = maxwell3d->regs;
-    // FSR, and DLSS with EDEN_NX2_DLSS_JITTER (it is made for jittered input too).
+    // FSR, and DLSS unless EDEN_NX2_DLSS_JITTER=0 (it is made for jittered input too).
     const bool jittered_backend =
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
         (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
@@ -3367,9 +3368,10 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         }
         oot_dlss_frame = render_trace_frame;
         // AMD's jitter phase count for FSR: 8 * (output / render width)^2, so 18 for 1440p -> 4K
-        // and 8 for native AA.
+        // and 8 for native AA. NVIDIA's guide uses the same formula but asks for at least 16.
         const f32 ratio = static_cast<f32>(output_extent.width) / static_cast<f32>(extent.width);
-        oot_jitter_phases = std::max(1U, static_cast<u32>(8.0f * ratio * ratio));
+        const u32 min_phases = oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? 16U : 1U;
+        oot_jitter_phases = std::max(min_phases, static_cast<u32>(8.0f * ratio * ratio));
         oot_fallback_reason = nullptr;
         return true;
     } catch (const vk::Exception& error) {

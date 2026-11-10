@@ -50,9 +50,10 @@ TEST_CASE("OoT FSR texture LOD bias follows the upscaler, the console mode and f
     using enum VideoCommon::OcarinaUpscaleBackend;
     using VideoCommon::KeepOcarinaFsrLodBias;
     using VideoCommon::OcarinaFsrLodBias;
-    CHECK(OcarinaFsrLodBias(Fsr) == -1.58f);
-    CHECK(OcarinaFsrLodBias(Dlss) == 0.0f);
-    CHECK(OcarinaFsrLodBias(Native) == 0.0f);
+    CHECK(OcarinaFsrLodBias(Fsr, false) == -1.58f);
+    CHECK(OcarinaFsrLodBias(Dlss, true) == -1.58f);
+    CHECK(OcarinaFsrLodBias(Dlss, false) == 0.0f);
+    CHECK(OcarinaFsrLodBias(Native, true) == 0.0f);
     CHECK(KeepOcarinaFsrLodBias(true, false, false));
     CHECK_FALSE(KeepOcarinaFsrLodBias(false, false, false));
     CHECK_FALSE(KeepOcarinaFsrLodBias(true, false, true));
