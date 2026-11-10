@@ -124,6 +124,9 @@ struct Fixture {
     std::vector<u32> state_methods;
 
     Fixture() {
+        // The tests write physical pages the kernel never handed out: commit them, as the kernel
+        // does with EDEN_NX2_SEC_RESERVE.
+        physical.buffer.Commit(0, 0x100000);
         slow.fast_maxwell3d = false;
         fast.fast_maxwell3d = true;
         for (auto* engine : {&slow, &fast}) {
