@@ -65,7 +65,7 @@ struct Frame {
     bool storage_capable{};
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
-    void* frame_gen_token{}; ///< DLSS Frame Generation: the frame's Streamline token, if any
+    Streamline::FrameGenSubmission frame_gen;
     /// Where the game image is in the frame (and the swapchain image), for DLSS Frame Generation.
     u32 game_left{}, game_top{}, game_right{}, game_bottom{};
 };

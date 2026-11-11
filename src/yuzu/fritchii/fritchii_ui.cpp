@@ -321,7 +321,7 @@ namespace {
 // Lichii mod: NVIDIA DLSS and its frame generation are set by the launchers' variables, read at
 // every game start. The Graphics menu and the frame generation button change them for the next
 // start of this window (nothing is saved: the launchers keep their own choice).
-enum class DlssMode { Off, To1440, To4K, NativeAA };
+enum class DlssMode { Off, To1440, To4K, NativeAA, Bananza1620 };
 
 std::string Env(const char* name) {
     const char* const value = std::getenv(name);
@@ -334,6 +334,9 @@ DlssMode CurrentDlssMode() {
     }
     if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
         return DlssMode::NativeAA;
+    }
+    if (Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId) {
+        return DlssMode::Bananza1620;
     }
     return Env("LICHII_SKIP_BUILTIN").find("Max Resolution") != std::string::npos
                ? DlssMode::To1440
@@ -533,6 +536,9 @@ QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks) {
         if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
             dlss_modes = {{DlssMode::Off, QObject::tr("Off")},
                           {DlssMode::NativeAA, QObject::tr("Native resolution (DLAA)")}};
+        } else if (Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId) {
+            dlss_modes = {{DlssMode::Off, QObject::tr("Off")},
+                          {DlssMode::Bananza1620, QObject::tr("Dynamic resolution to 1620p")}};
         }
         const QWidget* const owner = button;
         add_choices(

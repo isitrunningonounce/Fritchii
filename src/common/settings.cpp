@@ -27,6 +27,7 @@
 #include "common/assert.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/time_zone.h"
@@ -458,7 +459,12 @@ void UpdateRescalingInfo() {
         }
         return static_cast<ResolutionSetup>(index);
     }();
-    const auto setup = forced.value_or(values.resolution_setup.GetValue());
+    const char* replacement = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    const std::string_view backend = replacement ? replacement : "";
+    const bool bananza_temporal = GetCurrentProgramID() == DonkeyKongBananzaProgramId &&
+        IsDockedMode() && (backend == "fsr" || (backend != "native" && NvidiaDlssEnabled()));
+    const auto setup = forced.value_or(bananza_temporal ? ResolutionSetup::Res1X
+                                                        : values.resolution_setup.GetValue());
     auto& info = values.resolution_info;
     TranslateResolutionInfo(setup, info);
 }

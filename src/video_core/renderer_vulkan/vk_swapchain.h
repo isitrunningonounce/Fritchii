@@ -43,7 +43,7 @@ public:
 
     /// Presents the rendered image to the swapchain. Returns its present id for
     /// vkWaitForPresentKHR, or 0 (no present wait support, or the present failed).
-    u64 Present(VkSemaphore render_semaphore);
+    u64 Present(VkSemaphore render_semaphore, bool* presented = nullptr);
 
     VkSwapchainKHR Handle() const {
         return *swapchain;
