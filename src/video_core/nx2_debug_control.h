@@ -437,6 +437,8 @@ inline void LoadExperiments() {
         g_experiments[55].store(1, std::memory_order_relaxed);
         // 2026-11-10: EXP52 programs-only pipeline lookup test default; numbers still to come.
         g_experiments[52].store(1, std::memory_order_relaxed);
+        // 2026-11-11: EXP22 state delta blocks test default; numbers still to come.
+        g_experiments[22].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
