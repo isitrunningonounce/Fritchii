@@ -65,6 +65,8 @@ struct State {
     std::vector<std::string> fg_device_extensions;
     // Per frame: the token of the latest DLSS evaluation, until a present takes it (worker).
     std::atomic<const sl::FrameToken*> fg_tagged{};
+    std::optional<VkExtent2D> fg_bananza_static_extent; // Vulkan worker
+    bool fg_bananza_static_suspended{};
     bool fg_reflex_set{}; ///< Worker
     bool fg_reflex_on{};  ///< Worker: Reflex set for the player's frame generation switch on
     // eBlockNoClientQueues: frame generation's inputs fence, from the present thread to the worker.
@@ -710,6 +712,14 @@ bool FrameGenWaitsForInputs() {
     return waits;
 }
 
+static bool BananzaFrameGenDynamicResolution() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DKB_FG_DYNAMIC");
+        return !value || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
 void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const sl::Resource& motion,
                  const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle) {
     State& state = GetState();
@@ -743,6 +753,21 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
     if (!user_on) {
         return;
     }
+    const bool bananza_static =
+        !BananzaFrameGenDynamicResolution() &&
+        Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId;
+    if (bananza_static && state.fg_bananza_static_extent) {
+        const auto fixed = *state.fg_bananza_static_extent;
+        if (area.width != fixed.width || area.height != fixed.height) {
+            if (!std::exchange(state.fg_bananza_static_suspended, true)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Bananza temporal: static FG paused at {}x{} (locked to {}x{})",
+                            area.width, area.height, fixed.width, fixed.height);
+            }
+            return;
+        }
+    }
+
     // DLSS-G only runs with Reflex active ("eDLSSGStatusFailReflexNotDetectedAtRuntime - sl.reflex
     // must be enabled and active -1 != frame" without slReflexSleep each frame, or with the low
     // latency mode off, while still reporting two presented frames). Inline on the worker the
@@ -812,6 +837,16 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
                         static_cast<int>(result));
         }
         return;
+    }
+    if (bananza_static) {
+        if (!state.fg_bananza_static_extent) {
+            state.fg_bananza_static_extent = VkExtent2D{area.width, area.height};
+            LOG_INFO(Render_Vulkan, "Bananza temporal: static FG locked to {}x{}",
+                     area.width, area.height);
+        } else if (std::exchange(state.fg_bananza_static_suspended, false)) {
+            LOG_INFO(Render_Vulkan, "Bananza temporal: static FG resumed at {}x{}",
+                     area.width, area.height);
+        }
     }
     state.fg_tagged.store(&frame, std::memory_order_release);
 }
@@ -911,7 +946,7 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     const u64 program_id = Settings::GetCurrentProgramID();
     const bool mario_kart = program_id == Settings::MarioKartWorldProgramId;
     const bool bananza = program_id == Settings::DonkeyKongBananzaProgramId;
-    const bool dynamic_resolution = want_on && bananza;
+    const bool dynamic_resolution = want_on && bananza && BananzaFrameGenDynamicResolution();
     const auto update_options = [&](bool recompose) {
         if (want_on == state.fg_on && frames == state.fg_frames &&
             dynamic_resolution == state.fg_dynamic_resolution &&
@@ -971,6 +1006,14 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         }
         if (bananza && result != sl::Result::eOk) {
             return;
+        }
+        if (bananza && want_on && !state.fg_on) {
+            if (dynamic_resolution) {
+                LOG_INFO(Render_Vulkan, "Bananza temporal: FG dynamic resolution on ({}x{})",
+                         options.dynamicResWidth, options.dynamicResHeight);
+            } else {
+                LOG_INFO(Render_Vulkan, "Bananza temporal: FG dynamic resolution off");
+            }
         }
         state.fg_on = want_on;
         state.fg_frames = frames;
@@ -1201,6 +1244,8 @@ void Stop() {
     state.fg_on = false;
     state.fg_frames = 0;
     state.fg_dynamic_resolution = false;
+    state.fg_bananza_static_extent.reset();
+    state.fg_bananza_static_suspended = false;
     state.fg_tagged.store(nullptr, std::memory_order_relaxed);
     state.fg_inputs_fence.store(VK_NULL_HANDLE, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline stopped (result {})", static_cast<int>(result));
