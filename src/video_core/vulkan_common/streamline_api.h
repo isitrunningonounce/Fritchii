@@ -19,6 +19,8 @@
 
 namespace Vulkan::Streamline {
 
+class FrameGenCopyFence;
+
 struct Api {
     PFun_slInit* init{};
     PFun_slShutdown* shutdown{};
@@ -48,6 +50,7 @@ struct Api {
 /// the next present. eOnlyValidNow has Streamline copy them on cmdbuf; eValidUntilPresent is for
 /// the renderer's own copies.
 void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const sl::Resource& motion,
-                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle);
+                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle,
+                 FrameGenCopyFence* copy_fence = nullptr);
 
 } // namespace Vulkan::Streamline

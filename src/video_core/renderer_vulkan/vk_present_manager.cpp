@@ -250,7 +250,7 @@ void PresentManager::Present(Frame* frame) {
             frame->queued_at = std::chrono::steady_clock::now();
 #ifdef EGLANTINE_STREAMLINE
             // Right after this frame's commands on the worker: its DLSS evaluation's token.
-            frame->frame_gen_token = Streamline::TakeFrameGenToken();
+            frame->frame_gen = Streamline::TakeFrameGenSubmission();
 #endif
             // What ends the present thread's "present: wait for frame" (on the Vulkan worker).
             if (Common::Nx2Timeline::Active()) {
@@ -263,7 +263,7 @@ void PresentManager::Present(Frame* frame) {
     } else {
         scheduler.WaitWorker();
 #ifdef EGLANTINE_STREAMLINE
-        frame->frame_gen_token = Streamline::TakeFrameGenToken();
+        frame->frame_gen = Streamline::TakeFrameGenSubmission();
 #endif
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
@@ -646,6 +646,11 @@ void PresentManager::SetImageCount() {
 }
 
 void PresentManager::DiscardFrame(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    if (const auto fg = std::exchange(frame->frame_gen, {}); fg.copy_fence) {
+        fg.copy_fence->Release();
+    }
+#endif
     static constexpr VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     const VkSemaphore render_ready = *frame->render_ready;
     const VkSubmitInfo submit_info{
@@ -892,7 +897,7 @@ void PresentManager::RecordUiAlpha(Frame* frame, vk::CommandBuffer cmdbuf, VkExt
 }
 
 void PresentManager::PrepareHudlessPresent(Frame* frame, VkExtent2D extent) {
-    if (!frame->hudless_available || !frame->hudless_valid || !frame->frame_gen_token) {
+    if (!frame->hudless_available || !frame->hudless_valid || !frame->frame_gen.token) {
         return;
     }
     const auto format = swapchain.GetImageFormat();
@@ -961,7 +966,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         const char* const value = std::getenv("LICHII_DLSS_FG_PRESENT_WAIT");
         return !value || value[0] != '0';
     }();
-    if (wait_render && frame->frame_gen_token && frame->render_tick != 0) {
+    if (wait_render && frame->frame_gen.token && frame->render_tick != 0) {
         scheduler.GetMasterSemaphore().Wait(frame->render_tick);
     }
 #endif
@@ -988,7 +993,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     frame->ui_alpha_valid = false;
     PrepareHudlessPresent(frame, extent);
     const bool copy_hudless = frame->hudless_available && frame->hudless_valid &&
-                             frame->frame_gen_token && frame->hudless_present;
+                             frame->frame_gen.token && frame->hudless_present;
     const std::array pre_barriers{
         VkImageMemoryBarrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1171,7 +1176,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Present
 #ifdef EGLANTINE_STREAMLINE
-    void* const frame_gen_token = std::exchange(frame->frame_gen_token, nullptr);
+    const auto fg = std::exchange(frame->frame_gen, {});
+    void* const frame_gen_token = fg.token;
     const Streamline::FrameGenHudlessImage hudless{
         *frame->hudless_present, *frame->hudless_present_view, frame->hudless_present_format, extent};
     Common::Rectangle<u32> game_rect{frame->game_left, frame->game_top, frame->game_right, frame->game_bottom};
@@ -1189,8 +1195,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         {frame->width, frame->height}, extent, copy_hudless && valid_game_rect ? &hudless : nullptr,
         frame->ui_alpha_valid && valid_game_rect ? &alpha : nullptr);
 #endif
+    bool presented = false;
     try {
-        last_present_id = swapchain.Present(render_semaphore);
+        last_present_id = swapchain.Present(render_semaphore, &presented);
     } catch (...) {
 #ifdef EGLANTINE_STREAMLINE
         if (copy_hudless) {
@@ -1201,7 +1208,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         throw;
     }
 #ifdef EGLANTINE_STREAMLINE
-    Streamline::FrameGenAfterPresent(frame_gen_token, copy_hudless ? &frame->hudless_fence : nullptr);
+    Streamline::FrameGenAfterPresent(frame_gen_token, copy_hudless ? &frame->hudless_fence : nullptr,
+                                    presented ? fg.copy_fence : nullptr);
 #endif
 }
 

@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/dkb_upscale.h"
+#include "video_core/vulkan_common/streamline.h"
 
 namespace {
 
@@ -266,4 +267,39 @@ TEST_CASE("Bananza recalculates jitter phases for each scene width", "[video_cor
     CHECK(BananzaJitterPhaseCount(2095, true) == 16);
     CHECK(BananzaJitterPhaseCount(2880, true) == 16);
     CHECK(BananzaJitterPhaseCount(1920, true) == 18);
+}
+
+TEST_CASE("Bananza frame generation copy waits for its own present fence", "[video_core][dkb]") {
+    Vulkan::Streamline::FrameGenCopyFence slot;
+    const auto semaphore = reinterpret_cast<VkSemaphore>(uintptr_t{0x1234});
+    u64 completed{};
+    unsigned polls{};
+    const auto wait = [&](VkSemaphore actual, u64 value) {
+        CHECK(actual == semaphore);
+        CHECK(value == 7);
+        ++polls;
+        return completed >= value;
+    };
+
+    CHECK(slot.Ready(wait));
+    slot.Reserve();
+    CHECK_FALSE(slot.Ready(wait));
+    CHECK(polls == 0);
+
+    slot.Release({semaphore, 7, true});
+    CHECK_FALSE(slot.Ready(wait));
+    completed = 7;
+    CHECK(slot.Ready(wait));
+    CHECK(slot.Ready(wait));
+    CHECK(polls == 2);
+
+    slot.Reserve();
+    slot.Release({.pending = true});
+    CHECK_FALSE(slot.Ready(wait));
+    CHECK(polls == 2);
+
+    Vulkan::Streamline::FrameGenCopyFence discarded;
+    discarded.Reserve();
+    discarded.Release();
+    CHECK(discarded.Ready(wait));
 }

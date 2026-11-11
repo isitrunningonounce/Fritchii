@@ -7,7 +7,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,6 +55,7 @@ bool Start();
 /// LICHII_DLSS_FG=1: DLSS Frame Generation is wanted (with Reflex and PCL, which it needs).
 /// LICHII_DLSS_FG_MULTIPLIER=2..6 picks its multiplier, within what the GPU allows.
 [[nodiscard]] bool FrameGenRequested();
+[[nodiscard]] bool BananzaFrameGenOwnCopies();
 
 /// The queues DLSS Frame Generation asks the device for, beyond the renderer's own: compute and
 /// graphics queues in the graphics family (after its first queue), optical flow queues in the
@@ -106,6 +109,37 @@ struct FrameGenInputFence {
     }
 };
 
+class FrameGenCopyFence {
+public:
+    [[nodiscard]] bool Ready();
+    template <typename Wait>
+    bool Ready(Wait&& wait) {
+        return completed.load(std::memory_order_acquire) && fence.Retire(wait);
+    }
+
+    void Reserve() noexcept {
+        completed.store(false, std::memory_order_relaxed);
+    }
+    void Release(FrameGenInputFence result = {}, u64 swapchain_generation = 0) noexcept {
+        fence = result;
+        generation = swapchain_generation;
+        completed.store(true, std::memory_order_release);
+    }
+
+private:
+    std::atomic<bool> completed{true};
+    FrameGenInputFence fence;
+    u64 generation{};
+};
+
+/// Keep SDK-owned completion semaphores from being polled while their swapchain is replaced.
+[[nodiscard]] std::unique_lock<std::mutex> LockFrameGenCopyFencesForSwapchainReset();
+
+struct FrameGenSubmission {
+    void* token{};
+    FrameGenCopyFence* copy_fence{};
+};
+
 struct FrameGenUiOptionsState {
     std::optional<bool> requested;
     bool active{};
@@ -134,14 +168,15 @@ bool WaitFrameGenInputs(FrameGenInputFence& fence);
 /// Frame generation per presented frame. The present manager takes the token on the Vulkan worker
 /// right after the frame's commands (so it is the token of the DLSS evaluation in that frame, or
 /// null without one), then wraps the frame's vkQueuePresentKHR with it.
-[[nodiscard]] void* TakeFrameGenToken();
+[[nodiscard]] FrameGenSubmission TakeFrameGenSubmission();
 /// game_* is the rectangle the game image covers in the backbuffer: frame generation runs inside it
 /// (a little inset) and copies the rest as is (else, scaled to fullscreen, it smeared the edge row).
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
                            u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent,
                            const FrameGenHudlessImage* hudless = nullptr,
                            const FrameGenHudlessImage* ui_alpha = nullptr);
-void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs = nullptr);
+void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs = nullptr,
+                          FrameGenCopyFence* copy_fence = nullptr);
 /// Time the present thread spent acquiring the swapchain image (for the frame generation log).
 void NoteFrameGenAcquire(u64 ns);
 /// Time the renderer waited for a free present frame (for the frame generation log).

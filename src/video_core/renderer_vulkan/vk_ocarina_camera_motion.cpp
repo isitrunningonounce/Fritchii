@@ -1040,7 +1040,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                             const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame,
                             std::array<f32, 2> jitter, VkFormat depth_format,
                             std::optional<VideoCommon::TemporalCameraConstants> camera,
-                            VkExtent2D depth_allocation_size) {
+                            VkExtent2D depth_allocation_size, bool depth_transfer_src) {
     auto& state = *impl;
     const bool bananza = state.profile == Profile::Bananza;
     const bool mario_kart = state.profile == Profile::MarioKart;
@@ -1136,6 +1136,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .camera = camera,
             .bananza_dynamic = bananza,
             .depth_allocation_size = depth_allocation_size,
+            .depth_transfer_src = depth_transfer_src,
         })) {
         state.scheduler.InvalidateState();
         return false;
