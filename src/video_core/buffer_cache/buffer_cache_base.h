@@ -186,6 +186,8 @@ public:
     bool has_deleted_buffers = false;
 
     std::array<u32, NUM_STAGES> dirty_uniform_buffers{};
+    // EXP18: resolve checked memo hits at the normal draw-time update.
+    std::array<u32, NUM_STAGES> verify_uniform_buffers{};
     std::array<u32, NUM_STAGES> fast_bound_uniform_buffers{};
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
@@ -1118,6 +1120,30 @@ private:
     };
     std::array<std::array<StorageBindingMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES + 1>
         storage_binding_memo{};
+
+    struct BindingMemoSnapshot {
+        Binding binding;
+        std::optional<u32> offset;
+        bool valid{true};
+    };
+
+    struct BindingMemoVerify {
+        u64 uniform_translations{};
+        u64 uniform_resolved{};
+        u64 uniform_unresolved{};
+        u64 storage{};
+        u64 translation_mismatches{};
+        u64 uniform_mismatches{};
+        u64 storage_mismatches{};
+        u32 logged{};
+        std::chrono::steady_clock::time_point last_report{};
+    } binding_memo_verify;
+
+    BindingMemoSnapshot SnapshotBindingMemo(const Binding& binding) const;
+    bool CheckBindingMemo(const char* kind, size_t stage, u32 index,
+                          const BindingMemoSnapshot& expected,
+                          const BindingMemoSnapshot& actual, bool resolved);
+    void ReportBindingMemoVerify();
 
     /// FindBuffer and ResolveMultiRangeStorage for one storage binding, from its memo when
     /// nothing they depend on changed.

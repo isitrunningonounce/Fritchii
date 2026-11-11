@@ -125,6 +125,7 @@ void BufferCache<P>::TickFrame() {
     if (!channel_state) {
         return;
     }
+    ReportBindingMemoVerify();
     runtime.TickFrame(slot_buffers);
     if (!extent_probes.empty()) {
         CheckExtentProbes();
@@ -1040,8 +1041,8 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
     // buffers are unchanged translates to the same device range, and the buffer it resolved to
     // is still what FindBuffer returns: keep the binding with its buffer_id. The contents are
     // read at the draw as before. FindBuffer waits for writes with accurate GPU fences: keep that.
-    const bool use_memo = (VideoCore::Nx2Debug::Experiment(18) & 1) != 0 &&
-                          !Settings::IsGPUFenceBehaviorAccurate();
+    const int experiment = VideoCore::Nx2Debug::Experiment(18);
+    const bool use_memo = (experiment & 1) != 0 && !Settings::IsGPUFenceBehaviorAccurate();
     if (use_memo && memo.epoch == binding_epoch && memo.gpu_addr == gpu_addr &&
         memo.size == size && memo.channel == static_cast<const void*>(channel_state) &&
         current.device_addr == memo.device_addr && current.size == size &&
@@ -1049,8 +1050,31 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
         if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
             channel_state->dirty_uniform_buffers[stage] |= 1U << index;
         }
+        if ((experiment & 8) != 0) {
+            ++binding_memo_verify.uniform_translations;
+            const auto device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+            const Binding full = device_addr ? Binding{
+                                                  .device_addr = *device_addr,
+                                                  .size = size,
+                                                  .buffer_id = BufferId{},
+                                              }
+                                            : NULL_BINDING;
+            const bool matches = CheckBindingMemo(
+                "uniform translation", stage, index, {current, std::nullopt},
+                {full, std::nullopt, device_addr.has_value()}, false);
+            if (!matches) {
+                ++binding_memo_verify.translation_mismatches;
+                current = full;
+                channel_state->verify_uniform_buffers[stage] &= ~(1U << index);
+                memo.epoch = 0;
+                return;
+            }
+            // No cache lock here: keep the candidate until the normal locked update.
+            channel_state->verify_uniform_buffers[stage] |= 1U << index;
+        }
         return;
     }
+    channel_state->verify_uniform_buffers[stage] &= ~(1U << index);
     // Before the translation: a map in between makes the memo miss next time.
     const u64 map_serial = gpu_memory->MapSerial();
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
@@ -1082,6 +1106,7 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
 template <class P>
 void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
     uniform_bind_memo[stage][index].epoch = 0;
+    channel_state->verify_uniform_buffers[stage] &= ~(1U << index);
     auto& current = channel_state->uniform_buffers[stage][index];
     if (current.device_addr == 0 && current.size == 0 && current.buffer_id == NULL_BUFFER_ID)
         [[likely]] {
@@ -3069,7 +3094,8 @@ void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
     }
     ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
         Binding& binding = channel_state->uniform_buffers[stage][index];
-        if (binding.buffer_id) {
+        const bool verify = (channel_state->verify_uniform_buffers[stage] & (1U << index)) != 0;
+        if (binding.buffer_id && !verify) {
             // Already updated
             return;
         }
@@ -3077,8 +3103,26 @@ void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
         if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
             channel_state->dirty_uniform_buffers[stage] |= 1U << index;
         }
+        BindingMemoSnapshot expected{};
+        const bool resolved = static_cast<bool>(binding.buffer_id);
+        if (verify) {
+            // DeleteBuffer clears this binding before slot reuse; do not keep a detached ID.
+            channel_state->verify_uniform_buffers[stage] &= ~(1U << index);
+            expected = SnapshotBindingMemo(binding);
+        }
         // Resolve buffer
         binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+        if (verify) {
+            if (resolved) {
+                ++binding_memo_verify.uniform_resolved;
+                binding_memo_verify.uniform_mismatches +=
+                    !CheckBindingMemo("uniform resolved", stage, index, expected,
+                                      SnapshotBindingMemo(binding), true);
+            } else {
+                // BufferId{} is unresolved; NULL_BUFFER_ID{0} is a resolved null binding.
+                ++binding_memo_verify.uniform_unresolved;
+            }
+        }
     });
 }
 
@@ -3100,22 +3144,35 @@ void BufferCache<P>::ResolveStorageBinding(size_t memo_stage, u32 index, Binding
     StorageBindingMemo& memo = storage_binding_memo[memo_stage][index];
     // EDEN_NX2_EXP18 & 2: what FindBuffer and a ResolveMultiRangeStorage finding one range gave
     // last time, while the binding, the mappings and the set of buffers are unchanged.
-    const bool use_memo = (VideoCore::Nx2Debug::Experiment(18) & 2) != 0 &&
-                          !Settings::IsGPUFenceBehaviorAccurate();
+    const int experiment = VideoCore::Nx2Debug::Experiment(18);
+    const bool use_memo = (experiment & 2) != 0 && !Settings::IsGPUFenceBehaviorAccurate();
     // Before the lookup: a mapping change during it leaves a memo that never matches.
     const u64 map_serial = gpu_memory->MapSerial();
     const size_t as_id = gpu_memory->GetID();
-    if (use_memo && memo.epoch == binding_epoch && memo.device_addr == binding.device_addr &&
-        memo.gpu_addr == binding.gpu_addr && memo.size == binding.size &&
-        memo.is_written == is_written && memo.map_serial == map_serial && memo.as_id == as_id &&
-        memo.channel == static_cast<const void*>(channel_state)) {
+    const bool hit = use_memo && memo.epoch == binding_epoch &&
+                     memo.device_addr == binding.device_addr && memo.gpu_addr == binding.gpu_addr &&
+                     memo.size == binding.size && memo.is_written == is_written &&
+                     memo.map_serial == map_serial && memo.as_id == as_id &&
+                     memo.channel == static_cast<const void*>(channel_state);
+    const bool verify = hit && (experiment & 8) != 0;
+    BindingMemoSnapshot expected{};
+    if (hit) {
         binding.buffer_id = memo.buffer_id;
         binding.segment_first = 0;
         binding.segment_count = 0;
-        return;
+        if (!verify) {
+            return;
+        }
+        expected = SnapshotBindingMemo(binding);
     }
     binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
     ResolveMultiRangeStorage(binding, is_written, pool);
+    if (verify) {
+        ++binding_memo_verify.storage;
+        binding_memo_verify.storage_mismatches +=
+            !CheckBindingMemo("storage", memo_stage, index, expected,
+                              SnapshotBindingMemo(binding), true);
+    }
     memo.epoch = 0;
     if (use_memo && binding.segment_count == 0) {
         // binding_epoch after the lookup: a buffer it created is part of what the memo holds.
@@ -3131,6 +3188,75 @@ void BufferCache<P>::ResolveStorageBinding(size_t memo_stage, u32 index, Binding
             .buffer_id = binding.buffer_id,
         };
     }
+}
+
+template <class P>
+typename BufferCache<P>::BindingMemoSnapshot
+BufferCache<P>::SnapshotBindingMemo(const Binding& binding) const {
+    if (!binding.buffer_id || !slot_buffers.contains(binding.buffer_id)) {
+        return {binding, std::nullopt, false};
+    }
+    if (binding.buffer_id == NULL_BUFFER_ID) {
+        return {binding, 0};
+    }
+    const Buffer& buffer = slot_buffers[binding.buffer_id];
+    if (!buffer.IsInBounds(binding.device_addr, binding.size)) {
+        return {binding, std::nullopt, false};
+    }
+    return {binding, buffer.Offset(binding.device_addr)};
+}
+
+template <class P>
+bool BufferCache<P>::CheckBindingMemo(const char* kind, size_t stage, u32 index,
+                                     const BindingMemoSnapshot& expected,
+                                     const BindingMemoSnapshot& actual, bool resolved) {
+    const Binding& before = expected.binding;
+    const Binding& full = actual.binding;
+    const bool matches = expected.valid && actual.valid &&
+                         before.device_addr == full.device_addr && before.size == full.size &&
+                         (!resolved || (before.buffer_id == full.buffer_id &&
+                                        expected.offset == actual.offset &&
+                                        before.segment_count == full.segment_count));
+    if (!matches && binding_memo_verify.logged < 16) {
+        ++binding_memo_verify.logged;
+        LOG_ERROR(HW_GPU,
+                  "Binding memo (EXP18) mismatch: {} stage {} slot {} channel {} AS {}; "
+                  "expected id {:#x}, address {:#x}, size {:#x}, offset {:#x} (known {}), "
+                  "segments {}, valid {}; full id {:#x}, address {:#x}, size {:#x}, "
+                  "offset {:#x} (known {}), segments {}, valid {}",
+                  kind, stage, index, current_channel_id, gpu_memory->GetID(),
+                  before.buffer_id.index, before.device_addr, before.size,
+                  expected.offset.value_or(0), expected.offset.has_value(), before.segment_count,
+                  expected.valid, full.buffer_id.index, full.device_addr, full.size,
+                  actual.offset.value_or(0), actual.offset.has_value(), full.segment_count,
+                  actual.valid);
+    }
+    return matches;
+}
+
+template <class P>
+void BufferCache<P>::ReportBindingMemoVerify() {
+    auto& verify = binding_memo_verify;
+    if ((VideoCore::Nx2Debug::Experiment(18) & 8) == 0 && verify.uniform_translations == 0 &&
+        verify.storage == 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (verify.last_report == std::chrono::steady_clock::time_point{}) {
+        verify.last_report = now;
+        return;
+    }
+    if (now - verify.last_report < std::chrono::seconds{10}) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Binding memo (EXP18): since start uniform translations {}, resolved {}, "
+             "unresolved {}, storage {}; mismatches {} (translation {}, uniform {}, storage {})",
+             verify.uniform_translations, verify.uniform_resolved, verify.uniform_unresolved,
+             verify.storage,
+             verify.translation_mismatches + verify.uniform_mismatches + verify.storage_mismatches,
+             verify.translation_mismatches, verify.uniform_mismatches, verify.storage_mismatches);
+    verify.last_report = now;
 }
 
 template <class P>
@@ -4292,7 +4418,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
             dirty_vertex_buffers.push_back(index);
         }
     }
-    std::ranges::for_each(channel_state->uniform_buffers, replace);
+    // Other channels can retain a uniform buffer ID across a switch.
+    for (const size_t channel_id : active_channel_ids) {
+        std::ranges::for_each(channel_storage[channel_id].uniform_buffers, replace);
+    }
     std::ranges::for_each(channel_state->storage_buffers, replace);
     replace(channel_state->transform_feedback_buffers);
     replace(channel_state->compute_uniform_buffers);
