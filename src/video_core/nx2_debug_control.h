@@ -430,6 +430,8 @@ inline void LoadExperiments() {
         g_experiments[39].store(3, std::memory_order_relaxed);
         // 2026-11-10: EXP32 texture binding memo test default; numbers still to come.
         g_experiments[32].store(1, std::memory_order_relaxed);
+        // 2026-11-10: EXP31 render target memo test default; numbers still to come.
+        g_experiments[31].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
