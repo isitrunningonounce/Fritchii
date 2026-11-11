@@ -234,21 +234,24 @@ struct MarioKartBlendImage {
 
 inline bool IsMarioKartBlend(u64 fragment, bool indexed, bool indirect, u32 vertices,
                             u32 instances, std::span<const MarioKartBlendImage> sampled,
-                            const MarioKartBlendImage& target, u32 width, u32 height) {
+                            const MarioKartBlendImage& target, u32 width, u32 height,
+                            bool color_is_target = false, u32 max_target_padding = 0) {
     using VideoCore::Surface::PixelFormat;
     if (fragment != MarioKartBlendFragment || indexed || indirect || vertices != 3 ||
         instances != 1 || sampled.size() != 2 || width < 640 || height < 360 ||
-        target.format != PixelFormat::B10G11R11_FLOAT || target.width != width ||
-        target.height != height || target.identity == 0) {
+        target.format != PixelFormat::B10G11R11_FLOAT || target.width < width ||
+        target.width - width > max_target_padding || target.height != height ||
+        target.identity == 0) {
         return false;
     }
     u32 colors{}, weights{};
     for (const auto& image : sampled) {
-        if (!image.identity || image.identity == target.identity || image.width != width ||
-            image.height != height) {
+        const bool color = image.format == PixelFormat::B10G11R11_FLOAT;
+        if (!image.identity || (image.identity == target.identity) != (color_is_target && color) ||
+            image.width != width || image.height != height) {
             return false;
         }
-        colors += image.format == PixelFormat::B10G11R11_FLOAT;
+        colors += color;
         weights += image.format == PixelFormat::A8B8G8R8_UNORM;
     }
     return colors == 1 && weights == 1 && sampled[0].identity != sampled[1].identity;

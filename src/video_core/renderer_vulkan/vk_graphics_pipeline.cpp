@@ -1264,8 +1264,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
-    if (VideoCommon::ShouldTrackMarioKartSampledImages(record_sampled,
-            Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId,
+    const auto program = Settings::GetCurrentProgramID();
+    const bool bananza_blend = program == Settings::DonkeyKongBananzaProgramId &&
+                              key.unique_hashes[5] == VideoCommon::MarioKartBlendFragment;
+    if (bananza_blend || VideoCommon::ShouldTrackMarioKartSampledImages(
+            record_sampled, program == Settings::MarioKartWorldProgramId,
             key.unique_hashes[1], key.unique_hashes[5])) {
         sampled_images.clear();
         size_t view_index{};

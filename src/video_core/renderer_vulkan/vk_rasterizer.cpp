@@ -901,6 +901,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     TrackOcarinaCamera();
     TrackMarioKartCamera();
+    if (BananzaTemporalEnabled()) {
+        TrackBananzaCamera();
+    }
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
@@ -945,6 +948,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
+    if (program_id == Settings::DonkeyKongBananzaProgramId &&
+        pipeline->ShaderHashes()[5] == VideoCommon::MarioKartBlendFragment &&
+        BananzaTemporalEnabled()) {
+        if (TryBananzaBlend(*pipeline, is_indexed, is_indirect, instance_count)) {
+            submitted = true;
+            return;
+        }
+        if (!pipeline->Configure(is_indexed)) {
+            return;
+        }
+    }
+
     if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
         static const bool readback = [] {
             const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
@@ -959,6 +974,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateOcarinaJitter();
         UpdateMarioKartJitter();
+        UpdateBananzaJitter(*pipeline, is_indexed, is_indirect);
         UpdateDynamicStates(pipeline);
     }
 
@@ -2164,12 +2180,16 @@ void RasterizerVulkan::DispatchCompute() {
                              !indirect_address && !frame_dump.Capturing();
     // Until a dispatch overwrites the scene, each direct one binds only after the effects are
     // marked. The indirect path records its bind at once.
+    const bool bananza_upscale = pipeline->ShaderHash() == VideoCommon::BananzaUpscaleShader &&
+                                 BananzaTemporalEnabled();
+    const bool bananza_candidate = bananza_upscale && !indirect_address && !frame_dump.Capturing() &&
+                                   pipeline->CanReplaceBananzaUpscale();
     const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaTemporalEnabled() &&
                                  !indirect_address && !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || marking_effects ? &deferred_bind : nullptr)) {
+                             can_replace || bananza_candidate || marking_effects ? &deferred_bind : nullptr)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
@@ -2211,6 +2231,8 @@ void RasterizerVulkan::DispatchCompute() {
             flash_watch.NoteDispatch(pipeline->ShaderHash(), written);
         }
     };
+    const bool bananza_recognized =
+        bananza_upscale && TrackBananzaUpscale(*pipeline, indirect_address.has_value());
     TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
     if (frame_dump.CapturingSampled()) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
@@ -2271,7 +2293,7 @@ void RasterizerVulkan::DispatchCompute() {
     scheduler.NoteComputeWrites();
     // The upscaler's evaluation or the effects mark may be recorded next, before the dispatch:
     // the barrier goes first.
-    const bool barrier_first = can_replace || marking_effects;
+    const bool barrier_first = can_replace || bananza_candidate || marking_effects;
     if (barrier_first) {
         scheduler.Record([](vk::CommandBuffer cmdbuf) { RecordDispatchBarrier(cmdbuf); });
     }
@@ -2284,13 +2306,20 @@ void RasterizerVulkan::DispatchCompute() {
             oot_effects_frame.reset();
         }
     }
-    const auto* const replacement =
+    if (bananza_recognized && !frame_dump.Capturing() && (!bananza_candidate || byte_addressed_shadow)) {
+        LogBananzaFallback("unsupported native upscale side effects");
+    }
+    const bool bananza_replaced = bananza_candidate && bananza_recognized && !byte_addressed_shadow &&
+        RecordBananzaUpscale(texture_cache.GetImageView(pipeline->WrittenImages().front()),
+                             VideoCommon::BananzaFrameShape::Upscale);
+    const auto* const ocarina_replacement =
         can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
             ? oot_live_dlss.get()
             : nullptr;
+    const auto* const replacement = bananza_replaced ? bananza_upscaler.get() : ocarina_replacement;
     if (!replacement) {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
-    } else {
+    } else if (ocarina_replacement) {
         // Once per pass: which of the game's upscale passes the upscaler took, and with what.
         static std::array<u64, 8> logged{};
         const u64 hash = pipeline->ShaderHash();
@@ -2304,7 +2333,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
-                      barrier_recorded = barrier_first, replacement](vk::CommandBuffer cmdbuf) {
+                      barrier_recorded = barrier_first, replacement, bananza_replaced](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
         }
@@ -2312,7 +2341,8 @@ void RasterizerVulkan::DispatchCompute() {
             return;
         }
         if (replacement) {
-            LOG_WARNING(Render_Vulkan, "Ocarina temporal evaluation failed; dispatching native upscaler");
+            LOG_WARNING(Render_Vulkan, "{} temporal evaluation failed; dispatching native upscaler",
+                        bananza_replaced ? "Bananza" : "Ocarina");
         }
         if (bind) {
             bind(cmdbuf);
@@ -2330,7 +2360,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     });
     buffer_cache.RecordComputeExtentProbes();
-    if (can_replace || marking_effects) {
+    if (can_replace || bananza_candidate || marking_effects) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
@@ -3217,6 +3247,322 @@ void RasterizerVulkan::TrackMarioKartCamera() {
     });
 }
 
+namespace {
+
+bool ValidBananzaImage(const ImageView& view) {
+    return view.BackingImage() && view.size.depth == 1 && !view.IsRescaled() &&
+           view.Samples() == VK_SAMPLE_COUNT_1_BIT &&
+           view.range == VideoCommon::SubresourceRange{};
+}
+
+VideoCommon::MarioKartBlendImage DescribeBananzaImage(const ImageView& view) {
+    return {view.gpu_addr, view.format, view.size.width, view.size.height};
+}
+
+} // namespace
+
+bool RasterizerVulkan::BananzaTemporalEnabled() {
+    if (program_id != Settings::DonkeyKongBananzaProgramId || bananza_failed) {
+        return false;
+    }
+    if (bananza_upscaler && bananza_upscaler->EvaluationFailed()) {
+        bananza_failed = true;
+        texture_cache_runtime.ocarina_fsr_failed = true;
+        LogBananzaFallback("evaluation failed");
+        return false;
+    }
+    if (!bananza_backend) {
+        bananza_backend = ResolveBananzaUpscaler(device);
+    }
+    return *bananza_backend != VideoCommon::OcarinaUpscaleBackend::Native &&
+           Settings::IsDockedMode();
+}
+
+void RasterizerVulkan::LogBananzaFallback(const char* reason) {
+    if (!bananza_fallback_reason || std::string_view{bananza_fallback_reason} != reason) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: the game's pass draws frame {} ({})",
+                 render_trace_frame, reason);
+        bananza_fallback_reason = reason;
+    }
+}
+
+void RasterizerVulkan::TrackBananzaCamera() {
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0] || !targets.depth_buffer_id ||
+        bananza_scene.blend_frame == render_trace_frame) {
+        return;
+    }
+    using VideoCore::Surface::PixelFormat;
+    const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+    if (color.format != PixelFormat::B10G11R11_FLOAT || depth.format != PixelFormat::D32_FLOAT ||
+        !ValidBananzaImage(color) || !ValidBananzaImage(depth)) {
+        return;
+    }
+    const bool has_camera = bananza_scene.camera_frame == render_trace_frame;
+    const auto scene = bananza_scene.camera.extent;
+    const u64 area = has_camera ? u64{scene.width} * scene.height : 0;
+    if (u64{color.size.width} * color.size.height <= area) {
+        return;
+    }
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                const auto& binding, u32 bound_size,
+                                                const auto*, u32) {
+        std::array<f32, 0x1c0 / sizeof(f32)> block;
+        if (stage != 4 || storage || index != 3 || bound_size < sizeof(block) ||
+            buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(block))) {
+            return;
+        }
+        device_memory.ReadBlockUnsafe(binding.device_addr, block.data(), sizeof(block));
+        const auto camera = VideoCommon::ReadBananzaCamera(
+            block, {color.size.width, color.size.height}, false);
+        if (!camera || u64{camera->extent.width} * camera->extent.height <= area ||
+            depth.size.width < camera->extent.width || depth.size.height < camera->extent.height) {
+            return;
+        }
+        bananza_scene.channel = gpu_memory;
+        bananza_scene.camera_frame = render_trace_frame;
+        bananza_scene.camera = *camera;
+        bananza_scene.depth = targets.depth_buffer_id;
+        bananza_scene.depth_extent = {depth.size.width, depth.size.height};
+        bananza_scene.depth_address = depth.gpu_addr;
+    });
+}
+
+bool RasterizerVulkan::TryBananzaBlend(const GraphicsPipeline& pipeline, bool indexed,
+                                       bool indirect, u32 instances) {
+    auto& scene = bananza_scene;
+    if (scene.camera_frame != render_trace_frame || scene.channel != gpu_memory) {
+        LogBananzaFallback("no scene camera and depth this frame");
+        return false;
+    }
+    if (scene.blend_frame == render_trace_frame) {
+        LogBananzaFallback("more than one blend draw this frame");
+        return false;
+    }
+    const auto& targets = texture_cache.GetRenderTargets();
+    const auto sampled = pipeline.SampledImages();
+    if (!targets.color_buffer_ids[0] ||
+        std::ranges::any_of(targets.color_buffer_ids | std::views::drop(1),
+                           [](auto id) { return static_cast<bool>(id); }) ||
+        sampled.size() != 2 || !sampled[0].id || !sampled[1].id ||
+        sampled[0].stage != 4 || sampled[1].stage != 4) {
+        LogBananzaFallback("unexpected blend bindings");
+        return false;
+    }
+    const auto& first = texture_cache.GetImageView(sampled[0].id);
+    const auto& second = texture_cache.GetImageView(sampled[1].id);
+    auto& target = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    const auto extent = scene.camera.extent;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const std::array inputs{DescribeBananzaImage(first), DescribeBananzaImage(second)};
+    const auto shape = VideoCommon::RecognizeBananzaBlend(
+        pipeline.ShaderHashes()[5], indexed, indirect, draw.vertex_buffer.count, instances,
+        inputs, DescribeBananzaImage(target), extent);
+    if (!shape || mesh_draw || !ValidBananzaImage(first) || !ValidBananzaImage(second) ||
+        !ValidBananzaImage(target)) {
+        LogBananzaFallback("unexpected blend structure");
+        return false;
+    }
+    using VideoCore::Surface::PixelFormat;
+    const size_t color_index = first.format == PixelFormat::B10G11R11_FLOAT ? 0 : 1;
+    scene.blend_frame = render_trace_frame;
+    scene.shape = *shape;
+    scene.tonemapped = sampled[color_index].id;
+    scene.tonemapped_address = inputs[color_index].identity;
+    scene.blend_address = target.gpu_addr;
+    if (*shape == VideoCommon::BananzaFrameShape::Upscale && !bananza_depth_logged) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: D32_FLOAT reduced scene depth allocation {}x{}",
+                 scene.depth_extent.width, scene.depth_extent.height);
+        bananza_depth_logged = true;
+    }
+    if (bananza_last_scene != extent) {
+        bananza_scene_changes += bananza_last_scene.width != 0;
+        bananza_last_scene = extent;
+    }
+    if (bananza_logged_scene != extent && bananza_scene_rate.Ready(std::chrono::steady_clock::now())) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: scene {}x{} (frame {})",
+                 extent.width, extent.height, render_trace_frame);
+        bananza_logged_scene = extent;
+    }
+    return *shape == VideoCommon::BananzaFrameShape::NativeSize && !frame_dump.Capturing() &&
+           RecordBananzaUpscale(target, *shape);
+}
+
+bool RasterizerVulkan::TrackBananzaUpscale(const ComputePipeline& pipeline, bool indirect) {
+    const auto& scene = bananza_scene;
+    if (scene.blend_frame != render_trace_frame || scene.channel != gpu_memory ||
+        scene.shape != VideoCommon::BananzaFrameShape::Upscale) {
+        LogBananzaFallback("no reduced scene blend this frame");
+        return false;
+    }
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
+        LogBananzaFallback("unexpected upscale bindings");
+        return false;
+    }
+    const auto& source = texture_cache.GetImageView(sampled[0].id);
+    const auto& target = texture_cache.GetImageView(written[0]);
+    std::array<u32, 12> words{};
+    bool read_constants = false;
+    buffer_cache.ForEachBoundBuffer(true, [&](u32, bool storage, u32 index, bool,
+                                               const auto& binding, u32 bound_size,
+                                               const auto*, u32) {
+        if (!storage && index == 0 && bound_size >= sizeof(words) &&
+            !buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(words))) {
+            device_memory.ReadBlockUnsafe(binding.device_addr, words.data(), sizeof(words));
+            read_constants = true;
+        }
+    });
+    if (!read_constants || !ValidBananzaImage(source) || !ValidBananzaImage(target) ||
+        !VideoCommon::IsBananzaUpscaleDispatch(
+            pipeline.ShaderHash(), indirect, scene.camera.extent, scene.blend_address,
+            scene.tonemapped_address, scene.depth_address, std::array{DescribeBananzaImage(source)},
+            std::array{DescribeBananzaImage(target)}, words)) {
+        LogBananzaFallback("unexpected upscale images or constants");
+        return false;
+    }
+    if (!bananza_dispatch_logged) {
+        LOG_INFO(Render_Vulkan,
+                 "Bananza temporal: recognized upscale {:016x} with constants {}x{} -> {}x{}",
+                 pipeline.ShaderHash(), words[6] + 1, words[7] + 1, words[10] + 1, words[11] + 1);
+        bananza_dispatch_logged = true;
+    }
+    return true;
+}
+
+bool RasterizerVulkan::RecordBananzaUpscale(ImageView& target, VideoCommon::BananzaFrameShape shape) {
+    const auto fail = [this](const char* reason) {
+        LogBananzaFallback(reason);
+        return false;
+    };
+    const auto& scene = bananza_scene;
+    if (bananza_temporal_frame == render_trace_frame) {
+        return fail("already replaced a pass this frame");
+    }
+    auto* const color = texture_cache.TryGetImageView(scene.tonemapped);
+    auto* const depth = texture_cache.TryGetImageView(scene.depth);
+    const auto extent = scene.camera.extent;
+    using VideoCore::Surface::PixelFormat;
+    if (!color || !depth || !ValidBananzaImage(*color) || !ValidBananzaImage(*depth) ||
+        color->gpu_addr != scene.tonemapped_address || depth->gpu_addr != scene.depth_address ||
+        color->format != PixelFormat::B10G11R11_FLOAT || depth->format != PixelFormat::D32_FLOAT ||
+        color->size.width < extent.width || color->size.height < extent.height ||
+        depth->size.width < extent.width || depth->size.height < extent.height ||
+        target.ImageHandle() == depth->ImageHandle() ||
+        (target.ImageHandle() == color->ImageHandle()) !=
+            (shape == VideoCommon::BananzaFrameShape::NativeSize)) {
+        return fail("scene images changed or overlap");
+    }
+    constexpr VkFormat format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    if (!device.IsStorageImageExtendedFormatsSupported() ||
+        !device.IsFormatSupported(format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT, FormatType::Optimal) ||
+        !(target.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target.format).format != format) {
+        return fail("unsupported storage format");
+    }
+    const auto camera = VideoCommon::MakeBananzaTemporalCamera(scene.camera);
+    if (!camera) {
+        return fail("unsupported scene camera matrices");
+    }
+    try {
+        const auto color_view = color->Handle(Shader::TextureType::Color2D);
+        const auto depth_view = depth->DepthView();
+        const auto target_view = target.StorageView(Shader::TextureType::Color2D,
+                                                     Shader::ImageFormat::Typeless, false);
+        if (!color_view || !depth_view || !target_view) {
+            return fail("missing image view");
+        }
+        if (!bananza_upscaler) {
+            bananza_upscaler = std::make_unique<OcarinaUpscaler>(device, scheduler, descriptor_pool,
+                compute_pass_descriptor_queue, memory_allocator, staging_pool, *bananza_backend,
+                OcarinaUpscaler::Profile::Bananza);
+        }
+        const auto depth_format = MaxwellToVK::SurfaceFormat(
+            device, FormatType::Optimal, true, depth->format).format;
+        const auto jitter = bananza_jitter_frame == render_trace_frame
+            ? bananza_jitter_offset : std::array<f32, 2>{};
+        const VkExtent2D target_extent{target.size.width, target.size.height};
+        if (!bananza_upscaler->Record(color_view, depth_view, target_view,
+                {extent.width, extent.height}, target_extent, target_extent, scene.camera.matrices.current,
+                scene.camera.matrices.previous, {}, depth->ImageHandle(), render_trace_frame, jitter,
+                depth_format, camera, {depth->size.width, depth->size.height},
+                (depth->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0)) {
+            return fail("temporal upscaler declined the frame");
+        }
+        bananza_temporal_frame = render_trace_frame;
+        bananza_jitter_channel = scene.channel;
+        bananza_jitter_depth = scene.depth_address;
+        bananza_fallback_reason = nullptr;
+        if (!std::exchange(bananza_replacement_logged[static_cast<size_t>(shape)], true)) {
+            LOG_INFO(Render_Vulkan, "Bananza temporal: {} replaces the game's {} ({}x{} -> {}x{})",
+                     *bananza_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1",
+                     shape == VideoCommon::BananzaFrameShape::Upscale ? "upscale" : "SMAA blend",
+                     extent.width, extent.height, target_extent.width, target_extent.height);
+        }
+        return true;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Bananza temporal: unavailable ({})", error.what());
+        scheduler.InvalidateState();
+        bananza_failed = true;
+        texture_cache_runtime.ocarina_fsr_failed = true;
+        return fail("temporal resources unavailable");
+    }
+}
+
+void RasterizerVulkan::UpdateBananzaJitter(const GraphicsPipeline& pipeline, bool indexed,
+                                         bool indirect) {
+    if (program_id != Settings::DonkeyKongBananzaProgramId) {
+        return;
+    }
+    std::array<f32, 2> want{};
+    const bool dlss = bananza_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
+    const auto& regs = maxwell3d->regs;
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (bananza_temporal_frame && *bananza_temporal_frame + 1 == render_trace_frame &&
+        bananza_jitter_channel == gpu_memory && targets.depth_buffer_id && regs.depth_test_enable &&
+        BananzaTemporalEnabled() && (!dlss || VideoCommon::OcarinaDlssJitterMode() != 0) &&
+        !frame_dump.Capturing()) {
+        const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+        const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+        const f32 width = regs.viewport_scale_offset_enabled ? std::abs(viewport.width)
+            : static_cast<f32>(regs.surface_clip.width);
+        const f32 height = regs.viewport_scale_offset_enabled ? std::abs(viewport.height)
+            : static_cast<f32>(regs.surface_clip.height);
+        if (depth.gpu_addr == bananza_jitter_depth && ValidBananzaImage(depth) &&
+            width >= 640.0f && width <= static_cast<f32>(VideoCommon::BananzaOutputExtent.width) &&
+            height >= 360.0f && height <= static_cast<f32>(VideoCommon::BananzaOutputExtent.height) &&
+            std::trunc(width) == width && std::trunc(height) == height) {
+            auto extent = VideoCommon::Extent2D{static_cast<u32>(width), static_cast<u32>(height)};
+            if (bananza_scene.camera_frame == render_trace_frame &&
+                VideoCommon::IsBananzaSceneTarget(bananza_scene.camera.extent, extent)) {
+                extent = bananza_scene.camera.extent;
+            }
+            if (VideoCommon::IsBananzaSceneTarget(extent, {depth.size.width, depth.size.height})) {
+                const bool full_screen = !indexed && !indirect && !mesh_draw &&
+                    maxwell3d->draw_manager.draw_state.vertex_buffer.count == 3;
+                if (full_screen && VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
+                    LOG_DEBUG(Render_Vulkan,
+                              "Bananza temporal: full-screen scene depth test frame={} "
+                              "vertex={:016x} fragment={:016x} viewport={}x{}",
+                              render_trace_frame, pipeline.ShaderHashes()[1], pipeline.ShaderHashes()[5],
+                              extent.width, extent.height);
+                }
+                const u32 phases = VideoCommon::BananzaJitterPhaseCount(extent.width, dlss);
+                const u32 index = static_cast<u32>(render_trace_frame % phases) + 1;
+                want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
+                bananza_jitter_frame = render_trace_frame;
+                bananza_jitter_offset = want;
+            }
+        }
+    }
+    if (want != bananza_jitter_applied) {
+        bananza_jitter_applied = want;
+        maxwell3d->dirty.flags[Dirty::Viewports] = true;
+    }
+}
+
 void RasterizerVulkan::UpdateMarioKartJitter() {
     std::array<f32, 2> want{};
     const bool jittered_backend = mkw_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
@@ -3443,7 +3789,8 @@ bool RasterizerVulkan::TryMarioKartUpscale(const GraphicsPipeline& pipeline, boo
         }
         if (!mkw_upscaler) {
             mkw_upscaler = std::make_unique<OcarinaUpscaler>(device, scheduler, descriptor_pool,
-                compute_pass_descriptor_queue, memory_allocator, staging_pool, *mkw_backend, true);
+                compute_pass_descriptor_queue, memory_allocator, staging_pool, *mkw_backend,
+                OcarinaUpscaler::Profile::MarioKart);
         }
         const auto depth_format = MaxwellToVK::SurfaceFormat(
             device, FormatType::Optimal, true, depth.format).format;
@@ -3857,6 +4204,11 @@ void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
     flash_watch.TickFrame();
     ++render_trace_frame;
+    if (bananza_last_scene.width && render_trace_frame % 600 == 0) {
+        LOG_INFO(Render_Vulkan, "Bananza temporal: {} scene size changes in 600 frames (frame {})",
+                 bananza_scene_changes, render_trace_frame);
+        bananza_scene_changes = 0;
+    }
     render_trace_draws = 0;
     render_trace_clears = 0;
     if (Common::DkbFrameTrace::Enabled()) {
@@ -4114,7 +4466,9 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
     info.anti_aliased = (oot_dlss_frame == render_trace_frame && !oot_live_dlss->EvaluationFailed()) ||
-                       (mkw_temporal_frame == render_trace_frame && !mkw_upscaler->EvaluationFailed());
+                       (mkw_temporal_frame == render_trace_frame && !mkw_upscaler->EvaluationFailed()) ||
+                       (bananza_temporal_frame == render_trace_frame &&
+                        !bananza_upscaler->EvaluationFailed());
     if (oot_4k_scene_frame == render_trace_frame && info.image &&
         info.image == oot_4k_guest_present && info.image_view &&
         info.width == 2560 && info.height == 1440 && !scaled &&
@@ -4408,8 +4762,8 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
             height = -height;
         }
         VkViewport viewport{
-            .x = x + oot_jitter_applied[0] + mkw_jitter_applied[0],
-            .y = y + oot_jitter_applied[1] + mkw_jitter_applied[1],
+            .x = x + oot_jitter_applied[0] + mkw_jitter_applied[0] + bananza_jitter_applied[0],
+            .y = y + oot_jitter_applied[1] + mkw_jitter_applied[1] + bananza_jitter_applied[1],
             .width = width,
             .height = height,
             .minDepth = 0.0f,
@@ -4440,10 +4794,12 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         GetViewportState(device, regs, 12, scale), GetViewportState(device, regs, 13, scale),
         GetViewportState(device, regs, 14, scale), GetViewportState(device, regs, 15, scale),
     };
-    if (oot_jitter_applied != std::array<f32, 2>{} || mkw_jitter_applied != std::array<f32, 2>{}) {
+    if (oot_jitter_applied != std::array<f32, 2>{} ||
+        mkw_jitter_applied != std::array<f32, 2>{} ||
+        bananza_jitter_applied != std::array<f32, 2>{}) {
         for (VkViewport& viewport : viewport_list) {
-            viewport.x += oot_jitter_applied[0] + mkw_jitter_applied[0];
-            viewport.y += oot_jitter_applied[1] + mkw_jitter_applied[1];
+            viewport.x += oot_jitter_applied[0] + mkw_jitter_applied[0] + bananza_jitter_applied[0];
+            viewport.y += oot_jitter_applied[1] + mkw_jitter_applied[1] + bananza_jitter_applied[1];
         }
     }
     scheduler.Record([this, viewport_list](vk::CommandBuffer cmdbuf) {

@@ -27,6 +27,7 @@
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/streamline_api.h"
@@ -64,7 +65,13 @@ struct State {
     ExtraQueues fg_queues{};
     std::vector<std::string> fg_device_extensions;
     // Per frame: the token of the latest DLSS evaluation, until a present takes it (worker).
-    std::atomic<const sl::FrameToken*> fg_tagged{};
+    std::mutex fg_tag_mutex;
+    FrameGenSubmission fg_tagged;
+    std::mutex fg_copy_fence_mutex;
+    u64 fg_swapchain_generation{};
+    std::array<VkExtent2D, 2> fg_bananza_logged_extent{};
+    std::optional<VkExtent2D> fg_bananza_static_extent; // Vulkan worker
+    bool fg_bananza_static_suspended{};
     bool fg_reflex_set{}; ///< Worker
     bool fg_reflex_on{};  ///< Worker: Reflex set for the player's frame generation switch on
     // eBlockNoClientQueues: frame generation's inputs fence, from the present thread to the worker.
@@ -83,6 +90,7 @@ struct State {
     std::chrono::steady_clock::time_point fg_last_present{};
     bool fg_on{};         ///< Present thread from here on
     u32 fg_frames{};      ///< Generated frames per rendered one while on
+    bool fg_dynamic_resolution{};
     std::optional<std::array<u32, 12>> fg_mkw_geometry;
     FrameGenUiOptionsState fg_ui;
     std::optional<std::array<s32, 4>> fg_ui_log;
@@ -709,8 +717,31 @@ bool FrameGenWaitsForInputs() {
     return waits;
 }
 
+bool BananzaFrameGenOwnCopies() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DKB_FG_COPY");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+static bool BananzaFrameGenDynamicResolution() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DKB_FG_DYNAMIC");
+        return !value || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
 void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const sl::Resource& motion,
-                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle) {
+                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle,
+                 FrameGenCopyFence* copy_fence) {
+    bool attempted = false;
+    SCOPE_EXIT {
+        if (copy_fence) {
+            copy_fence->Release({.pending = attempted});
+        }
+    };
     State& state = GetState();
     if (!IsFrameGenAvailable()) {
         return;
@@ -742,6 +773,20 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
     if (!user_on) {
         return;
     }
+    const bool bananza = Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId;
+    const bool bananza_static = bananza && !BananzaFrameGenDynamicResolution();
+    if (bananza_static && state.fg_bananza_static_extent) {
+        const auto fixed = *state.fg_bananza_static_extent;
+        if (area.width != fixed.width || area.height != fixed.height) {
+            if (!std::exchange(state.fg_bananza_static_suspended, true)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Bananza temporal: static FG paused at {}x{} (locked to {}x{})",
+                            area.width, area.height, fixed.width, fixed.height);
+            }
+            return;
+        }
+    }
+
     // DLSS-G only runs with Reflex active ("eDLSSGStatusFailReflexNotDetectedAtRuntime - sl.reflex
     // must be enabled and active -1 != frame" without slReflexSleep each frame, or with the low
     // latency mode off, while still reporting two presented frames). Inline on the worker the
@@ -797,6 +842,7 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
                         lifecycle, &area},
     };
     const auto tag_begin = std::chrono::steady_clock::now();
+    attempted = true;
     const sl::Result result =
         api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, tags, static_cast<u32>(std::size(tags)),
                               reinterpret_cast<sl::CommandBuffer*>(cmdbuf));
@@ -812,7 +858,29 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
         }
         return;
     }
-    state.fg_tagged.store(&frame, std::memory_order_release);
+    if (bananza) {
+        auto& logged_extent = state.fg_bananza_logged_extent[copy_fence != nullptr];
+        if (logged_extent.width != area.width || logged_extent.height != area.height) {
+            LOG_INFO(Render_Vulkan, "Bananza temporal: FG {} copies at {}x{}",
+                     copy_fence ? "emulator-owned" : "Streamline-owned", area.width, area.height);
+            logged_extent = {area.width, area.height};
+        }
+    }
+    if (bananza_static) {
+        if (!state.fg_bananza_static_extent) {
+            state.fg_bananza_static_extent = VkExtent2D{area.width, area.height};
+            LOG_INFO(Render_Vulkan, "Bananza temporal: static FG locked to {}x{}",
+                     area.width, area.height);
+        } else if (std::exchange(state.fg_bananza_static_suspended, false)) {
+            LOG_INFO(Render_Vulkan, "Bananza temporal: static FG resumed at {}x{}",
+                     area.width, area.height);
+        }
+    }
+    std::scoped_lock lock{state.fg_tag_mutex};
+    if (state.fg_tagged.copy_fence) {
+        state.fg_tagged.copy_fence->Release(); // This token never reached a presentation frame.
+    }
+    state.fg_tagged = {const_cast<sl::FrameToken*>(&frame), std::exchange(copy_fence, nullptr)};
 }
 
 void NoteFrameGenAcquire(u64 ns) {
@@ -860,12 +928,40 @@ u32 FrameGenSwapchainImages() {
     return value ? static_cast<u32>(std::atoi(value)) : 0;
 }
 
-void* TakeFrameGenToken() {
-    State& state = GetState();
+FrameGenSubmission TakeFrameGenSubmission() {
     if (!IsFrameGenAvailable()) {
-        return nullptr;
+        return {};
     }
-    return const_cast<sl::FrameToken*>(state.fg_tagged.exchange(nullptr, std::memory_order_acq_rel));
+    State& state = GetState();
+    std::scoped_lock lock{state.fg_tag_mutex};
+    return std::exchange(state.fg_tagged, {});
+}
+
+bool FrameGenCopyFence::Ready() {
+    State& state = GetState();
+    return Ready([&](VkSemaphore semaphore, u64 value) {
+        std::scoped_lock lock{state.fg_copy_fence_mutex};
+        if (generation != state.fg_swapchain_generation) {
+            return true; // The old swapchain was drained and destroyed.
+        }
+        if (!state.wait_semaphores) {
+            return false;
+        }
+        const VkSemaphoreWaitInfo wait{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &value,
+        };
+        return state.wait_semaphores(state.device, &wait, 0) == VK_SUCCESS;
+    });
+}
+
+std::unique_lock<std::mutex> LockFrameGenCopyFencesForSwapchainReset() {
+    State& state = GetState();
+    std::unique_lock lock{state.fg_copy_fence_mutex};
+    ++state.fg_swapchain_generation;
+    return lock;
 }
 
 bool WaitFrameGenInputs(FrameGenInputFence& fence) {
@@ -907,9 +1003,13 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     const bool want_on = token != nullptr;
     const u32 multiplier = Common::FrameGenStats::multiplier.load(std::memory_order_relaxed);
     const u32 frames = want_on ? std::clamp<u32>(multiplier, 2, state.fg_max_frames + 1) - 1 : 0;
-    const bool mario_kart = Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId;
+    const u64 program_id = Settings::GetCurrentProgramID();
+    const bool mario_kart = program_id == Settings::MarioKartWorldProgramId;
+    const bool bananza = program_id == Settings::DonkeyKongBananzaProgramId;
+    const bool dynamic_resolution = want_on && bananza && BananzaFrameGenDynamicResolution();
     const auto update_options = [&](bool recompose) {
         if (want_on == state.fg_on && frames == state.fg_frames &&
+            dynamic_resolution == state.fg_dynamic_resolution &&
             (!mario_kart || !state.fg_ui.NeedsUpdate(recompose))) {
             return;
         }
@@ -918,6 +1018,11 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
         options.mode = want_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
         options.numFramesToGenerate = (std::max)(frames, 1u);
         options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        if (dynamic_resolution) {
+            options.flags |= sl::DLSSGFlags::eDynamicResolutionEnabled;
+            options.dynamicResWidth = 2400;
+            options.dynamicResHeight = 1350;
+        }
         // The default blocks the presenting queue (the emulator's only graphics queue) until
         // frame generation finishes: the real frame rate halved (50 -> 26 fps). LICHII_DLSS_FG_BLOCK=1
         // goes back to it.
@@ -959,8 +1064,20 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
             LOG_INFO(Render_Vulkan, "DLSS Frame Generation off (result {})",
                      static_cast<int>(result));
         }
+        if (bananza && result != sl::Result::eOk) {
+            return;
+        }
+        if (bananza && want_on && !state.fg_on) {
+            if (dynamic_resolution) {
+                LOG_INFO(Render_Vulkan, "Bananza temporal: FG dynamic resolution on ({}x{})",
+                         options.dynamicResWidth, options.dynamicResHeight);
+            } else {
+                LOG_INFO(Render_Vulkan, "Bananza temporal: FG dynamic resolution off");
+            }
+        }
         state.fg_on = want_on;
         state.fg_frames = frames;
+        state.fg_dynamic_resolution = dynamic_resolution;
         Common::FrameGenStats::active.store(want_on, std::memory_order_relaxed);
         state.fg_window_begin = {};
         state.fg_window_shown = 0;
@@ -1080,7 +1197,15 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     state.fg_present_begin = std::chrono::steady_clock::now();
 }
 
-void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs) {
+void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs, FrameGenCopyFence* copy_fence) {
+    FrameGenInputFence copy_completion{.pending = true};
+    SCOPE_EXIT {
+        if (copy_fence) {
+            State& state = GetState();
+            std::scoped_lock lock{state.fg_copy_fence_mutex};
+            copy_fence->Release(copy_completion, state.fg_swapchain_generation);
+        }
+    };
     State& state = GetState();
     if (!IsFrameGenAvailable() || !token) {
         return;
@@ -1110,6 +1235,8 @@ void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs) {
         inputs->value = fg_state.lastPresentInputsProcessingCompletionFenceValue;
     }
     if (fg_state.inputsProcessingCompletionFence) {
+        copy_completion.semaphore = static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence);
+        copy_completion.value = fg_state.lastPresentInputsProcessingCompletionFenceValue;
         state.fg_inputs_value.store(fg_state.lastPresentInputsProcessingCompletionFenceValue,
                                     std::memory_order_release);
         state.fg_inputs_fence.store(static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence),
@@ -1186,7 +1313,14 @@ void Stop() {
     state.fg_reflex_set = false;
     state.fg_on = false;
     state.fg_frames = 0;
-    state.fg_tagged.store(nullptr, std::memory_order_relaxed);
+    state.fg_dynamic_resolution = false;
+    state.fg_bananza_logged_extent = {};
+    state.fg_bananza_static_extent.reset();
+    state.fg_bananza_static_suspended = false;
+    {
+        std::scoped_lock lock{state.fg_tag_mutex};
+        state.fg_tagged = {};
+    }
     state.fg_inputs_fence.store(VK_NULL_HANDLE, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline stopped (result {})", static_cast<int>(result));
 }

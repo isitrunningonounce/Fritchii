@@ -258,6 +258,13 @@ try
 
 RendererVulkan::~RendererVulkan() {
     scheduler.RegisterOnSubmit([] {});
+#ifdef EGLANTINE_STREAMLINE
+    if (Streamline::BananzaFrameGenOwnCopies()) {
+        scheduler.WaitWorker();
+        present_manager.WaitPresent();
+        (void)Streamline::TakeFrameGenSubmission();
+    }
+#endif
     void(device.GetLogical().WaitIdle());
 }
 
