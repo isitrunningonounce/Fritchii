@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <memory>
 #include <catch2/catch_test_macros.hpp>
 #include "audio_core/sink/input_processing.h"
 #include "common/scope_exit.h"
@@ -27,7 +28,9 @@ TEST_CASE("Capture uses the input sink gain instead of rereading configuration",
     SCOPE_EXIT {
         Settings::values.microphone_volume.SetValue(previous_gain);
     };
-    SysmixTests::Stream stream{context.system, AudioCore::Sink::StreamType::In, 2, true};
+    auto owned_stream = std::make_unique<SysmixTests::Stream>(
+        context.system, AudioCore::Sink::StreamType::In, 2, true);
+    auto& stream = *owned_stream;
     stream.SetSystemChannels(2);
     stream.SetDeviceVolume(0.5f);
     Settings::values.microphone_volume.SetValue(200);

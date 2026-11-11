@@ -193,6 +193,42 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
     }
 }
 
+TEST_CASE("GPU mapping serial invalidates binding memos on unmap and remap", "[memory_manager]") {
+    const bool big = GENERATE(false, true);
+    CAPTURE(big);
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31, 16};
+    memory.BindRasterizer(&rasterizer);
+
+    const u64 page = big ? 0x10000 : 0x1000;
+    constexpr GPUVAddr gpu_addr = 0x4000'0000;
+    constexpr DAddr first = 0x1000'0000;
+    constexpr DAddr second = 0x2000'0000;
+    const u64 initial_serial = memory.MapSerial();
+    memory.Map(gpu_addr, first, page, Tegra::PTEKind::PITCH, big);
+    const u64 mapped_serial = memory.MapSerial();
+    REQUIRE(mapped_serial > initial_serial);
+    REQUIRE(memory.GpuToCpuAddress(gpu_addr + 0x10) == first + 0x10);
+
+    memory.Unmap(gpu_addr, page);
+    const u64 unmapped_serial = memory.MapSerial();
+    REQUIRE(unmapped_serial > mapped_serial);
+    REQUIRE_FALSE(memory.GpuToCpuAddress(gpu_addr + 0x10).has_value());
+
+    memory.Map(gpu_addr, second, page, Tegra::PTEKind::PITCH, big);
+    REQUIRE(memory.MapSerial() > unmapped_serial);
+    REQUIRE(memory.GpuToCpuAddress(gpu_addr + 0x10) == second + 0x10);
+
+    const u64 remapped_serial = memory.MapSerial();
+    memory.MapSparse(gpu_addr, page, big);
+    REQUIRE(memory.MapSerial() > remapped_serial);
+    REQUIRE_FALSE(memory.GpuToCpuAddress(gpu_addr + 0x10).has_value());
+}
+
 TEST_CASE("Native mapping size stops at the end of its own pool", "[memory_manager]") {
     ScopedSystemTestContext context;
     Core::System system;
