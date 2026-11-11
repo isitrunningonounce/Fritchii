@@ -119,9 +119,9 @@ inline std::atomic<int> g_idle_pause{-1};
 /// (BindSmallUniformReusing; zortos293/Lichii#641 EDEN_NX2_UBO_RANGE_REUSE).
 /// EXP18 (buffer binding memos, #641), bits: 1 = a constant buffer bind of the slot's current
 /// GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
-/// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame
-/// (default 4: exact, see LoadExperiments). All while the mappings and the set of buffers are
-/// unchanged (BufferCache::binding_epoch).
+/// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame,
+/// 8 = verify memo hits through the full path (15 verifies both memos). Default 7, see
+/// LoadExperiments. Memos require unchanged mappings and buffers (BufferCache::binding_epoch).
 /// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
 /// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
 /// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
@@ -382,10 +382,11 @@ inline void LoadExperiments() {
         // EXP14: unchanged macro register writes dropped before FrontWrite's other checks.
         // Castle Town, profile toggle: front macro 250 -> 236 ms/s, push 77 -> 70 ms/s.
         g_experiments[14].store(1, std::memory_order_relaxed);
-        // EXP18 = 4 (exact, zortos293/Lichii#717 wave 1): a buffer touches its LRU node once
+        // EXP18 bit 4 (exact, zortos293/Lichii#717 wave 1): a buffer touches its LRU node once
         // per frame; a second touch in the same frame was already a no-op in LruCache::Touch
-        // (its tick is not older), so only the node's cache miss goes. Bits 1 and 2 stay off.
-        g_experiments[18].store(4, std::memory_order_relaxed);
+        // (its tick is not older), so only the node's cache miss goes.
+        // 2026-11-11: also enable uniform/storage binding memos (bits 1/2); numbers still to come.
+        g_experiments[18].store(7, std::memory_order_relaxed);
         // EXP21 = 1: a texture whose handle word is a storage buffer's address gets no texture
         // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
         // flickered every other frame in bursts without it.
@@ -428,6 +429,16 @@ inline void LoadExperiments() {
         // EXP39 = 3: publish to a back that waits after 8 words, no snapshot refresh of entries
         // that ran (zortos293/Lichii#805 62db242b34; see the EXP39 notes above). Timing only.
         g_experiments[39].store(3, std::memory_order_relaxed);
+        // 2026-11-10: EXP32 texture binding memo test default; numbers still to come.
+        g_experiments[32].store(1, std::memory_order_relaxed);
+        // 2026-11-10: EXP31 render target memo test default; numbers still to come.
+        g_experiments[31].store(1, std::memory_order_relaxed);
+        // 2026-11-10: EXP55 vertex input pipeline lookup test default; numbers still to come.
+        g_experiments[55].store(1, std::memory_order_relaxed);
+        // 2026-11-10: EXP52 programs-only pipeline lookup test default; numbers still to come.
+        g_experiments[52].store(1, std::memory_order_relaxed);
+        // 2026-11-11: EXP22 state delta blocks test default; numbers still to come.
+        g_experiments[22].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
