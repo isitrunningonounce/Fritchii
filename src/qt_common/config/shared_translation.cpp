@@ -136,6 +136,34 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            "other race conditions."));
 
     // Renderer
+    INSERT(Settings, hdr_mode, tr("HDR output:"),
+           tr("HDR output for games with an HDR mode. Requires Vulkan.\n"
+              "Off (default): always SDR.\n"
+              "Auto: HDR while Windows HDR (\"Use HDR\") is on for the monitor that shows the "
+              "game, SDR otherwise and on hosts that cannot tell.\n"
+              "On: HDR whenever the display driver offers an HDR format.\n"
+              "The game is told the display is HDR only while Lichii really presents HDR. SDR "
+              "games and menus are shown at the reference white.\n"
+              "While HDR is active, anti-aliasing, post-processing, FSR/SGSR upscaling and frame "
+              "generation are off and the window is scaled bilinearly.\n"
+              "Screenshots are tone mapped to SDR."));
+    INSERT(Settings, hdr_swapchain, tr("HDR format:"),
+           tr("HDR10: 10-bit PQ, what HDR displays take.\n"
+              "scRGB: 16-bit float. Try it if HDR shows banding, which some NVIDIA drivers do "
+              "with 10-bit in fullscreen."));
+    INSERT(Settings, hdr_reference_white, tr("HDR Reference White"),
+           tr("Reference white in nits reported to the game, the brightness of its HUD and "
+              "menus. 0 (default): Windows' SDR content brightness for the monitor, so the game "
+              "matches the desktop; elsewhere the Switch 2 calibration, HDR Peak Luminance "
+              "divided by 1.5, rounded up and clamped to 50-300 nits.\n"
+              "SDR games and menus are shown at this brightness while HDR is active, and HDR "
+              "screenshots map it to SDR white."));
+    INSERT(Settings, hdr_peak_luminance, tr("HDR Peak Luminance"),
+           tr("Peak luminance in nits reported to the game, which tone maps to it. 0 (default): "
+              "the monitor's peak from its EDID as Windows reports it; elsewhere 300 nits, the "
+              "Switch 2 HDR calibration's starting value.\n"
+              "Also the HDR10 metadata peak, and what an HDR image rolls off to on an SDR "
+              "screen."));
     INSERT(Settings, renderer_backend, tr("API:"),
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
@@ -144,7 +172,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
               "Options lower than 1X can cause artifacts."));
-    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"), QString());
+    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"),
+           tr("Bilinear while HDR output is active."));
     INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
               "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
@@ -168,7 +197,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
-              "can produce a more stable picture in lower resolutions."));
+              "can produce a more stable picture in lower resolutions.\nOff while HDR output "
+              "is active."));
     INSERT(Settings, oot_movie_upscale, tr("Ocarina of Time movies:"),
            tr("How the title screen and cutscene videos are scaled up.\nGame's own upscaler: the "
               "game's video upscaler, which removes banding and sharpens. Fast on NVIDIA RTX, slow "
@@ -240,7 +270,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_gen, tr("Enable Frame Generation (experimental)"),
            tr("Shows generated frames between the game's own frames for smoother motion. The "
               "game still runs and responds at its own frame rate.\nExperimental: it can make "
-              "the camera flicker, and frame pacing is off while it runs."));
+              "the camera flicker, and frame pacing is off while it runs.\nPaused while HDR output is active."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
     INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
@@ -626,6 +656,17 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotRefreshCap, Hz120, tr("120 FPS")),
                               PAIR(OotRefreshCap, Hz144, tr("144 FPS")),
                               PAIR(OotRefreshCap, Hz165, tr("165 FPS")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::HdrMode>::Index(),
+                          {
+                              PAIR(HdrMode, Off, tr("Off")),
+                              PAIR(HdrMode, Auto, tr("Auto")),
+                              PAIR(HdrMode, On, tr("On")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::HdrSwapchain>::Index(),
+                          {
+                              PAIR(HdrSwapchain, Hdr10, tr("HDR10 (10-bit)")),
+                              PAIR(HdrSwapchain, Scrgb, tr("scRGB (16-bit float)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

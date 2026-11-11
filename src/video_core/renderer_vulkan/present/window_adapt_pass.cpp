@@ -35,17 +35,16 @@ WindowAdaptPass::~WindowAdaptPass() = default;
 void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, Scheduler& scheduler, size_t image_index,
                            std::list<Layer>& layers,
                            std::span<const Tegra::FramebufferConfig> configs,
-                           const Layout::FramebufferLayout& layout, Frame* dst,
+                           const Layout::FramebufferLayout& layout,
+                           VkFramebuffer framebuffer, VkExtent2D extent,
+                           const HdrPresent& output,
                            std::span<const FramebufferTextureInfo> overrides,
                            FramebufferTextureInfo* first_texture) {
 
-    const VkFramebuffer host_framebuffer{*dst->framebuffer};
+    const VkFramebuffer host_framebuffer{framebuffer};
     const VkRenderPass renderpass{*render_pass};
     const VkPipelineLayout graphics_pipeline_layout{*pipeline_layout};
-    const VkExtent2D render_area{
-        .width = dst->width,
-        .height = dst->height,
-    };
+    const VkExtent2D render_area{extent};
 
     const size_t layer_count = configs.size();
     std::vector<PresentPushConstants> push_constants(layer_count);
@@ -68,7 +67,7 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
         }
 
         layer_it->ConfigureDraw(device, &push_constants[i], &descriptor_sets[i], rasterizer, *sampler,
-                                image_index, configs[i], layout,
+                                image_index, configs[i], layout, output,
                                 overrides.empty() ? nullptr : &overrides[i],
                                 i == 0 ? first_texture : nullptr);
         layer_it++;

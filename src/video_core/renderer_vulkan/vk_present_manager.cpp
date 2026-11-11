@@ -9,6 +9,7 @@
 #include <utility>
 #include <thread>
 
+#include "common/display_hdr.h"
 #include "common/logging.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
@@ -140,7 +141,6 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , scheduler{scheduler_}
     , swapchain{swapchain_}
     , surface{surface_}
-    , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
@@ -241,6 +241,8 @@ Frame* PresentManager::GetRenderFrame() {
     frame->hudless_available = Streamline::WaitFrameGenInputs(frame->hudless_fence);
 #endif
     frame->hudless_valid = false;
+    frame->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+
     return frame;
 }
 
@@ -278,11 +280,23 @@ bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
     return required && frame->storage_capable && !frame->storage_view;
 }
 
+VkFormat PresentManager::GetFrameImageFormat(VkFormat image_view_format) const {
+    if (image_view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+        image_view_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        return image_view_format;
+    }
+    // Render SDR through a UNORM view, but preserve the surface's transfer encoding for blits.
+    return swapchain.GetSdrImageFormat();
+}
+
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
                                    VkRenderPass rd, bool storage) {
     auto& dld = device.GetLogical();
     frame->width = width;
     frame->height = height;
+    frame->format = image_view_format;
+    frame->image_format = GetFrameImageFormat(image_view_format);
+    frame->storage_capable = CanStoreToFrame(device.GetPhysical(), frame->image_format);
 
     const bool with_storage = storage && frame->storage_capable;
     VkImageUsageFlags storage_usage = 0;
@@ -295,7 +309,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .pNext = nullptr,
         .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = swapchain.GetImageFormat(),
+        .format = frame->image_format,
         .extent =
             {
                 .width = width,
@@ -346,7 +360,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
             .flags = 0,
             .image = *frame->image,
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = swapchain.GetImageFormat(),
+            .format = frame->image_format,
             .components =
                 {
                     .r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -610,7 +624,19 @@ void PresentManager::DrainShown() {
     }
 }
 
-void PresentManager::RecreateSwapchain(Frame* frame) {
+void PresentManager::UpdateHdrMetadata() {
+    // The values the guest was told it renders for (nx2:vi2 QueryDisplayHdrStatus).
+    auto& monitor = Common::DisplayHdrMonitor::Instance();
+    monitor.Watch(render_window.GetWindowInfo().render_surface);
+    hdr_metadata_generation = monitor.Generation();
+    const auto output = Common::ResolveHdrOutput(monitor.Current(), Settings::HdrMode::On,
+                                                 Settings::values.hdr_peak_luminance.GetValue(),
+                                                 Settings::values.hdr_reference_white.GetValue());
+    swapchain.SetHdrMetadata(output.peak_luminance, output.reference_white);
+}
+
+// Returns false after discarding a deferred or incompatible frame; creation exceptions propagate.
+bool PresentManager::RecreateSwapchain(Frame* frame) {
     // Nothing may wait on the old swapchain while it is replaced: its queued ids count as lost.
     std::unique_lock wl{present_wait_mutex, std::defer_lock};
     if (present_wait_enabled) {
@@ -624,8 +650,34 @@ void PresentManager::RecreateSwapchain(Frame* frame) {
             ReportShown(item.id, std::chrono::steady_clock::now(), true);
         }
     }
-    swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
-    SetImageCount();
+    if (swapchain.Create(*surface, frame->width, frame->height, frame->format,
+                         frame->color_space)) {
+        SetImageCount();
+        if (swapchain.GetColorSpace() == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            UpdateHdrMetadata();
+        }
+        ConfigureTransfer(frame);
+        if (transfer_mode != TransferMode::Unsupported) {
+            return true;
+        }
+    }
+    DiscardFrame(frame);
+    return false;
+}
+
+void PresentManager::ConfigureTransfer(const Frame* frame) {
+    transfer_source_format = frame->image_format;
+    transfer_mode = TransferMode::Unsupported;
+    if (frame->color_space == swapchain.GetColorSpace() &&
+        frame->image_format == GetFrameImageFormat(frame->format)) {
+        if (CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageFormat()) &&
+            (device.GetPhysical().GetFormatProperties(frame->image_format).optimalTilingFeatures &
+             VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0) {
+            transfer_mode = TransferMode::Blit;
+        } else if (frame->image_format == swapchain.GetImageFormat()) {
+            transfer_mode = TransferMode::Copy;
+        }
+    }
 }
 
 void PresentManager::SetImageCount() {
@@ -679,7 +731,9 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
 #ifdef __ANDROID__
                 surface = CreateSurface(instance, render_window.GetWindowInfo());
 #endif
-                RecreateSwapchain(frame);
+                if (!RecreateSwapchain(frame)) {
+                    return;
+                }
             }
 
             // Draw to swapchain.
@@ -730,7 +784,7 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
     const auto format = swapchain.GetImageFormat();
     const auto rect = VideoCommon::MapMarioKartPresentRect(
         {frame->game_left, frame->game_top, frame->game_right, frame->game_bottom},
-        frame->width, frame->height, extent.width, extent.height, blit_supported);
+        frame->width, frame->height, extent.width, extent.height, transfer_mode == TransferMode::Blit);
     const bool byte_color = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ||
                             format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB;
     const char* reason = !rect ? "invalid mapped game rectangle" : !byte_color ? "unsupported format" : nullptr;
@@ -808,7 +862,7 @@ void PresentManager::RecordHudlessCheck(Frame* frame, vk::CommandBuffer cmdbuf, 
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, {}, {}, before);
     if (!frame->ui_alpha_valid) {
-        if (blit_supported) {
+        if (transfer_mode == TransferMode::Blit) {
             cmdbuf.BlitImage(
                 *frame->image, SRC, color, DST,
                 MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
@@ -861,7 +915,7 @@ void PresentManager::RecordUiAlpha(Frame* frame, vk::CommandBuffer cmdbuf, VkExt
     }
     const auto rect = VideoCommon::MapMarioKartPresentRect(
         {frame->game_left, frame->game_top, frame->game_right, frame->game_bottom}, frame->width,
-        frame->height, extent.width, extent.height, blit_supported);
+        frame->height, extent.width, extent.height, transfer_mode == TransferMode::Blit);
     const auto format = swapchain.GetImageFormat();
     const char* reason = !rect ? "invalid game rectangle" : nullptr;
     try {
@@ -882,7 +936,7 @@ void PresentManager::RecordUiAlpha(Frame* frame, vk::CommandBuffer cmdbuf, VkExt
                 cmdbuf, frame->ui_images, *frame->image, *frame->hudless_present,
                 MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
                 MakeImageCopy(frame->width, frame->height, extent.width, extent.height),
-                blit_supported, *rect, frame->index);
+                transfer_mode == TransferMode::Blit, *rect, frame->index);
             frame->ui_alpha_valid = true;
         }
     } catch (const std::exception&) {
@@ -943,13 +997,29 @@ void PresentManager::PrepareHudlessPresent(Frame* frame, VkExtent2D extent) {
 
 void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
-    // If the size of the incoming frames has changed, recreate the swapchain
-    // to account for that.
+    // Recreate for size changes, SDR/HDR10/scRGB transitions, or a suboptimal swapchain.
     const bool is_suboptimal = swapchain.NeedsRecreation() || swapchain.IsOutDated();
     const bool size_changed =
         swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
-    if (is_suboptimal || size_changed) {
-        RecreateSwapchain(frame);
+    const bool format_changed = swapchain.GetRequestedFormat() != frame->format;
+    const bool color_space_changed = swapchain.GetRequestedColorSpace() != frame->color_space;
+    if (is_suboptimal || size_changed || format_changed || color_space_changed) {
+        if (!RecreateSwapchain(frame)) {
+            return;
+        }
+    } else if (frame->color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+               Common::DisplayHdrMonitor::Instance().Generation() != hdr_metadata_generation) {
+        // A new calibration or peak while HDR stays on: the game tone maps to the new peak.
+        UpdateHdrMetadata();
+    }
+
+    // Queued SDR frames can retain an older underlying format after surface recreation.
+    if (transfer_source_format != frame->image_format) {
+        ConfigureTransfer(frame);
+    }
+    if (transfer_mode == TransferMode::Unsupported) {
+        DiscardFrame(frame);
+        return;
     }
     if (!swapchain.IsCreated()) {
         DiscardFrame(frame);
@@ -971,7 +1041,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 #endif
     while (swapchain.AcquireNextImage(!use_present_thread)) {
-        RecreateSwapchain(frame);
+        if (!RecreateSwapchain(frame)) {
+            return;
+        }
     }
 #ifdef EGLANTINE_STREAMLINE
     Streamline::NoteFrameGenAcquire(static_cast<u64>(
@@ -1074,7 +1146,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT, {},
                            {}, {}, pre_barriers);
 
-    if (blit_supported) {
+    if (transfer_mode == TransferMode::Blit) {
         cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
@@ -1111,7 +1183,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         };
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, {}, {}, before);
-        if (blit_supported) {
+        if (transfer_mode == TransferMode::Blit) {
             cmdbuf.BlitImage(*frame->hudless->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 *frame->hudless_present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 MakeImageBlit(frame->width, frame->height, extent.width, extent.height), VK_FILTER_LINEAR);
@@ -1184,7 +1256,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     bool valid_game_rect = true;
     if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId) {
         const auto mapped = VideoCommon::MapMarioKartPresentRect(game_rect, frame->width, frame->height,
-                                                                extent.width, extent.height, blit_supported);
+                                                                extent.width, extent.height, transfer_mode == TransferMode::Blit);
         valid_game_rect = mapped.has_value();
         game_rect = mapped.value_or(Common::Rectangle<u32>{});
     }
