@@ -3487,7 +3487,8 @@ bool RasterizerVulkan::RecordBananzaUpscale(ImageView& target, VideoCommon::Bana
         if (!bananza_upscaler->Record(color_view, depth_view, target_view,
                 {extent.width, extent.height}, target_extent, target_extent, scene.camera.matrices.current,
                 scene.camera.matrices.previous, {}, depth->ImageHandle(), render_trace_frame, jitter,
-                depth_format, camera, {depth->size.width, depth->size.height})) {
+                depth_format, camera, {depth->size.width, depth->size.height},
+                (depth->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0)) {
             return fail("temporal upscaler declined the frame");
         }
         bananza_temporal_frame = render_trace_frame;

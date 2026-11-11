@@ -11,6 +11,7 @@
 
 #include "common/frame_gen_stats.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/dlss_evaluation.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -146,10 +147,7 @@ constexpr VkImageUsageFlags FG_COPY_USAGE =
 
 } // Anonymous namespace
 
-void StreamlineDlssUpscaler::CreateFrameGenCopies(const Inputs& in) {
-    if (fg_copies[0].depth) {
-        scheduler.Finish(); // frame generation may still read the old ones
-    }
+StreamlineDlssUpscaler::FrameGenCopy StreamlineDlssUpscaler::CreateFrameGenCopy(const Inputs& in) {
     const auto create = [&](VkFormat format, VkImageAspectFlags aspect, vk::Image& image,
                             vk::ImageView& view) {
         image = memory_allocator.CreateImage(VkImageCreateInfo{
@@ -186,16 +184,51 @@ void StreamlineDlssUpscaler::CreateFrameGenCopies(const Inputs& in) {
             },
         });
     };
-    for (FrameGenCopy& copy : fg_copies) {
-        create(in.depth.format, VK_IMAGE_ASPECT_DEPTH_BIT, copy.depth, copy.depth_view);
-        create(in.motion_vectors.format, VK_IMAGE_ASPECT_COLOR_BIT, copy.motion,
-               copy.motion_view);
+    FrameGenCopy copy;
+    create(in.depth.format, VK_IMAGE_ASPECT_DEPTH_BIT, copy.depth, copy.depth_view);
+    create(in.motion_vectors.format, VK_IMAGE_ASPECT_COLOR_BIT, copy.motion, copy.motion_view);
+    return copy;
+}
+
+void StreamlineDlssUpscaler::CreateFrameGenCopies(const Inputs& in) {
+    if (fg_copies[0].depth) {
+        scheduler.Finish(); // frame generation may still read the old ones
+    }
+    for (auto& slot : fg_copies) {
+        auto copy = CreateFrameGenCopy(in);
+        std::swap(slot, copy);
     }
     fg_copy_extent = in.render_size;
     fg_depth_format = in.depth.format;
     fg_motion_format = in.motion_vectors.format;
     LOG_INFO(Render_Vulkan, "DLSS Frame Generation: {} copies of depth and motion at {}x{}",
              FRAME_GEN_COPIES, in.render_size.width, in.render_size.height);
+}
+
+StreamlineDlssUpscaler::BananzaFrameGenCopy* StreamlineDlssUpscaler::AcquireBananzaFrameGenCopy(
+    const Inputs& in) {
+    scheduler.GetMasterSemaphore().Refresh();
+    for (size_t offset = 0; offset < bananza_fg_copies.size(); ++offset) {
+        const size_t index = (bananza_fg_copy_next + offset) % bananza_fg_copies.size();
+        auto& slot = bananza_fg_copies[index];
+        if (!scheduler.IsFree(slot.tick) || !slot.fence.Ready()) {
+            continue;
+        }
+        if (!slot.images.depth || slot.extent.width != in.render_size.width ||
+            slot.extent.height != in.render_size.height || slot.depth_format != in.depth.format ||
+            slot.motion_format != in.motion_vectors.format) {
+            auto copy = CreateFrameGenCopy(in);
+            std::swap(slot.images, copy);
+            slot.extent = in.render_size;
+            slot.depth_format = in.depth.format;
+            slot.motion_format = in.motion_vectors.format;
+        }
+        slot.tick = scheduler.CurrentTick();
+        slot.fence.Reserve();
+        bananza_fg_copy_next = (index + 1) % bananza_fg_copies.size();
+        return &slot;
+    }
+    return nullptr;
 }
 
 StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler& scheduler_,
@@ -372,10 +405,29 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         CreateBananzaExposure();
     }
 
-    // Bananza lets Streamline own the copies of its changing depth and motion regions.
+    const bool fg_enabled = Streamline::IsFrameGenAvailable() &&
+        Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed);
+    const bool bananza_own_copies = in.bananza_dynamic && Streamline::BananzaFrameGenOwnCopies();
+    BananzaFrameGenCopy* bananza_copy = nullptr;
+    if (fg_enabled && bananza_own_copies) {
+        if (in.depth_transfer_src) {
+            try {
+                bananza_copy = AcquireBananzaFrameGenCopy(in);
+            } catch (const vk::Exception& error) {
+                if (!std::exchange(bananza_fg_fallback_logged, true)) {
+                    LOG_WARNING(Render_Vulkan, "Bananza temporal: FG copy allocation failed ({})",
+                                error.what());
+                }
+            }
+        }
+        if (!bananza_copy && !std::exchange(bananza_fg_fallback_logged, true)) {
+            LOG_WARNING(Render_Vulkan, "Bananza temporal: FG copy unavailable ({})",
+                        in.depth_transfer_src ? "all slots busy, using Streamline copies"
+                                              : "scene depth lacks transfer-source usage");
+        }
+    }
     const FrameGenCopy* fg_copy = nullptr;
-    if (!in.bananza_dynamic && Streamline::IsFrameGenAvailable() && FrameGenOwnCopies() &&
-        Common::FrameGenStats::user_enabled.load(std::memory_order_relaxed)) {
+    if (!in.bananza_dynamic && fg_enabled && FrameGenOwnCopies()) {
         if (!fg_copies[0].depth || fg_copy_extent.width != in.render_size.width ||
             fg_copy_extent.height != in.render_size.height ||
             fg_depth_format != in.depth.format || fg_motion_format != in.motion_vectors.format) {
@@ -410,8 +462,15 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, in, reset, initial_options = options, options_changed, render_changed,
-                      index = frame_index++, fg_copy, output_image_handle = *output_image,
+                      index = frame_index++, fg_copy, bananza_copy, bananza_own_copies,
+                      output_image_handle = *output_image,
                       output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
+        bool copy_handed_off = false;
+        SCOPE_EXIT {
+            if (bananza_copy && !copy_handed_off) {
+                bananza_copy->fence.Release();
+            }
+        };
         const Streamline::Api& api = Streamline::GetApi();
         const sl::ViewportHandle viewport{0u};
         // The caller draws the output this frame even when DLSS writes nothing to it: clear it
@@ -650,6 +709,70 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         };
+        const auto copy_and_tag = [&](const FrameGenCopy& copy, Streamline::FrameGenCopyFence* fence) {
+            // Copy depth and motion (read-only for DLSS right now) into this frame's slot.
+            const auto copy_image = [](VkImage image, VkImageAspectFlags aspect) {
+                return StreamlineDlssUpscaler::Image{
+                    .view = VK_NULL_HANDLE,
+                    .image = image,
+                    .format = VK_FORMAT_UNDEFINED,
+                    .range = {aspect, 0, 1, 0, 1},
+                    .barrier_aspect = aspect,
+                };
+            };
+            const auto depth_copy = copy_image(*copy.depth, in.depth.barrier_aspect);
+            const auto motion_copy = copy_image(*copy.motion, VK_IMAGE_ASPECT_COLOR_BIT);
+            constexpr VkImageLayout READ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            constexpr VkImageLayout SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            constexpr VkImageLayout DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            const std::array before_copy{
+                Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        READ, SRC),
+                Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT,
+                        VK_ACCESS_TRANSFER_READ_BIT, READ, SRC),
+                Barrier(depth_copy, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, DST),
+                Barrier(motion_copy, VK_ACCESS_SHADER_READ_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, DST),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before_copy);
+            const auto region = [&](const StreamlineDlssUpscaler::Image& source,
+                                    VkImageAspectFlags aspect) {
+                return VkImageCopy{
+                    .srcSubresource = {aspect, source.range.baseMipLevel,
+                                       source.range.baseArrayLayer, 1},
+                    .srcOffset = {0, 0, 0},
+                    .dstSubresource = {aspect, 0, 0, 1},
+                    .dstOffset = {0, 0, 0},
+                    .extent = {in.render_size.width, in.render_size.height, 1},
+                };
+            };
+            cmdbuf.CopyImage(in.depth.image, SRC, *copy.depth, DST,
+                             region(in.depth, VK_IMAGE_ASPECT_DEPTH_BIT));
+            cmdbuf.CopyImage(in.motion_vectors.image, SRC, *copy.motion, DST,
+                             region(in.motion_vectors, VK_IMAGE_ASPECT_COLOR_BIT));
+            const std::array after_copy{
+                Barrier(in.depth, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        SRC, READ),
+                Barrier(in.motion_vectors, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_ACCESS_SHADER_READ_BIT, SRC, READ),
+                Barrier(depth_copy, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        DST, READ),
+                Barrier(motion_copy, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        DST, READ),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, after_copy);
+            const sl::Resource depth_tagged =
+                Resource(*copy.depth, *copy.depth_view, in.depth.format, READ,
+                         in.render_size, FG_COPY_USAGE);
+            const sl::Resource motion_tagged =
+                Resource(*copy.motion, *copy.motion_view, in.motion_vectors.format,
+                         READ, in.render_size, FG_COPY_USAGE);
+            Streamline::TagFrameGen(*frame, depth_tagged, motion_tagged, render_area, *cmdbuf,
+                                    sl::ResourceLifecycle::eValidUntilPresent, fence);
+        };
         sl::Result api_result = sl::Result::eOk;
         const auto result = VideoCommon::RecordDlssEvaluation(
             [&] {
@@ -682,68 +805,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                             sl::ResourceLifecycle::eOnlyValidNow);
                     return true;
                 }
-                // Copy depth and motion (read-only for DLSS right now) into this frame's slot.
-                const auto copy_image = [](VkImage image, VkImageAspectFlags aspect) {
-                    return StreamlineDlssUpscaler::Image{
-                        .view = VK_NULL_HANDLE,
-                        .image = image,
-                        .format = VK_FORMAT_UNDEFINED,
-                        .range = {aspect, 0, 1, 0, 1},
-                        .barrier_aspect = aspect,
-                    };
-                };
-                const auto depth_copy = copy_image(*fg_copy->depth, in.depth.barrier_aspect);
-                const auto motion_copy = copy_image(*fg_copy->motion, VK_IMAGE_ASPECT_COLOR_BIT);
-                constexpr VkImageLayout READ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                constexpr VkImageLayout SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                constexpr VkImageLayout DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                const std::array before_copy{
-                    Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                            READ, SRC),
-                    Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT,
-                            VK_ACCESS_TRANSFER_READ_BIT, READ, SRC),
-                    Barrier(depth_copy, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_IMAGE_LAYOUT_UNDEFINED, DST),
-                    Barrier(motion_copy, VK_ACCESS_SHADER_READ_BIT,
-                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, DST),
-                };
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before_copy);
-                const auto region = [&](const StreamlineDlssUpscaler::Image& source,
-                                        VkImageAspectFlags aspect) {
-                    return VkImageCopy{
-                        .srcSubresource = {aspect, source.range.baseMipLevel,
-                                           source.range.baseArrayLayer, 1},
-                        .srcOffset = {0, 0, 0},
-                        .dstSubresource = {aspect, 0, 0, 1},
-                        .dstOffset = {0, 0, 0},
-                        .extent = {in.render_size.width, in.render_size.height, 1},
-                    };
-                };
-                cmdbuf.CopyImage(in.depth.image, SRC, *fg_copy->depth, DST,
-                                 region(in.depth, VK_IMAGE_ASPECT_DEPTH_BIT));
-                cmdbuf.CopyImage(in.motion_vectors.image, SRC, *fg_copy->motion, DST,
-                                 region(in.motion_vectors, VK_IMAGE_ASPECT_COLOR_BIT));
-                const std::array after_copy{
-                    Barrier(in.depth, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
-                            SRC, READ),
-                    Barrier(in.motion_vectors, VK_ACCESS_TRANSFER_READ_BIT,
-                            VK_ACCESS_SHADER_READ_BIT, SRC, READ),
-                    Barrier(depth_copy, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                            DST, READ),
-                    Barrier(motion_copy, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                            DST, READ),
-                };
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, after_copy);
-                const sl::Resource depth_tagged =
-                    Resource(*fg_copy->depth, *fg_copy->depth_view, in.depth.format, READ,
-                             in.render_size, FG_COPY_USAGE);
-                const sl::Resource motion_tagged =
-                    Resource(*fg_copy->motion, *fg_copy->motion_view, in.motion_vectors.format,
-                             READ, in.render_size, FG_COPY_USAGE);
-                Streamline::TagFrameGen(*frame, depth_tagged, motion_tagged, render_area, *cmdbuf,
-                                        sl::ResourceLifecycle::eValidUntilPresent);
+                copy_and_tag(*fg_copy, nullptr);
                 return true;
             },
             [&] {
@@ -752,8 +814,13 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 const bool evaluated = api_result == sl::Result::eOk ||
                                        api_result == sl::Result::eWarnOutOfVRAM;
                 if (evaluated && in.bananza_dynamic) {
-                    Streamline::TagFrameGen(*frame, depth, motion, render_area, *cmdbuf,
-                                            sl::ResourceLifecycle::eOnlyValidNow);
+                    if (bananza_copy) {
+                        copy_and_tag(bananza_copy->images, &bananza_copy->fence);
+                        copy_handed_off = true;
+                    } else if (!bananza_own_copies || in.depth_transfer_src) {
+                        Streamline::TagFrameGen(*frame, depth, motion, render_area, *cmdbuf,
+                                                sl::ResourceLifecycle::eOnlyValidNow);
+                    }
                 }
                 // eWarnOutOfVRAM is a warning: the evaluation was recorded. Treating it as a
                 // failure turned DLSS off for the session on an 8 GB card with other apps open.

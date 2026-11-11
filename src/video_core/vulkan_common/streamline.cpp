@@ -27,6 +27,7 @@
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/streamline_api.h"
@@ -64,7 +65,11 @@ struct State {
     ExtraQueues fg_queues{};
     std::vector<std::string> fg_device_extensions;
     // Per frame: the token of the latest DLSS evaluation, until a present takes it (worker).
-    std::atomic<const sl::FrameToken*> fg_tagged{};
+    std::mutex fg_tag_mutex;
+    FrameGenSubmission fg_tagged;
+    std::mutex fg_copy_fence_mutex;
+    u64 fg_swapchain_generation{};
+    std::array<VkExtent2D, 2> fg_bananza_logged_extent{};
     std::optional<VkExtent2D> fg_bananza_static_extent; // Vulkan worker
     bool fg_bananza_static_suspended{};
     bool fg_reflex_set{}; ///< Worker
@@ -712,6 +717,14 @@ bool FrameGenWaitsForInputs() {
     return waits;
 }
 
+bool BananzaFrameGenOwnCopies() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DKB_FG_COPY");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
 static bool BananzaFrameGenDynamicResolution() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_DKB_FG_DYNAMIC");
@@ -721,7 +734,14 @@ static bool BananzaFrameGenDynamicResolution() {
 }
 
 void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const sl::Resource& motion,
-                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle) {
+                 const sl::Extent& area, VkCommandBuffer cmdbuf, sl::ResourceLifecycle lifecycle,
+                 FrameGenCopyFence* copy_fence) {
+    bool attempted = false;
+    SCOPE_EXIT {
+        if (copy_fence) {
+            copy_fence->Release({.pending = attempted});
+        }
+    };
     State& state = GetState();
     if (!IsFrameGenAvailable()) {
         return;
@@ -753,9 +773,8 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
     if (!user_on) {
         return;
     }
-    const bool bananza_static =
-        !BananzaFrameGenDynamicResolution() &&
-        Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId;
+    const bool bananza = Settings::GetCurrentProgramID() == Settings::DonkeyKongBananzaProgramId;
+    const bool bananza_static = bananza && !BananzaFrameGenDynamicResolution();
     if (bananza_static && state.fg_bananza_static_extent) {
         const auto fixed = *state.fg_bananza_static_extent;
         if (area.width != fixed.width || area.height != fixed.height) {
@@ -823,6 +842,7 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
                         lifecycle, &area},
     };
     const auto tag_begin = std::chrono::steady_clock::now();
+    attempted = true;
     const sl::Result result =
         api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, tags, static_cast<u32>(std::size(tags)),
                               reinterpret_cast<sl::CommandBuffer*>(cmdbuf));
@@ -838,6 +858,14 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
         }
         return;
     }
+    if (bananza) {
+        auto& logged_extent = state.fg_bananza_logged_extent[copy_fence != nullptr];
+        if (logged_extent.width != area.width || logged_extent.height != area.height) {
+            LOG_INFO(Render_Vulkan, "Bananza temporal: FG {} copies at {}x{}",
+                     copy_fence ? "emulator-owned" : "Streamline-owned", area.width, area.height);
+            logged_extent = {area.width, area.height};
+        }
+    }
     if (bananza_static) {
         if (!state.fg_bananza_static_extent) {
             state.fg_bananza_static_extent = VkExtent2D{area.width, area.height};
@@ -848,7 +876,11 @@ void TagFrameGen(const sl::FrameToken& frame, const sl::Resource& depth, const s
                      area.width, area.height);
         }
     }
-    state.fg_tagged.store(&frame, std::memory_order_release);
+    std::scoped_lock lock{state.fg_tag_mutex};
+    if (state.fg_tagged.copy_fence) {
+        state.fg_tagged.copy_fence->Release(); // This token never reached a presentation frame.
+    }
+    state.fg_tagged = {const_cast<sl::FrameToken*>(&frame), std::exchange(copy_fence, nullptr)};
 }
 
 void NoteFrameGenAcquire(u64 ns) {
@@ -896,12 +928,40 @@ u32 FrameGenSwapchainImages() {
     return value ? static_cast<u32>(std::atoi(value)) : 0;
 }
 
-void* TakeFrameGenToken() {
-    State& state = GetState();
+FrameGenSubmission TakeFrameGenSubmission() {
     if (!IsFrameGenAvailable()) {
-        return nullptr;
+        return {};
     }
-    return const_cast<sl::FrameToken*>(state.fg_tagged.exchange(nullptr, std::memory_order_acq_rel));
+    State& state = GetState();
+    std::scoped_lock lock{state.fg_tag_mutex};
+    return std::exchange(state.fg_tagged, {});
+}
+
+bool FrameGenCopyFence::Ready() {
+    State& state = GetState();
+    return Ready([&](VkSemaphore semaphore, u64 value) {
+        std::scoped_lock lock{state.fg_copy_fence_mutex};
+        if (generation != state.fg_swapchain_generation) {
+            return true; // The old swapchain was drained and destroyed.
+        }
+        if (!state.wait_semaphores) {
+            return false;
+        }
+        const VkSemaphoreWaitInfo wait{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &value,
+        };
+        return state.wait_semaphores(state.device, &wait, 0) == VK_SUCCESS;
+    });
+}
+
+std::unique_lock<std::mutex> LockFrameGenCopyFencesForSwapchainReset() {
+    State& state = GetState();
+    std::unique_lock lock{state.fg_copy_fence_mutex};
+    ++state.fg_swapchain_generation;
+    return lock;
 }
 
 bool WaitFrameGenInputs(FrameGenInputFence& fence) {
@@ -1137,7 +1197,15 @@ void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_ri
     state.fg_present_begin = std::chrono::steady_clock::now();
 }
 
-void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs) {
+void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs, FrameGenCopyFence* copy_fence) {
+    FrameGenInputFence copy_completion{.pending = true};
+    SCOPE_EXIT {
+        if (copy_fence) {
+            State& state = GetState();
+            std::scoped_lock lock{state.fg_copy_fence_mutex};
+            copy_fence->Release(copy_completion, state.fg_swapchain_generation);
+        }
+    };
     State& state = GetState();
     if (!IsFrameGenAvailable() || !token) {
         return;
@@ -1167,6 +1235,8 @@ void FrameGenAfterPresent(void* token, FrameGenInputFence* inputs) {
         inputs->value = fg_state.lastPresentInputsProcessingCompletionFenceValue;
     }
     if (fg_state.inputsProcessingCompletionFence) {
+        copy_completion.semaphore = static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence);
+        copy_completion.value = fg_state.lastPresentInputsProcessingCompletionFenceValue;
         state.fg_inputs_value.store(fg_state.lastPresentInputsProcessingCompletionFenceValue,
                                     std::memory_order_release);
         state.fg_inputs_fence.store(static_cast<VkSemaphore>(fg_state.inputsProcessingCompletionFence),
@@ -1244,9 +1314,13 @@ void Stop() {
     state.fg_on = false;
     state.fg_frames = 0;
     state.fg_dynamic_resolution = false;
+    state.fg_bananza_logged_extent = {};
     state.fg_bananza_static_extent.reset();
     state.fg_bananza_static_suspended = false;
-    state.fg_tagged.store(nullptr, std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{state.fg_tag_mutex};
+        state.fg_tagged = {};
+    }
     state.fg_inputs_fence.store(VK_NULL_HANDLE, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "NVIDIA Streamline stopped (result {})", static_cast<int>(result));
 }

@@ -73,7 +73,7 @@ public:
                 VkImage depth_image, u64 frame, std::array<f32, 2> jitter = {},
                 VkFormat depth_format = VK_FORMAT_D32_SFLOAT,
                 std::optional<VideoCommon::TemporalCameraConstants> camera = std::nullopt,
-                VkExtent2D depth_allocation_size = {});
+                VkExtent2D depth_allocation_size = {}, bool depth_transfer_src = false);
 
 private:
     struct Impl;

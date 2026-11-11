@@ -174,7 +174,14 @@ void Swapchain::Create(
         }
         vk::Check(result);
     }
-    Destroy();
+    {
+#ifdef EGLANTINE_STREAMLINE
+        auto copy_fence_lock = swapchain && Streamline::BananzaFrameGenOwnCopies()
+                                   ? Streamline::LockFrameGenCopyFencesForSwapchainReset()
+                                   : std::unique_lock<std::mutex>{};
+#endif
+        Destroy();
+    }
 
     CreateSwapchain(capabilities);
     CreateSemaphores();
@@ -245,7 +252,7 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     return false;
 }
 
-u64 Swapchain::Present(VkSemaphore render_semaphore) {
+u64 Swapchain::Present(VkSemaphore render_semaphore, bool* presented) {
     const auto present_queue{device.GetSwapchainQueue()};
     // Ids for vkWaitForPresentKHR (the host frame pacer). They only have to increase per
     // swapchain, so one counter serves every swapchain this object creates.
@@ -303,6 +310,9 @@ u64 Swapchain::Present(VkSemaphore render_semaphore) {
     ++frame_index;
     if (frame_index >= image_count) {
         frame_index = 0;
+    }
+    if (presented) {
+        *presented = queued;
     }
     return queued ? present_id : 0;
 }
