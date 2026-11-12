@@ -1810,14 +1810,18 @@ private:
         Common::Nx2Timeline::ArgSpan timeline_span{"guest present"};
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        // SetNativeWindowNextOrigin encodes lower-left origin in the present flags.
+        constexpr u32 LowerLeftOrigin = 1u << 18;
+        const bool flip_vertical = (w[8] & LowerLeftOrigin) != 0;
         timeline_span.Set(0, {"frame", m_presents});
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
-            LOG_INFO(Service, "nx2:vi2 229 present #{} by t{} token={:#x} slot={} image={}", m_presents, ctx.GetThread().GetThreadId(),
-                     u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
+            LOG_INFO(Service, "nx2:vi2 229 present #{} by t{} token={:#x} slot={} image={} flags={:#x}",
+                     m_presents, ctx.GetThread().GetThreadId(), u64{w[2]} | (u64{w[3]} << 32),
+                     w[4], w[5], w[8]);
         }
         NoteFrameFence(~w[22], w[24]);
         // Wait for this frame's fence, so the game doesn't write the next frame's data (constant
@@ -1869,7 +1873,7 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
-        Composite(w[5], ~w[22], w[24], w[7]);
+        Composite(w[5], ~w[22], w[24], w[7], flip_vertical);
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
@@ -2332,7 +2336,7 @@ private:
     // RGBA8 surface in the console's native GOB layout at GPU address == CPU address.
     // shown_size: the present's word 7, ((height - 1) << 16) | (width - 1) of the area the game drew
     // into from the image's top-left corner (0 when it gives none).
-    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size) {
+    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size, bool flip_vertical) {
         Common::Nx2Timeline::Span timeline_span{"present: composite"};
         u64 address{};
         u32 parent{};
@@ -2442,7 +2446,8 @@ private:
             // Preference word 6: 1 = RGBA8, 4 = RGB10A2.
             .pixel_format = image_format == 4 ? android::PixelFormat::Rgba1010102
                                               : android::PixelFormat::Rgba8888,
-            .transform_flags = android::BufferTransformFlags::Unset,
+            .transform_flags = flip_vertical ? android::BufferTransformFlags::FlipV
+                                             : android::BufferTransformFlags::Unset,
             .crop_rect = {0, 0, static_cast<int>(crop_width), static_cast<int>(crop_height)},
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
