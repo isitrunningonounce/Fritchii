@@ -54,6 +54,8 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(OotRefreshCap, false);
 SWITCHABLE(OotMovieUpscale, false);
+SWITCHABLE(HdrMode, false);
+SWITCHABLE(HdrSwapchain, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);

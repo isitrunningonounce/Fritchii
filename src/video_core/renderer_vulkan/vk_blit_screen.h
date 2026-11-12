@@ -8,6 +8,8 @@
 
 #include <list>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -60,10 +62,12 @@ public:
                         Scheduler& scheduler, const PresentFilters& filters);
     ~BlitScreen();
 
+    /// Composites layers into a frame presented as output (SDR for captures).
     void DrawToFrame(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
                      std::span<const Tegra::FramebufferConfig> framebuffers,
                      const Layout::FramebufferLayout& layout, size_t current_swapchain_image_count,
-                     VkFormat current_swapchain_view_format, bool prepare_hudless = false);
+                     VkFormat current_swapchain_view_format, const HdrPresent& output = {},
+                     bool prepare_hudless = false);
 
     void PrepareFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
 
@@ -74,6 +78,12 @@ public:
 private:
     void WaitIdle(const Device& device);
     void SetWindowAdaptPass(const Device& device);
+    /// The render pass of the frame's framebuffer: the HDR10 encode's, else the window adapt's.
+    VkRenderPass FrameRenderPass() const;
+    /// Composites the layers in scRGB, then encodes the composite to PQ into the frame.
+    void DrawHdr10(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
+                   std::span<const Tegra::FramebufferConfig> framebuffers,
+                   const Layout::FramebufferLayout& layout, const HdrPresent& output);
     vk::Framebuffer CreateFramebuffer(const Device& device, const VkImageView& image_view, VkExtent2D extent,
                                       VkRenderPass render_pass);
 
@@ -92,6 +102,16 @@ private:
     std::list<Layer> hudless_layers{};
     const char* hudless_reason{"not initialized"};
     bool hudless_failed{};
+
+    struct Hdr10Composite {
+        vk::Image image{};
+        vk::ImageView image_view{};
+        vk::Framebuffer framebuffer{};
+        u64 tick{};
+    };
+    std::optional<HdrConvertPass> hdr10_encode{};
+    std::vector<Hdr10Composite> hdr10_composite{};
+    VkExtent2D hdr10_composite_extent{};
 };
 
 } // namespace Vulkan

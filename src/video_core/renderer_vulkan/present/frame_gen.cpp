@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -199,28 +200,36 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                        VkExtent2D guest_extent) {
     generated = false;
 
-    if (!shaders) {
-        shaders.emplace(device);
-    }
-
-    if (unavailable || !Settings::FrameGenActive()) {
+    if (!Settings::FrameGenActive()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
             chain.reset();
             fsr3_chain.reset();
         }
         warm_streak = 0;
-        return;
-    }
-
-    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
-        unavailable = true;
+        unsupported_format = VK_FORMAT_UNDEFINED;
         return;
     }
 
     if (!frame->storage_view) {
+        if (unsupported_format != format) {
+            unsupported_format = format;
+            LOG_WARNING(Render_Vulkan, "Frame generation cannot write present format {}",
+                        string_VkFormat(format));
+        }
         warm_streak = 0;
         return;
+    }
+    unsupported_format = VK_FORMAT_UNDEFINED;
+
+    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    if (!use_fsr3) {
+        if (!shaders) {
+            shaders.emplace(device);
+        }
+        if (!shaders->IsValid()) {
+            return;
+        }
     }
 
     peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
@@ -228,9 +237,10 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
 
     const VkExtent2D extent{.width = frame->width, .height = frame->height};
     const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, extent);
-    if ((!chain && !fsr3_chain) || built_extent.width != extent.width || built_extent.height != extent.height ||
+    if ((use_fsr3 ? !fsr3_chain : !chain) || built_extent.width != extent.width ||
+        built_extent.height != extent.height ||
         built_format != format || built_flow_scale != flow_scale) {
-        Rebuild(device, extent, format, flow_scale);
+        Rebuild(device, extent, format, flow_scale, use_fsr3);
     }
 
     const u64 count = frame_count++;
@@ -241,9 +251,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
 
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-
-    if (use_fsr3 && fsr3_chain) {
+    if (fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
         fsr3_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count);
     } else if (chain) {
@@ -267,10 +275,6 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
 }
 
 size_t FrameGen::WantedGenerations(size_t capacity) {
-    if (unavailable) {
-        plan = {};
-        return 0;
-    }
     plan = pacer.Plan(capacity);
     return plan.generations;
 }
@@ -280,9 +284,7 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-
-    if (use_fsr3 && fsr3_chain) {
+    if (fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
 
@@ -305,21 +307,21 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
     }
 }
 
-void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale) {
+void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale,
+                       bool use_fsr3) {
     scheduler.Finish();
     chain.reset();
     fsr3_chain.reset();
 
     built_flow_scale = flow_scale;
 
-    const bool fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-    if (fsr3) {
+    if (use_fsr3) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
     }
     LOG_INFO(Render_Vulkan, "Frame generation: {} at {}x{}, multiplier {}, target {} fps, flow {}",
-             fsr3 ? "FSR 3" : "LSFG", extent.width, extent.height, Settings::FrameGenMultiplier(),
+             use_fsr3 ? "FSR 3" : "LSFG", extent.width, extent.height, Settings::FrameGenMultiplier(),
              Settings::values.frame_gen_target_rate.GetValue(), flow_scale);
     built_extent = extent;
     built_format = format;

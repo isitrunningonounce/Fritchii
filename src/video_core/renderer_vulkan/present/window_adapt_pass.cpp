@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cmath>
+
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/host_shaders/vulkan_present_vert_spv.h"
@@ -35,17 +37,16 @@ WindowAdaptPass::~WindowAdaptPass() = default;
 void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, Scheduler& scheduler, size_t image_index,
                            std::list<Layer>& layers,
                            std::span<const Tegra::FramebufferConfig> configs,
-                           const Layout::FramebufferLayout& layout, Frame* dst,
+                           const Layout::FramebufferLayout& layout,
+                           VkFramebuffer framebuffer, VkExtent2D extent,
+                           const HdrPresent& output,
                            std::span<const FramebufferTextureInfo> overrides,
                            FramebufferTextureInfo* first_texture) {
 
-    const VkFramebuffer host_framebuffer{*dst->framebuffer};
+    const VkFramebuffer host_framebuffer{framebuffer};
     const VkRenderPass renderpass{*render_pass};
     const VkPipelineLayout graphics_pipeline_layout{*pipeline_layout};
-    const VkExtent2D render_area{
-        .width = dst->width,
-        .height = dst->height,
-    };
+    const VkExtent2D render_area{extent};
 
     const size_t layer_count = configs.size();
     std::vector<PresentPushConstants> push_constants(layer_count);
@@ -68,16 +69,25 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
         }
 
         layer_it->ConfigureDraw(device, &push_constants[i], &descriptor_sets[i], rasterizer, *sampler,
-                                image_index, configs[i], layout,
+                                image_index, configs[i], layout, output,
                                 overrides.empty() ? nullptr : &overrides[i],
                                 i == 0 ? first_texture : nullptr);
         layer_it++;
     }
 
     const auto draw = [=](vk::CommandBuffer cmdbuf) {
-        const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
-        const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
-        const f32 bg_blue = Settings::values.bg_blue.GetValue() / 255.0f;
+        const auto background_channel = [&](u8 channel) {
+            const f32 srgb = channel / 255.0f;
+            if (!output.IsHdr()) {
+                return srgb;
+            }
+            const f32 linear = srgb <= 0.04045f ? srgb / 12.92f
+                                               : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+            return linear * (output.reference_white / 80.0f);
+        };
+        const f32 bg_red = background_channel(Settings::values.bg_red.GetValue());
+        const f32 bg_green = background_channel(Settings::values.bg_green.GetValue());
+        const f32 bg_blue = background_channel(Settings::values.bg_blue.GetValue());
         const VkClearAttachment clear_attachment{
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .colorAttachment = 0,
