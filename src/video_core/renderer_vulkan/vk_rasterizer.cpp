@@ -32,6 +32,7 @@
 #include "common/assert.h"
 #include "core/lichii_telemetry.h"
 #include "common/dkb_frame_trace.h"
+#include "common/display_hdr.h"
 #include "common/host_memory.h"
 #include "common/memory_detect.h"
 #include "shader_recompiler/exception.h"
@@ -1026,14 +1027,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
+    constexpr u64 final_fragment_hdr = 0x5b1e35e21d880a91ULL;
     const auto hashes = pipeline->ShaderHashes();
-    if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
+    if (oot_4k_scene_frame == render_trace_frame && oot_live_dlss &&
+        hashes[5] == (oot_live_dlss->HdrScene() ? final_fragment_hdr : final_fragment) &&
         std::ranges::find(hashes, final_vertex) != hashes.end()) {
         const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
         if (target_id) {
             const auto& target = texture_cache.GetImageView(target_id);
+            const auto final_format = oot_live_dlss->HdrScene()
+                                          ? VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM
+                                          : VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB;
             if (target.size.width == 2560 && target.size.height == 1440 &&
-                target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
+                target.format == final_format) {
                 oot_4k_guest_present = target.ImageHandle();
             }
         }
@@ -4069,10 +4075,31 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         if (!target_view || (upscale_4k && !scene_reference)) {
             return fail("no upscale target view");
         }
+        auto& monitor = Common::DisplayHdrMonitor::Instance();
+        const bool hdr_scene = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+            Common::ResolveGuestHdrOutput(monitor.Current(), Settings::values.hdr_mode.GetValue(),
+                                         Settings::values.hdr_peak_luminance.GetValue(),
+                                         Settings::values.hdr_reference_white.GetValue(),
+                                         monitor.PresentingHdr()).enabled;
+        if (oot_live_dlss && oot_live_dlss->HdrScene() != hdr_scene) {
+            // Queued passes retain the old upscaler and its images. Drain them before changing
+            // encoding, and discard its temporal history and present target together.
+            scheduler.Finish();
+            oot_live_dlss.reset();
+            oot_dlss_frame.reset();
+            oot_4k_scene_frame.reset();
+            oot_4k_guest_present = VK_NULL_HANDLE;
+        }
+        // vi2 notifies the guest asynchronously. Keep its own upscale until its presentation
+        // confirms the new encoding, instead of treating an SDR scene as HDR (or vice versa).
+        if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+            (!oot_present_hdr || *oot_present_hdr != hdr_scene)) {
+            return fail("waiting for the guest HDR output transition");
+        }
         if (!oot_live_dlss) {
             oot_live_dlss = std::make_unique<OcarinaUpscaler>(
                 device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator,
-                staging_pool, *oot_backend);
+                staging_pool, *oot_backend, OcarinaUpscaler::Profile::Ocarina, hdr_scene);
         }
         const VkExtent2D target_extent{target.size.width, target.size.height};
         // The offset this frame's scene was drawn with (none when no scene draw was offset).
@@ -4434,6 +4461,14 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
         return {};
     }
     std::scoped_lock lock{texture_cache.mutex};
+    if (config.native_tiling && OcarinaTemporalEnabled()) {
+        if (config.color_space == Tegra::ColorSpace::RGB709 ||
+            config.color_space == Tegra::ColorSpace::RGB2020_PQ) {
+            oot_present_hdr = config.color_space == Tegra::ColorSpace::RGB2020_PQ;
+        } else {
+            oot_present_hdr.reset();
+        }
+    }
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
     static u32 display_trace_count{};
@@ -4469,10 +4504,12 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
                        (mkw_temporal_frame == render_trace_frame && !mkw_upscaler->EvaluationFailed()) ||
                        (bananza_temporal_frame == render_trace_frame &&
                         !bananza_upscaler->EvaluationFailed());
-    if (oot_4k_scene_frame == render_trace_frame && info.image &&
+    if (oot_4k_scene_frame == render_trace_frame && oot_live_dlss && info.image &&
         info.image == oot_4k_guest_present && info.image_view &&
         info.width == 2560 && info.height == 1440 && !scaled &&
-        image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM &&
+        image_view->format == (oot_live_dlss->HdrScene()
+                                   ? VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM
+                                   : VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM) &&
         !oot_live_dlss->EvaluationFailed() && !frame_dump.Capturing()) {
         try {
             oot_live_dlss->Composite4k(info.image_view, render_trace_frame);

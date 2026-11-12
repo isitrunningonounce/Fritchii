@@ -44,10 +44,12 @@ public:
     OcarinaUpscaler(const Device& device, Scheduler& scheduler, DescriptorPool& pool,
                    ComputePassDescriptorQueue& queue, MemoryAllocator& allocator,
                    StagingBufferPool& staging, VideoCommon::OcarinaUpscaleBackend backend,
-                   Profile profile = Profile::Ocarina);
+                   Profile profile = Profile::Ocarina, bool hdr_scene = false);
     ~OcarinaUpscaler();
 
     [[nodiscard]] bool EvaluationFailed() const;
+    /// The scene is linear HDR and its 4K composite is HDR10.
+    [[nodiscard]] bool HdrScene() const;
     /// Save the 1440p temporal scene copy before the game adds its HUD.
     void SaveSceneReference(VkImageView color);
     void SaveMarioKartScene(VkImage color, VkExtent2D extent);

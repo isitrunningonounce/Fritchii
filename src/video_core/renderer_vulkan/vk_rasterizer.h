@@ -399,6 +399,7 @@ private:
         std::array<f32, 16> previous{};
     } oot_motion;
     std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
+    std::optional<bool> oot_present_hdr; ///< encoding confirmed by the guest's last native present
     bool oot_live_failed{};
     const char* oot_fallback_reason{};
     u32 oot_fallback_repeats{};

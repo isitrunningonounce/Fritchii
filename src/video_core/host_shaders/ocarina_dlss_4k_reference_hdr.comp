@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D guest_scene;
+layout(binding = 1, rgba16f) uniform writeonly image2D reference_color;
+
+// The game's HDR10 output pass: PQ of 203 nits times the BT.709 to BT.2020 matrix times the
+// linear scene, measured on a frame dump (code error under 0.03 of 1023).
+vec3 encode_hdr10(vec3 linear) {
+    const mat3 bt709_to_bt2020 = mat3(0.627404, 0.069097, 0.016391,
+                                      0.329283, 0.919540, 0.088013,
+                                      0.043313, 0.011362, 0.895595);
+    vec3 y = pow(max(bt709_to_bt2020 * linear, vec3(0.0)) * (203.0 / 10000.0), vec3(0.1593017578125));
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), vec3(78.84375));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(reference_color)))) {
+        return;
+    }
+    // Encoded like the native composite, so both filter alike when the 4K composite samples them.
+    imageStore(reference_color, pixel,
+               vec4(encode_hdr10(texelFetch(guest_scene, pixel, 0).rgb), 1.0));
+}

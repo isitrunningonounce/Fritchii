@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D dlss_scene;       // linear, 3840x2160
+layout(binding = 1) uniform sampler2D native_scene;     // HDR10-encoded, 2560x1440
+layout(binding = 2) uniform sampler2D native_composite; // HDR10-encoded, 2560x1440
+layout(binding = 3, rgb10_a2) uniform writeonly image2D output_color;
+layout(push_constant) uniform Controls { uint use_dlss; } controls;
+
+// Same encoding as ocarina_dlss_4k_reference_hdr.comp.
+vec3 encode_hdr10(vec3 linear) {
+    const mat3 bt709_to_bt2020 = mat3(0.627404, 0.069097, 0.016391,
+                                      0.329283, 0.919540, 0.088013,
+                                      0.043313, 0.011362, 0.895595);
+    vec3 y = pow(max(bt709_to_bt2020 * linear, vec3(0.0)) * (203.0 / 10000.0), vec3(0.1593017578125));
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), vec3(78.84375));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(output_color);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    vec3 composite = textureLod(native_composite, uv, 0).rgb;
+    if (controls.use_dlss != 0) {
+        vec3 scene = encode_hdr10(texelFetch(dlss_scene, pixel, 0).rgb);
+        vec3 reference = textureLod(native_scene, uv, 0).rgb;
+        vec3 overlay = composite - reference;
+        float difference = max(max(abs(overlay.r), abs(overlay.g)), abs(overlay.b));
+        // Preserve the native composite where HUD or postprocessing substantially changes color.
+        // PQ puts SDR white near 0.58, so the SDR composite's thresholds are scaled to it.
+        float coverage = smoothstep(0.015, 0.07, difference);
+        composite = mix(scene + overlay, composite, coverage);
+    }
+    imageStore(output_color, pixel, vec4(clamp(composite, 0.0, 1.0), 1.0));
+}
