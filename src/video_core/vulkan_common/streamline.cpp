@@ -991,6 +991,27 @@ bool WaitFrameGenInputs(FrameGenInputFence& fence) {
     return retired;
 }
 
+void FrameGenSuspend() {
+    State& state = GetState();
+    if (!IsFrameGenAvailable() || !state.fg_on) {
+        return;
+    }
+    sl::DLSSGOptions options{};
+    options.mode = sl::DLSSGMode::eOff;
+    options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+    const auto result = state.api.dlssg_set_options(sl::ViewportHandle{0u}, options);
+    if (result != sl::Result::eOk) {
+        LOG_WARNING(Render_Vulkan, "DLSS Frame Generation suspend failed (result {})",
+                    static_cast<int>(result));
+        return;
+    }
+    state.fg_on = false;
+    state.fg_frames = 0;
+    state.fg_dynamic_resolution = false;
+    state.fg_ui = {};
+    Common::FrameGenStats::active.store(false, std::memory_order_relaxed);
+}
+
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
                            u32 game_bottom, VkExtent2D frame_extent, VkExtent2D swapchain_extent,
                            const FrameGenHudlessImage* hudless,

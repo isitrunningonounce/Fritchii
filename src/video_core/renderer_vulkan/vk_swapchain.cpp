@@ -72,13 +72,15 @@ VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats,
 }
 
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
-                                              bool has_fifo_relaxed) {
+                                              bool has_fifo_relaxed,
+                                              [[maybe_unused]] VkFormat format) {
 #ifdef EGLANTINE_STREAMLINE
     // DLSS Frame Generation in Vulkan has no VSync (NVIDIA: VSync with frame generation is D3D12
     // only): with Mailbox the generated frame, presented just before the real one, was replaced
     // before it was shown (FrameView saw only the real ~50 per second). Immediate presents both.
     // LICHII_DLSS_FG_VSYNC=1 keeps the setting's mode. Here so NeedsPresentModeUpdate agrees.
-    if (Streamline::IsFrameGenAvailable() && has_imm) {
+    if (Streamline::IsFrameGenAvailable() && Streamline::FrameGenSupportsSwapchain(format) &&
+        has_imm) {
         const char* const keep = std::getenv("LICHII_DLSS_FG_VSYNC");
         if (!keep || keep[0] != '1') {
             return VK_PRESENT_MODE_IMMEDIATE_KHR;
@@ -330,7 +332,9 @@ u64 Swapchain::Present(VkSemaphore render_semaphore, bool* presented) {
     // No present ids with DLSS Frame Generation (LICHII_DLSS_FG_PRESENT_ID=1 keeps them): its
     // pacer presents on its own, and the ids may keep its present synchronous.
 #ifdef EGLANTINE_STREAMLINE
-    const bool frame_gen_drops_ids = Streamline::FrameGenDropsPresentIds();
+    const bool frame_gen_drops_ids =
+        Streamline::FrameGenSupportsSwapchain(GetImageFormat()) &&
+        Streamline::FrameGenDropsPresentIds();
 #else
     constexpr bool frame_gen_drops_ids = false;
 #endif
@@ -405,11 +409,18 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
                                  VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.end();
 
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
+    [[maybe_unused]] const VkFormat previous_format = GetImageFormat();
     surface_format = ChooseSwapSurfaceFormat(formats, requested_format, requested_color_space);
-    present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, GetImageFormat());
 #ifdef EGLANTINE_STREAMLINE
-    if (Streamline::IsFrameGenAvailable() && present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+    const bool dlss_frame_gen =
+        Streamline::IsFrameGenAvailable() && Streamline::FrameGenSupportsSwapchain(GetImageFormat());
+    if (dlss_frame_gen && present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
         LOG_INFO(Render_Vulkan, "DLSS Frame Generation: presenting without VSync (Immediate)");
+    }
+    if (Streamline::IsFrameGenAvailable() && previous_format != GetImageFormat() &&
+        !Streamline::FrameGenSupportsSwapchain(GetImageFormat())) {
+        LOG_INFO(Render_Vulkan, "DLSS Frame Generation paused on scRGB; use HDR10 to enable it");
     }
 #endif
 
@@ -427,7 +438,8 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     }
 #ifdef EGLANTINE_STREAMLINE
     // DLSS Frame Generation paces two presents per frame: more images in flight (test).
-    if (const u32 fg_images = Streamline::FrameGenSwapchainImages(); fg_images != 0) {
+    if (const u32 fg_images = dlss_frame_gen ? Streamline::FrameGenSwapchainImages() : 0;
+        fg_images != 0) {
         requested_image_count = (std::max)(requested_image_count, fg_images);
         if (capabilities.maxImageCount > 0) {
             requested_image_count = (std::min)(requested_image_count, capabilities.maxImageCount);
@@ -554,7 +566,8 @@ void Swapchain::SetHdrMetadata(u16 peak_luminance, u16 reference_white) const {
 }
 
 bool Swapchain::NeedsPresentModeUpdate() const {
-    const auto requested_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    const auto requested_mode =
+        ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, GetImageFormat());
     return present_mode != requested_mode;
 }
 

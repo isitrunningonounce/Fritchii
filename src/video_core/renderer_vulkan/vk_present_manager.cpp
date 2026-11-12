@@ -42,9 +42,15 @@ constexpr u32 MAX_PRESENT_ATTEMPTS = 3;
 static_assert(MAX_FRAMES_IN_FLIGHT <= LSFG_MAX_TARGETS);
 #endif
 
-bool CanStoreToFrame(const vk::PhysicalDevice& physical_device, VkFormat format) {
+bool CanStoreToFrame(const Device& device, VkFormat format) {
 #ifdef HAS_LSFG
-    const VkFormatProperties props{physical_device.GetFormatProperties(format)};
+    const auto physical = device.GetPhysical();
+    if (device.ApiVersion() >= VK_API_VERSION_1_3) {
+        constexpr auto required = VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+        return (physical.GetFormatProperties3(format).optimalTilingFeatures & required) == required;
+    }
+    const auto props = physical.GetFormatProperties(format);
     return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 #else
     return false;
@@ -141,7 +147,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , scheduler{scheduler_}
     , swapchain{swapchain_}
     , surface{surface_}
-    , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
+    , storage_supported{CanStoreToFrame(device, swapchain.GetImageFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
     SetImageCount();
@@ -296,7 +302,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
     frame->height = height;
     frame->format = image_view_format;
     frame->image_format = GetFrameImageFormat(image_view_format);
-    frame->storage_capable = CanStoreToFrame(device.GetPhysical(), frame->image_format);
+    frame->storage_capable = CanStoreToFrame(device, frame->image_format);
 
     const bool with_storage = storage && frame->storage_capable;
     VkImageUsageFlags storage_usage = 0;
@@ -637,6 +643,9 @@ void PresentManager::UpdateHdrMetadata() {
 
 // Returns false after discarding a deferred or incompatible frame; creation exceptions propagate.
 bool PresentManager::RecreateSwapchain(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
     // Nothing may wait on the old swapchain while it is replaced: its queued ids count as lost.
     std::unique_lock wl{present_wait_mutex, std::defer_lock};
     if (present_wait_enabled) {
@@ -1027,6 +1036,11 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
 #ifdef EGLANTINE_STREAMLINE
+    if (!Streamline::FrameGenSupportsSwapchain(swapchain.GetImageFormat())) {
+        if (const auto fg = std::exchange(frame->frame_gen, {}); fg.copy_fence) {
+            fg.copy_fence->Release();
+        }
+    }
     const auto acquire_begin = std::chrono::steady_clock::now();
     // DLSS Frame Generation's pacer takes one present at a time and waits on the GPU for it:
     // presented before the GPU had rendered it, each present waited a whole GPU frame plus

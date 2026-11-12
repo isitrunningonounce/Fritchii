@@ -338,21 +338,17 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                output_format.format, output, true);
 
 #ifdef HAS_LSFG
-    if (output.IsHdr()) {
-        frame_gen.Pause();
-    } else {
-        void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
+    void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
+    frame_gen.Process(device, frame, frame->image_format, GuestExtent(framebuffers));
 
-        frame_gen.Process(device, frame, frame->image_format, GuestExtent(framebuffers));
-
-        const size_t generated_frames = frame_gen.GeneratedFrameCount();
-        for (size_t generation = 0; generation < generated_frames; ++generation) {
-            Frame* generated = present_manager.GetRenderFrame();
-            blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
-            frame_gen.GenerateInto(device, generated, generation);
-            generated->render_tick = scheduler.Flush(*generated->render_ready);
-            present_manager.Present(generated);
-        }
+    const size_t generated_frames = frame_gen.GeneratedFrameCount();
+    for (size_t generation = 0; generation < generated_frames; ++generation) {
+        Frame* generated = present_manager.GetRenderFrame();
+        generated->color_space = output.color_space;
+        blit_swapchain.PrepareFrame(device, generated, frame_layout);
+        frame_gen.GenerateInto(device, generated, generation);
+        generated->render_tick = scheduler.Flush(*generated->render_ready);
+        present_manager.Present(generated);
     }
 #endif
 
@@ -418,7 +414,7 @@ HdrPresent RendererVulkan::UpdateHdrPresent() {
         if (output_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             LOG_INFO(Render_Vulkan,
                      "HDR output: {} {}, reference white {} nits, peak {} nits. Anti-aliasing, "
-                     "post-processing, upscaling filters and frame generation are off",
+                     "post-processing and window upscaling filters are off",
                      string_VkFormat(output_format.format),
                      string_VkColorSpaceKHR(output_format.colorSpace), output_reference_white,
                      output_peak);

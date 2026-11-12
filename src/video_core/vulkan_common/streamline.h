@@ -169,6 +169,11 @@ bool WaitFrameGenInputs(FrameGenInputFence& fence);
 /// right after the frame's commands (so it is the token of the DLSS evaluation in that frame, or
 /// null without one), then wraps the frame's vkQueuePresentKHR with it.
 [[nodiscard]] FrameGenSubmission TakeFrameGenSubmission();
+[[nodiscard]] constexpr bool FrameGenSupportsSwapchain(VkFormat format) {
+    return format != VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+/// Called by the presenter before replacing a swapchain that DLSS-G may still be using.
+void FrameGenSuspend();
 /// game_* is the rectangle the game image covers in the backbuffer: frame generation runs inside it
 /// (a little inset) and copies the rest as is (else, scaled to fullscreen, it smeared the edge row).
 void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,

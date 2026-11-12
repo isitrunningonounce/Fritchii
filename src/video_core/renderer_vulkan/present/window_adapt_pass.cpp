@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cmath>
+
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/host_shaders/vulkan_present_vert_spv.h"
@@ -74,9 +76,18 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
     }
 
     const auto draw = [=](vk::CommandBuffer cmdbuf) {
-        const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
-        const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
-        const f32 bg_blue = Settings::values.bg_blue.GetValue() / 255.0f;
+        const auto background_channel = [&](u8 channel) {
+            const f32 srgb = channel / 255.0f;
+            if (!output.IsHdr()) {
+                return srgb;
+            }
+            const f32 linear = srgb <= 0.04045f ? srgb / 12.92f
+                                               : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+            return linear * (output.reference_white / 80.0f);
+        };
+        const f32 bg_red = background_channel(Settings::values.bg_red.GetValue());
+        const f32 bg_green = background_channel(Settings::values.bg_green.GetValue());
+        const f32 bg_blue = background_channel(Settings::values.bg_blue.GetValue());
         const VkClearAttachment clear_attachment{
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .colorAttachment = 0,

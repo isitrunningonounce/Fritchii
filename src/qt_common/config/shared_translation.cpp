@@ -144,8 +144,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "On: HDR whenever the display driver offers an HDR format.\n"
               "The game is told the display is HDR only while Lichii really presents HDR. SDR "
               "games and menus are shown at the reference white.\n"
-              "While HDR is active, anti-aliasing, post-processing, FSR/SGSR upscaling and frame "
-              "generation are off and the window is scaled bilinearly.\n"
+              "While HDR is active, the window is scaled bilinearly and anti-aliasing and "
+              "post-processing are off. NVIDIA DLSS Frame Generation requires HDR10.\n"
               "Screenshots are tone mapped to SDR."));
     INSERT(Settings, hdr_swapchain, tr("HDR format:"),
            tr("HDR10: 10-bit PQ, what HDR displays take.\n"
@@ -270,7 +270,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_gen, tr("Enable Frame Generation (experimental)"),
            tr("Shows generated frames between the game's own frames for smoother motion. The "
               "game still runs and responds at its own frame rate.\nExperimental: it can make "
-              "the camera flicker, and frame pacing is off while it runs.\nPaused while HDR output is active."));
+              "the camera flicker, and frame pacing is off while it runs."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
     INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());

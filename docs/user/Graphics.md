@@ -28,9 +28,10 @@ swapchain. An HDR image shown on an SDR swapchain, and every screenshot or captu
 frame, is tone mapped to SDR: the reference white becomes SDR white and highlights roll off to
 the peak.
 
-While HDR is active, anti-aliasing, post-processing, FSR/SGSR/FSR 3 upscaling and frame
-generation are off, and the window is scaled bilinearly. Upscalers that replace a game's own
-network (DLSS, FSR 3.1 in Ocarina of Time) run inside the game's frame and keep working.
+While HDR is active, the window is scaled bilinearly and presentation anti-aliasing and
+post-processing are off. In-game upscalers still run, and Ocarina of Time can present its
+4K DLSS composite in HDR. FSR3 and LSFG frame generation require a GPU that can write to
+the selected HDR format. NVIDIA DLSS Frame Generation supports HDR10 and pauses in scRGB.
 
 On Windows, Auto follows changes during play: toggling Windows HDR, moving the window to
 another monitor, changing the SDR content brightness or running the Windows HDR Calibration app
