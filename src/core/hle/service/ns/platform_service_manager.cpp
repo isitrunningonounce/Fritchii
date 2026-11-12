@@ -120,6 +120,7 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
         {1001, nullptr, "GetNgWordDataSizeForPlatformRegionChina"},
         {2000, &IPlatformServiceManager::GetBuiltInFontSharedMemory, "GetBuiltInFontSharedMemory (Switch 2)"},
         {2010, &IPlatformServiceManager::GetBuiltInFontData, "GetBuiltInFontData (Switch 2)"},
+        {2020, &IPlatformServiceManager::GetBuiltInFontDataSet, "GetBuiltInFontDataSet (Switch 2)"},
     };
     // clang-format on
     RegisterHandlers(functions);
@@ -240,6 +241,40 @@ void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
     rb.Push<u32>(0);
     rb.Push<u32>(region.offset);
     rb.Push<u32>(region.size);
+}
+
+// The SDK accepts up to six u8 font types and a writable array of 12-byte descriptors.
+// Reply layout: bool available at offset 0, u32 descriptor count at offset 4.
+void IPlatformServiceManager::GetBuiltInFontDataSet(HLERequestContext& ctx) {
+    struct Descriptor {
+        u32_le flags;
+        u32_le offset;
+        u32_le size;
+    };
+    static_assert(sizeof(Descriptor) == 12);
+    const auto types = ctx.CanReadBuffer() ? ctx.ReadBuffer() : std::span<const u8>{};
+    const auto capacity = ctx.CanWriteBuffer()
+                              ? std::min<std::size_t>(6, ctx.GetWriteBufferNumElements<Descriptor>())
+                              : 0;
+    std::vector<Descriptor> descriptors;
+    for (const auto type : types) {
+        if (descriptors.size() == capacity) {
+            break;
+        }
+        if (type < impl->builtin_font_regions.size()) {
+            const auto& region = impl->builtin_font_regions[type];
+            descriptors.push_back({0, region.offset, region.size});
+        }
+    }
+    if (!descriptors.empty()) {
+        ctx.WriteBuffer(descriptors);
+    }
+    LOG_INFO(Service_NS, "Built-in font set: {} requested, {} available", types.size(),
+             descriptors.size());
+    IPC::ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(descriptors.empty() ? 0 : 1);
+    rb.Push<u32>(static_cast<u32>(descriptors.size()));
 }
 
 IPlatformServiceManager::~IPlatformServiceManager() {
