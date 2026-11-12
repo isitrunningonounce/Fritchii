@@ -70,6 +70,11 @@ $env:PATH = "$VisualStudio/VC/Tools/Llvm/x64/bin;$env:PATH"
 $profilePath = (Resolve-Path (Join-Path $root $PgoProfile)).Path -replace '\\', '/'
 $flags = "/O2 /Ob2 /DNDEBUG -flto=thin -fprofile-use=$profilePath " +
     '-Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin'
+# The release must not name this machine or its user: __FILE__ would carry the checkout's path.
+$private = $root, $env:USERPROFILE | ForEach-Object { ($_ -replace '\\', '/'), ($_ -replace '/', '\') }
+foreach ($path in $private | Select-Object -First 2) {
+    $flags += " /clang:-fmacro-prefix-map=$path=."
+}
 Invoke-Native 'Configure' {
     cmake -S $root -B $build -G Ninja -C (Join-Path $root $InitialCache) -UZLIB_CONF_WRITTEN `
         "-DCMAKE_C_FLAGS_RELEASE:STRING=$flags" "-DCMAKE_CXX_FLAGS_RELEASE:STRING=$flags" `
@@ -84,6 +89,12 @@ $exe = Join-Path $build 'bin/lichii.exe'
 $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
 foreach ($expected in "$Tag`0", "$Platform`0", "$Repo`0") {
     if (-not $text.Contains($expected)) { throw "lichii.exe does not contain '$($expected.TrimEnd([char]0))'" }
+}
+foreach ($name in 'lichii.exe', 'eden-cli.exe') {
+    $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $build "bin/$name")))
+    foreach ($path in $private) {
+        if ($text.IndexOf($path, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw "$name contains '$path'" }
+    }
 }
 
 $skip = 'tests.exe', 'update_checker_tests.exe', 'event_wait_probe.exe', 'eden-room.exe', '*.pdb', '*.ilk', '*.lib', '*.exp'

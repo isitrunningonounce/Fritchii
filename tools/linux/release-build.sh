@@ -94,10 +94,16 @@ ccache=OFF
 if command -v ccache > /dev/null; then
     ccache=ON
 fi
+# The release must not name this machine or its user: __FILE__ would carry the home directory,
+# and the build tree's run path the Qt install under it.
+prefix_map="-ffile-prefix-map=$home=. -ffile-prefix-map=$qt=qt"
 # The CI runner has no libfmt-dev and so builds the bundled fmt 12. Ubuntu's fmt 9 would pass
 # cpmfile.json's minimum but is too old for common/logging.h.
 "$cmake" -S "$src" -B "$build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    "-DCMAKE_C_FLAGS=$prefix_map" \
+    "-DCMAKE_CXX_FLAGS=$prefix_map" \
+    -DCMAKE_SKIP_BUILD_RPATH=ON \
     -DBUILD_TESTING=OFF \
     -DYUZU_TESTS=OFF \
     -DYUZU_CMD=ON \
@@ -130,7 +136,10 @@ mkdir -p "$package"
 cd "$package"
 cp "$build/bin/lichii" "$build/bin/eden-cli" .
 strip lichii eden-cli
-tar -czf "$archive" lichii eden-cli
+for name in lichii eden-cli; do
+    ! grep -qaF "$HOME" "$name" || die "$name contains $HOME"
+done
+tar --owner=0 --group=0 --numeric-owner -czf "$archive" lichii eden-cli
 
 mkdir -p "$tools"
 for name in linuxdeploy linuxdeploy-plugin-qt; do
@@ -189,6 +198,10 @@ chmod +x AppRun
     --plugin qt \
     --output appimage
 [ -s "$appimage" ] || die "linuxdeploy wrote no $appimage"
+rm -rf squashfs-root
+"./$appimage" --appimage-extract > /dev/null
+! grep -rqaF "$HOME" squashfs-root || die "$appimage contains $HOME"
+rm -rf squashfs-root
 
 mkdir -p "$out"
 cp "$archive" "$appimage" "$out/"
