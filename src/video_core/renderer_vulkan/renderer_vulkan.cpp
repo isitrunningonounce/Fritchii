@@ -163,7 +163,7 @@ Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dl
 /// DLSS Frame Generation finds the swapchain's window through the surface it saw created, and
 /// its surface proxy needs the device Streamline was given: once the device exists, the surface is
 /// made again through it, before the swapchain. Returns the device for the next member.
-const Device& RebindSurfaceForFrameGen(
+static const Device& RebindSurfaceForFrameGen(
     const vk::Instance& instance, vk::SurfaceKHR& surface,
     const Core::Frontend::EmuWindow::WindowSystemInfo& window_info, const Device& device) {
 #ifdef EGLANTINE_STREAMLINE

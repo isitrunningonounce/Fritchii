@@ -473,8 +473,9 @@ public:
             const bool guest_color_read = fallback || bananza;
             const VkMemoryBarrier before{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = guest_color_read ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
-                                          : VK_ACCESS_SHADER_WRITE_BIT,
+                .srcAccessMask = static_cast<VkAccessFlags>(
+                    guest_color_read ? VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+                                     : VK_ACCESS_SHADER_WRITE_BIT),
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
             };
             cmd.PipelineBarrier(guest_color_read ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT

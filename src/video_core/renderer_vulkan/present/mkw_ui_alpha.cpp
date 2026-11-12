@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdint>
 #include <vector>
 
 #include "video_core/host_shaders/mkw_ui_alpha_comp_spv.h"

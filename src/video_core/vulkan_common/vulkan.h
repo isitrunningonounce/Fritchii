@@ -34,9 +34,11 @@
 #undef CreateEvent
 #undef CreateSemaphore
 #undef Always
+#undef BadValue
 #undef False
 #undef None
 #undef Status
+#undef Success
 #undef True
 
 // "Catch-all" handle for both Android and.. the rest of platforms
