@@ -1967,6 +1967,12 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
             if (result > Core::SystemResultStatus::ErrorLoader) {
                 const u16 loader_id = static_cast<u16>(Core::SystemResultStatus::ErrorLoader);
                 const u16 error_id = static_cast<u16>(result) - loader_id;
+                const auto loader_status = static_cast<Loader::ResultStatus>(error_id);
+                if (loader_status == Loader::ResultStatus::ErrorEncryptedContentUnsupported) {
+                    ShowErrorWithExportLog(tr("Error while loading ROM!"),
+                                           QString::fromStdString(GetResultStatusString(loader_status)));
+                    break;
+                }
                 const std::string error_code = fmt::format("({:04X}-{:04X})", loader_id, error_id);
                 LOG_CRITICAL(Frontend, "Failed to load ROM! {}", error_code);
 
@@ -1977,7 +1983,7 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                     tr("%1<br>Please redump your files or ask on Discord/Stoat for help.",
                        "%1 signifies an error string.")
                         .arg(QString::fromStdString(
-                            GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
+                            GetResultStatusString(loader_status)));
 
                 ShowErrorWithExportLog(title, description);
             } else {

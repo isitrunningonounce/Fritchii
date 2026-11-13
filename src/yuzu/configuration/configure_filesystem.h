@@ -34,7 +34,6 @@ private:
         NAND,
         SD,
         Save,
-        Gamecard,
         Dump,
         Load,
     };
@@ -43,7 +42,6 @@ private:
     void SetSaveDirectory();
     void PromptSaveMigration(const QString& from_path, const QString& to_path);
     void ResetMetadata();
-    void UpdateEnabledControls();
 
     std::unique_ptr<Ui::ConfigureFilesystem> ui;
 };
