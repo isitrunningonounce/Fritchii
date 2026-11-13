@@ -72,22 +72,20 @@ void SetUpBananzaNvn2Trace(Kernel::KProcess& process, const NSOHeader& header,
         return;
     }
 #if defined(_M_X64) || defined(__x86_64__)
-    constexpr std::array<u8, 32> Bananza320Sdk{
-        0xB7, 0xFF, 0xF6, 0x14, 0xF2, 0xBC, 0xDD, 0xD3, 0x8E, 0x80,
-        0xD5, 0x71, 0x61, 0x9C, 0x73, 0xF3, 0x00, 0xF4, 0x8E, 0x1A,
-    };
-    if (header.build_id != Bananza320Sdk) {
+    const auto* layout = Core::BananzaNvn2Trace::FindSdk(header.build_id);
+    if (!layout) {
         LOG_WARNING(Loader, "NVN 2 count: unsupported SDK build {}. Using the guest SDK.",
                     Common::HexToString(header.build_id));
         return;
     }
-    auto trace = Core::BananzaNvn2Trace::Session::Create(image, base);
+    auto trace = Core::BananzaNvn2Trace::Session::Create(*layout, image, base);
     if (!trace) {
         LOG_WARNING(Loader, "NVN 2 count: could not read the SDK procedure table.");
         return;
     }
     process.SetBananzaNvn2Trace(std::move(trace));
-    LOG_INFO(Loader, "NVN 2 count: instrumenting Bananza 3.2.0 SDK at {:#x}", base);
+    LOG_INFO(Loader, "NVN 2 count: instrumenting {} Bananza SDK procedures at {:#x}",
+             layout->entry_count, base);
 #else
     (void)header;
     (void)image;

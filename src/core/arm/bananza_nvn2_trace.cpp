@@ -16,11 +16,27 @@
 namespace Core::BananzaNvn2Trace {
 namespace {
 
-// Bananza 3.2.0 SDK module offsets. The name and target tables share the resolver's indices.
-constexpr size_t Names = 0xB74C26;
-constexpr size_t NameOffsets = 0xB79B90;
-constexpr size_t Targets = 0xD95168;
-constexpr size_t TextEnd = 0x776A70;
+// The base and 3.2.0 update packages have separate SDK procedure tables.
+constexpr std::array SupportedSdks{
+    SdkLayout{
+        .build_id = {0xB7, 0xFF, 0xF6, 0x14, 0xF2, 0xBC, 0xDD, 0xD3, 0x8E, 0x80,
+                     0xD5, 0x71, 0x61, 0x9C, 0x73, 0xF3, 0x00, 0xF4, 0x8E, 0x1A},
+        .names = 0xB74C26,
+        .name_offsets = 0xB79B90,
+        .targets = 0xD95168,
+        .text_end = 0x776A70,
+        .entry_count = 698,
+    },
+    SdkLayout{
+        .build_id = {0x18, 0x26, 0x5D, 0xAE, 0xA2, 0x10, 0x5B, 0x31, 0xF2, 0x53,
+                     0x46, 0xAD, 0xFB, 0xBD, 0x09, 0xB5, 0xED, 0xF1, 0x20, 0x7F},
+        .names = 0xB9A5EA,
+        .name_offsets = 0xB9F94C,
+        .targets = 0xE056E0,
+        .text_end = 0x7B65A0,
+        .entry_count = 726,
+    },
+};
 
 } // Anonymous namespace
 
@@ -32,36 +48,48 @@ bool CountEnabled() {
     return enabled;
 }
 
-std::unique_ptr<Session> Session::Create(std::span<const u8> sdk, u64 base) {
-    if (sdk.size() < Targets + EntryCount * sizeof(u64_le) || base + TextEnd < base) {
+const SdkLayout* FindSdk(const std::array<u8, 32>& build_id) {
+    const auto it = std::ranges::find(SupportedSdks, build_id, &SdkLayout::build_id);
+    return it == SupportedSdks.end() ? nullptr : &*it;
+}
+
+std::unique_ptr<Session> Session::Create(const SdkLayout& layout, std::span<const u8> sdk,
+                                         u64 base) {
+    if (layout.entry_count == 0 || layout.entry_count > MaxEntries ||
+        sdk.size() < layout.targets + layout.entry_count * sizeof(u64_le) ||
+        base + layout.text_end < base) {
         return {};
     }
-    std::array<size_t, EntryCount> order{};
-    std::array<u64, EntryCount> targets{};
-    for (size_t i = 0; i < EntryCount; ++i) {
+    std::array<size_t, MaxEntries> order{};
+    std::array<u64, MaxEntries> targets{};
+    for (size_t i = 0; i < layout.entry_count; ++i) {
         u64_le target{};
-        std::memcpy(&target, sdk.data() + Targets + i * sizeof(target), sizeof(target));
-        if (target == 0 || target >= TextEnd || target % sizeof(u32) != 0) {
+        std::memcpy(&target, sdk.data() + layout.targets + i * sizeof(target), sizeof(target));
+        if (target == 0 || target >= layout.text_end || target % sizeof(u32) != 0) {
             return {};
         }
         targets[i] = target;
         order[i] = i;
     }
-    std::ranges::sort(order, {}, [&](size_t index) { return targets[index]; });
+    std::ranges::sort(std::span{order}.first(layout.entry_count), {},
+                      [&](size_t index) { return targets[index]; });
 
     auto session = std::make_unique<Session>();
-    for (size_t i = 0; i < EntryCount; ++i) {
+    session->entry_count = layout.entry_count;
+    for (size_t i = 0; i < layout.entry_count; ++i) {
         const size_t index = order[i];
         if (i != 0 && targets[index] == targets[order[i - 1]]) {
             return {};
         }
         u32_le offset{};
-        std::memcpy(&offset, sdk.data() + NameOffsets + index * sizeof(offset), sizeof(offset));
-        if (offset >= NameOffsets - Names) {
+        std::memcpy(&offset, sdk.data() + layout.name_offsets + index * sizeof(offset),
+                    sizeof(offset));
+        if (offset >= layout.name_offsets - layout.names) {
             return {};
         }
         const std::string_view name_storage{
-            reinterpret_cast<const char*>(sdk.data() + Names + offset), NameOffsets - Names - offset};
+            reinterpret_cast<const char*>(sdk.data() + layout.names + offset),
+            layout.name_offsets - layout.names - offset};
         const size_t length = name_storage.find('\0');
         if (length == 0 || length == std::string_view::npos || length > 96) {
             return {};
@@ -86,14 +114,15 @@ std::unique_ptr<Session> Session::Create(std::span<const u8> sdk, u64 base) {
 }
 
 std::optional<size_t> Session::Find(u64 address) const {
-    if (address < entries.front().address || address > entries.back().address) {
+    const auto active_entries = std::span{entries}.first(entry_count);
+    if (address < active_entries.front().address || address > active_entries.back().address) {
         return std::nullopt;
     }
-    const auto it = std::ranges::lower_bound(entries, address, {}, &Entry::address);
-    if (it == entries.end() || it->address != address) {
+    const auto it = std::ranges::lower_bound(active_entries, address, {}, &Entry::address);
+    if (it == active_entries.end() || it->address != address) {
         return std::nullopt;
     }
-    return static_cast<size_t>(it - entries.begin());
+    return static_cast<size_t>(it - active_entries.begin());
 }
 
 void Session::Count(size_t index, u64 thread, u64 arg1) {
@@ -126,12 +155,12 @@ void Session::Finish() {
 }
 
 void Session::Report(bool final) {
-    std::array<u64, EntryCount> calls{};
+    std::array<u64, MaxEntries> calls{};
     u64 total{};
     u64 draws{};
     u64 recorded{};
     u64 submits{};
-    for (size_t i = 0; i < EntryCount; ++i) {
+    for (size_t i = 0; i < entry_count; ++i) {
         auto& entry = entries[i];
         const u64 current = entry.calls.load(std::memory_order_relaxed);
         calls[i] = final ? current : current - entry.reported_calls;
@@ -164,7 +193,7 @@ void Session::Report(bool final) {
              submits, submitted, per_frame(submitted), fmt::join(threads, ", "));
     recording_threads.clear();
     std::string line;
-    for (size_t i = 0; i < EntryCount; ++i) {
+    for (size_t i = 0; i < entry_count; ++i) {
         if (calls[i] == 0) {
             continue;
         }

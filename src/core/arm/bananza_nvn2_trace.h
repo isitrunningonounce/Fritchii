@@ -18,9 +18,21 @@ namespace Core::BananzaNvn2Trace {
 
 bool CountEnabled();
 
+struct SdkLayout {
+    std::array<u8, 32> build_id;
+    size_t names;
+    size_t name_offsets;
+    size_t targets;
+    size_t text_end;
+    size_t entry_count;
+};
+
+const SdkLayout* FindSdk(const std::array<u8, 32>& build_id);
+
 class Session {
 public:
-    static std::unique_ptr<Session> Create(std::span<const u8> sdk, u64 base);
+    static std::unique_ptr<Session> Create(const SdkLayout& layout, std::span<const u8> sdk,
+                                           u64 base);
 
     std::optional<size_t> Find(u64 address) const;
     void Count(size_t index, u64 thread, u64 arg1);
@@ -29,7 +41,7 @@ public:
 
 private:
     enum class Kind { Other, Draw, Begin, End, Submit };
-    static constexpr size_t EntryCount = 698;
+    static constexpr size_t MaxEntries = 726;
     struct Entry {
         u64 address{};
         std::string name;
@@ -40,7 +52,8 @@ private:
 
     void Report(bool final);
 
-    std::array<Entry, EntryCount> entries{};
+    std::array<Entry, MaxEntries> entries{};
+    size_t entry_count{};
     std::mutex report_mutex;
     std::set<u64> recording_threads;
     std::set<u64> reported_threads;
