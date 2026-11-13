@@ -9,14 +9,124 @@
 #include <catch2/catch_test_macros.hpp>
 #include <oaknut/oaknut.hpp>
 
+#include <chrono>
+#include <fmt/format.h>
+
 #include "dynarmic/tests/A64/testenv.h"
 #include "dynarmic/tests/native/testenv.h"
 #include "dynarmic/common/fp/fpsr.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#include "dynarmic/frontend/A64/a64_ir_emitter.h"
+#endif
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/interface/optimization_flags.h"
 
 using namespace Dynarmic;
 using namespace oaknut::util;
+
+#if defined(_M_X64) || defined(__x86_64__)
+TEST_CASE("A64: a pre-instruction callback preserves the guest instruction", "[a64]") {
+    struct CallbackEnv : A64TestEnv {
+        u64 seen{};
+    } env;
+    env.code_mem = {0x91000421, 0x14000000}; // ADD X1, X1, #1; B .
+    env.ticks_left = 2;
+
+    A64::UserConfig config{};
+    config.callbacks = &env;
+    config.pre_instruction = [](A64::UserCallbacks& callbacks, A64::IREmitter& ir, u64 pc) {
+        if (pc == 0) {
+            ir.CallHostFunction(
+                +[](u64 context, u64 x1) { reinterpret_cast<CallbackEnv*>(context)->seen = x1; },
+                ir.Imm64(reinterpret_cast<u64>(&static_cast<CallbackEnv&>(callbacks))),
+                ir.GetX(A64::Reg::R1));
+        }
+    };
+    A64::Jit jit{config};
+    jit.SetRegister(1, 41);
+    CheckedRun([&] { jit.Run(); });
+    REQUIRE(env.seen == 41);
+    REQUIRE(jit.GetRegister(1) == 42);
+}
+
+TEST_CASE("A64: measure a host trap and a guest ring append", "[a64][.nvn2-transport]") {
+    struct ProbeEnv : A64FastmemTestEnv {
+        using A64FastmemTestEnv::A64FastmemTestEnv;
+
+        A64::Jit* jit{};
+        u64 traps{};
+
+        void ExceptionRaised(u64 pc, A64::Exception exception) override {
+            if (exception == A64::Exception::Breakpoint && read<u32>(pc) == 0xD4200020) {
+                ++traps;
+            } else {
+                jit->HaltExecution();
+            }
+        }
+    };
+
+    constexpr u64 Iterations = 2'000'000;
+    constexpr u64 Ring = 0x1000;
+    constexpr u64 Head = 0x6000;
+    alignas(4096) std::array<char, 0x8000> backing{};
+    ProbeEnv env{backing.data()};
+    A64::UserConfig config{};
+    config.callbacks = &env;
+    config.fastmem_pointer = reinterpret_cast<uintptr_t>(backing.data());
+    config.fastmem_address_space_bits = 15;
+    config.enable_cycle_counting = false;
+    A64::Jit jit{config};
+    env.jit = &jit;
+
+    // Each loop advances a sequence and ends at BRK #0. The trap uses BRK #1.
+    constexpr std::array<u32, 5> baseline{
+        0xD503201F, 0x91000442, 0xF1000400, 0x54FFFFA1, 0xD4200000,
+    };
+    auto trap = baseline;
+    trap.front() = 0xD4200020;
+    // Mask the sequence, store a function ID and one argument, then publish the head.
+    constexpr std::array<u32, 8> ring{
+        0x92402443, 0x8B031023, 0xA9000064, 0x91000442,
+        0xC89FFCA2, 0xF1000400, 0x54FFFF41, 0xD4200000,
+    };
+
+    const auto measure = [&](u64 pc, const auto& code) {
+        for (size_t i = 0; i < code.size(); ++i) {
+            env.write(pc + i * sizeof(u32), code[i]);
+        }
+        const auto run = [&](u64 iterations) {
+            jit.SetPC(pc);
+            jit.SetRegister(0, iterations);
+            jit.SetRegister(1, Ring);
+            jit.SetRegister(2, 0);
+            jit.SetRegister(4, 42);
+            jit.SetRegister(5, Head);
+            env.traps = 0;
+            const auto start = std::chrono::steady_clock::now();
+            jit.Run();
+            return std::chrono::duration<double, std::nano>{
+                std::chrono::steady_clock::now() - start}.count() / iterations;
+        };
+        run(4'096);
+        const double ns = run(Iterations);
+        REQUIRE(jit.GetRegister(2) == Iterations);
+        return ns;
+    };
+
+    const double base_ns = measure(0x100, baseline);
+    const double trap_ns = measure(0x200, trap);
+    REQUIRE(env.traps == Iterations);
+    const double ring_ns = measure(0x300, ring);
+    REQUIRE(env.read<u64>(Head) == Iterations);
+    const u64 last_entry = Ring + ((Iterations - 1) % 1024) * 16;
+    REQUIRE(env.read<u64>(last_entry) == 42);
+    REQUIRE(env.read<u64>(last_entry + 8) == 1);
+    fmt::print("NVN 2 transport: baseline {:.1f} ns/iteration, "
+               "trap {:.1f} ns ({:+.1f} ns over baseline), "
+               "ring append {:.1f} ns ({:+.1f} ns over baseline)\n",
+               base_ns, trap_ns, trap_ns - base_ns, ring_ns, ring_ns - base_ns);
+}
+#endif
 
 TEST_CASE("A64: ADD", "[a64]") {
     A64TestEnv env;

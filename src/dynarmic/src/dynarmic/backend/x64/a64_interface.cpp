@@ -319,7 +319,14 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        A64::PreInstructionHook pre_instruction;
+        if (conf.pre_instruction) {
+            pre_instruction = [this](A64::IREmitter& ir, u64 pc) {
+                conf.pre_instruction(*conf.callbacks, ir, pc);
+            };
+        }
+        A64::Translate(ir_block, arch_descriptor, get_code,
+                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct}, pre_instruction);
         Optimization::Optimize(ir_block, conf, polyfill_options);
         const auto emitted = emitter.Emit(ir_block);
         const CodePtr entrypoint = emitted.entrypoint;

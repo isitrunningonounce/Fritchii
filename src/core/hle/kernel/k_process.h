@@ -24,6 +24,10 @@
 #include "core/hle/kernel/k_thread_local_page.h"
 #include "core/memory.h"
 
+namespace Core::BananzaNvn2Trace {
+class Session;
+}
+
 namespace Kernel {
 
 enum class DebugWatchpointType : u8 {
@@ -83,6 +87,7 @@ private:
     ::Common::unordered_map<u64, u64> m_post_handlers{};
 #endif
     std::unique_ptr<Core::ExclusiveMonitor> m_exclusive_monitor;
+    std::unique_ptr<Core::BananzaNvn2Trace::Session> m_bananza_nvn2_trace;
     Core::Memory::Memory m_memory;
     KCapabilities m_capabilities{};
     KProcessAddress m_code_address{};
@@ -187,6 +192,12 @@ public:
     u64 GetProgramId() const {
         return m_program_id;
     }
+
+    Core::BananzaNvn2Trace::Session* GetBananzaNvn2Trace() const {
+        return m_bananza_nvn2_trace.get();
+    }
+
+    void SetBananzaNvn2Trace(std::unique_ptr<Core::BananzaNvn2Trace::Session> trace);
 
     bool IsMkwDynamicFpsPatchApplied() const {
         return m_mkw_dynamic_fps_patch_applied.load(std::memory_order_relaxed);

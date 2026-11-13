@@ -6,6 +6,8 @@
 
 add_library(core STATIC
     arm/arm_interface.cpp
+    arm/bananza_nvn2_trace.cpp
+    arm/bananza_nvn2_trace.h
     arm/arm_interface.h
     arm/debug.cpp
     arm/debug.h

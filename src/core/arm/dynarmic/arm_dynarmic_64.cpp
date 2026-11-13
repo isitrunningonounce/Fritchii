@@ -15,8 +15,10 @@
 #include <mutex>
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "core/arm/bananza_nvn2_trace.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
@@ -26,10 +28,33 @@
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#include "dynarmic/frontend/A64/a64_ir_emitter.h"
+#endif
 
 namespace Core {
 
 using namespace Common::Literals;
+
+#if defined(_M_X64) || defined(__x86_64__)
+namespace {
+void CountNvn2Call(u64 callback, u64 index, u64 arg1) {
+    auto& cpu = *reinterpret_cast<DynarmicCallbacks64*>(callback);
+    cpu.m_process->GetBananzaNvn2Trace()->Count(index, cpu.m_nvn2_thread_id, arg1);
+}
+
+void InstrumentNvn2(Dynarmic::A64::UserCallbacks& callbacks, Dynarmic::A64::IREmitter& ir,
+                    u64 pc) {
+    auto& cpu = static_cast<DynarmicCallbacks64&>(callbacks);
+    if (const auto* trace = cpu.m_process->GetBananzaNvn2Trace()) {
+        if (const auto index = trace->Find(pc)) {
+            ir.CallHostFunction(CountNvn2Call, ir.Imm64(reinterpret_cast<u64>(&cpu)),
+                                ir.Imm64(*index), ir.GetX(Dynarmic::A64::Reg::R1));
+        }
+    }
+}
+} // Anonymous namespace
+#endif
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -372,6 +397,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Callbacks
     config.callbacks = std::addressof(*m_cb);
+#if defined(_M_X64) || defined(__x86_64__)
+    if (m_cb->m_process->GetProgramId() == Settings::DonkeyKongBananzaProgramId &&
+        BananzaNvn2Trace::CountEnabled()) {
+        config.pre_instruction = InstrumentNvn2;
+    }
+#endif
 
     // Memory
     if (page_table) {
@@ -605,6 +636,9 @@ void ArmDynarmic64::ReportCompiledBlocks() {
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    if (m_cb->m_process->GetBananzaNvn2Trace()) {
+        m_cb->m_nvn2_thread_id = thread->GetThreadId();
+    }
     if (!m_blocks_precompiled) {
         m_blocks_precompiled = true;
         PrecompileStoredBlocks();
@@ -615,6 +649,9 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
+    if (m_cb->m_process->GetBananzaNvn2Trace()) {
+        m_cb->m_nvn2_thread_id = thread->GetThreadId();
+    }
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Step());
 }

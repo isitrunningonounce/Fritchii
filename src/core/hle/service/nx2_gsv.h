@@ -37,6 +37,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/lichii_telemetry.h"
+#include "core/arm/bananza_nvn2_trace.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/device_memory.h"
 #include "video_core/rasterizer_interface.h"
@@ -1820,6 +1821,11 @@ private:
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        if (const auto* process = ctx.GetThread().GetOwnerProcess()) {
+            if (auto* trace = process->GetBananzaNvn2Trace()) {
+                trace->Present();
+            }
+        }
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} by t{} token={:#x} slot={} image={} flags={:#x}",
                      m_presents, ctx.GetThread().GetThreadId(), u64{w[2]} | (u64{w[3]} << 32),

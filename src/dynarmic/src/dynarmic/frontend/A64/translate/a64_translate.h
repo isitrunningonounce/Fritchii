@@ -21,8 +21,10 @@ class Block;
 namespace A64 {
 
 class LocationDescriptor;
+class IREmitter;
 
 using MemoryReadCodeFuncType = std::function<std::optional<u32>(u64 vaddr)>;
+using PreInstructionHook = std::function<void(IREmitter&, u64 vaddr)>;
 
 struct TranslationOptions {
     /// This changes what IR we emit when we translate an unpredictable instruction.
@@ -47,7 +49,8 @@ struct TranslationOptions {
  * @param options Configures how certain instructions are translated.
  * @return A translated basic block in the intermediate representation.
  */
-void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options);
+void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code,
+               TranslationOptions options, const PreInstructionHook& pre_instruction = {});
 
 /**
  * This function translates a single provided instruction into our intermediate representation.

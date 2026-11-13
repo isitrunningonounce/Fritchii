@@ -16,7 +16,8 @@
 
 namespace Dynarmic::A64 {
 
-void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
+void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code,
+               TranslationOptions options, const PreInstructionHook& pre_instruction) {
     const bool single_step = descriptor.SingleStepping();
     TranslatorVisitor visitor{block, descriptor, std::move(options)};
 
@@ -24,6 +25,9 @@ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFu
     do {
         const u64 pc = visitor.ir.current_location->PC();
         if (const auto instruction = memory_read_code(pc)) {
+            if (pre_instruction) {
+                pre_instruction(visitor.ir, pc);
+            }
             if (auto decoder = Decode<TranslatorVisitor, bool>(visitor, *instruction)) {
                 should_continue = *decoder;
             } else {

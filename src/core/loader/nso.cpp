@@ -12,6 +12,7 @@
 #include <fstream>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/common_funcs.h"
@@ -22,6 +23,7 @@
 #include "common/zbic_compression.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/bananza_nvn2_trace.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/lichii_hooks.h"
 #include "core/arm/dynarmic/lichii_zstd_hle.h"
@@ -53,6 +55,45 @@ static_assert(sizeof(MODHeader) == 0x1c, "MODHeader has incorrect size.");
 
 constexpr u32 PageAlignSize(u32 size) {
     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
+}
+
+void SetUpBananzaNvn2Trace(Kernel::KProcess& process, const NSOHeader& header,
+                          std::span<const u8> image, VAddr base) {
+    const char* value = std::getenv("EDEN_NX2_NVN_HLE");
+    if (!value || process.GetProgramId() != Settings::DonkeyKongBananzaProgramId) {
+        return;
+    }
+    const std::string_view mode{value};
+    if (mode == "1") {
+        LOG_WARNING(Loader, "NVN 2 HLE replay is unavailable. Using the guest SDK.");
+        return;
+    }
+    if (!Core::BananzaNvn2Trace::CountEnabled()) {
+        return;
+    }
+#if defined(_M_X64) || defined(__x86_64__)
+    constexpr std::array<u8, 32> Bananza320Sdk{
+        0xB7, 0xFF, 0xF6, 0x14, 0xF2, 0xBC, 0xDD, 0xD3, 0x8E, 0x80,
+        0xD5, 0x71, 0x61, 0x9C, 0x73, 0xF3, 0x00, 0xF4, 0x8E, 0x1A,
+    };
+    if (header.build_id != Bananza320Sdk) {
+        LOG_WARNING(Loader, "NVN 2 count: unsupported SDK build {}. Using the guest SDK.",
+                    Common::HexToString(header.build_id));
+        return;
+    }
+    auto trace = Core::BananzaNvn2Trace::Session::Create(image, base);
+    if (!trace) {
+        LOG_WARNING(Loader, "NVN 2 count: could not read the SDK procedure table.");
+        return;
+    }
+    process.SetBananzaNvn2Trace(std::move(trace));
+    LOG_INFO(Loader, "NVN 2 count: instrumenting Bananza 3.2.0 SDK at {:#x}", base);
+#else
+    (void)header;
+    (void)image;
+    (void)base;
+    LOG_WARNING(Loader, "NVN 2 count requires the x64 Dynarmic backend.");
+#endif
 }
 } // Anonymous namespace
 
@@ -331,6 +372,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Load codeset for current process
     if (name == "sdk") {
+        SetUpBananzaNvn2Trace(process, nso_header,
+                             std::span<const u8>{codeset.memory}.subspan(module_start),
+                             load_base + module_start);
         const bool matching_sdk =
             Core::WindowTrace::Enabled() && process.GetProgramId() == Core::WindowTrace::ProgramId &&
             Common::HexToString(std::span{nso_header.build_id}.first(20)) ==
