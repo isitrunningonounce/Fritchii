@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <limits>
 #include <random>
-#include <regex>
 #include <openssl/evp.h>
 #include "common/assert.h"
 #include "common/fs/path_util.h"
@@ -38,21 +37,6 @@ bool operator==(const ContentProviderEntry& lhs, const ContentProviderEntry& rhs
 
 bool operator!=(const ContentProviderEntry& lhs, const ContentProviderEntry& rhs) {
     return !operator==(lhs, rhs);
-}
-
-static bool FollowsTwoDigitDirFormat(std::string_view name) {
-    static const std::regex two_digit_regex("000000[0-9A-F]{2}", std::regex_constants::ECMAScript |
-                                                                     std::regex_constants::icase);
-    return std::regex_match(name.begin(), name.end(), two_digit_regex);
-}
-
-static bool FollowsNcaIdFormat(std::string_view name) {
-    static const std::regex nca_id_regex("[0-9A-F]{32}\\.nca", std::regex_constants::ECMAScript |
-                                                                   std::regex_constants::icase);
-    static const std::regex nca_id_cnmt_regex(
-        "[0-9A-F]{32}\\.cnmt.nca", std::regex_constants::ECMAScript | std::regex_constants::icase);
-    return (name.size() == 36 && std::regex_match(name.begin(), name.end(), nca_id_regex)) ||
-           (name.size() == 41 && std::regex_match(name.begin(), name.end(), nca_id_cnmt_regex));
 }
 
 static std::string GetRelativePathFromNcaID(const std::array<u8, 16>& nca_id, bool second_hex_upper,
@@ -416,97 +400,9 @@ std::optional<NcaID> RegisteredCache::GetNcaIDFromMetadata(u64 title_id,
     return CheckMapForContentRecord(meta, title_id, type);
 }
 
-std::vector<NcaID> RegisteredCache::AccumulateFiles() const {
-    std::vector<NcaID> ids;
-    for (const auto& d2_dir : dir->GetSubdirectories()) {
-        if (FollowsNcaIdFormat(d2_dir->GetName())) {
-            ids.push_back(Common::HexStringToArray<0x10, true>(d2_dir->GetName().substr(0, 0x20)));
-            continue;
-        }
+void RegisteredCache::Refresh() {}
 
-        if (!FollowsTwoDigitDirFormat(d2_dir->GetName()))
-            continue;
-
-        for (const auto& nca_dir : d2_dir->GetSubdirectories()) {
-            if (nca_dir == nullptr || !FollowsNcaIdFormat(nca_dir->GetName())) {
-                continue;
-            }
-
-            ids.push_back(Common::HexStringToArray<0x10, true>(nca_dir->GetName().substr(0, 0x20)));
-        }
-
-        for (const auto& nca_file : d2_dir->GetFiles()) {
-            if (nca_file == nullptr || !FollowsNcaIdFormat(nca_file->GetName())) {
-                continue;
-            }
-
-            ids.push_back(
-                Common::HexStringToArray<0x10, true>(nca_file->GetName().substr(0, 0x20)));
-        }
-    }
-
-    for (const auto& d2_file : dir->GetFiles()) {
-        if (FollowsNcaIdFormat(d2_file->GetName()))
-            ids.push_back(Common::HexStringToArray<0x10, true>(d2_file->GetName().substr(0, 0x20)));
-    }
-    return ids;
-}
-
-void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
-    for (const auto& id : ids) {
-        const auto file = GetFileAtID(id);
-
-        if (file == nullptr)
-            continue;
-        const auto nca = std::make_shared<NCA>(parser(file, id));
-        if (nca->GetStatus() != Loader::ResultStatus::Success ||
-            nca->GetType() != NCAContentType::Meta || nca->GetSubdirectories().empty()) {
-            continue;
-        }
-
-        const auto section0 = nca->GetSubdirectories()[0];
-
-        for (const auto& section0_file : section0->GetFiles()) {
-            if (section0_file->GetExtension() != "cnmt")
-                continue;
-
-            meta.insert_or_assign(nca->GetTitleId(), CNMT(section0_file));
-            meta_id.insert_or_assign(nca->GetTitleId(), id);
-            break;
-        }
-    }
-}
-
-void RegisteredCache::AccumulateYuzuMeta() {
-    const auto meta_dir = dir->GetSubdirectory("yuzu_meta");
-    if (meta_dir == nullptr) {
-        return;
-    }
-
-    for (const auto& file : meta_dir->GetFiles()) {
-        if (file->GetExtension() != "cnmt") {
-            continue;
-        }
-
-        CNMT cnmt(file);
-        yuzu_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
-    }
-}
-
-void RegisteredCache::Refresh() {
-    if (dir == nullptr) {
-        return;
-    }
-
-    const auto ids = AccumulateFiles();
-    ProcessFiles(ids);
-    AccumulateYuzuMeta();
-}
-
-RegisteredCache::RegisteredCache(VirtualDir dir_, ContentProviderParsingFunction parsing_function)
-    : dir(std::move(dir_)), parser(std::move(parsing_function)) {
-    Refresh();
-}
+RegisteredCache::RegisteredCache(VirtualDir dir_) : dir(std::move(dir_)) {}
 
 RegisteredCache::~RegisteredCache() = default;
 
@@ -533,16 +429,12 @@ std::optional<u32> RegisteredCache::GetEntryVersion(u64 title_id) const {
     return std::nullopt;
 }
 
-VirtualFile RegisteredCache::GetEntryRaw(u64 title_id, ContentRecordType type) const {
-    const auto id = GetNcaIDFromMetadata(title_id, type);
-    return id ? parser(GetFileAtID(*id), *id) : nullptr;
+VirtualFile RegisteredCache::GetEntryRaw(u64, ContentRecordType) const {
+    return nullptr;
 }
 
-std::unique_ptr<NCA> RegisteredCache::GetEntry(u64 title_id, ContentRecordType type) const {
-    const auto raw = GetEntryRaw(title_id, type);
-    if (raw == nullptr)
-        return nullptr;
-    return std::make_unique<NCA>(raw);
+std::unique_ptr<NCA> RegisteredCache::GetEntry(u64, ContentRecordType) const {
+    return nullptr;
 }
 
 template <typename T>

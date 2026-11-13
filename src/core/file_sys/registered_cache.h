@@ -32,7 +32,6 @@ struct MetaRecord;
 class RegisteredCache;
 
 using NcaID = std::array<u8, 0x10>;
-using ContentProviderParsingFunction = std::function<VirtualFile(const VirtualFile&, const NcaID&)>;
 using VfsCopyFunction = std::function<bool(const VirtualFile&, const VirtualFile&, size_t)>;
 
 struct ContentProviderEntry {
@@ -130,12 +129,7 @@ class RegisteredCache : public ContentProvider {
     friend class PlaceholderCache;
 
 public:
-    // Parsing function defines the conversion from raw file to NCA. If there are other steps
-    // besides creating the NCA from the file (e.g. NAX0 on SD Card), that should go in a custom
-    // parsing function.
-    explicit RegisteredCache(
-        VirtualDir dir, ContentProviderParsingFunction parsing_function =
-                            [](const VirtualFile& file, const NcaID& id) { return file; });
+    explicit RegisteredCache(VirtualDir dir);
     ~RegisteredCache() override;
 
     void Refresh() override;
@@ -164,14 +158,10 @@ private:
     void IterateAllMetadata(std::vector<T>& out,
                             std::function<T(const CNMT&, const ContentRecord&)> proc,
                             std::function<bool(const CNMT&, const ContentRecord&)> filter) const;
-    std::vector<NcaID> AccumulateFiles() const;
-    void ProcessFiles(const std::vector<NcaID>& ids);
-    void AccumulateYuzuMeta();
     std::optional<NcaID> GetNcaIDFromMetadata(u64 title_id, ContentRecordType type) const;
     VirtualFile GetFileAtID(NcaID id) const;
     VirtualFile OpenFileOrDirectoryConcat(const VirtualDir& open_dir, std::string_view path) const;
     VirtualDir dir;
-    ContentProviderParsingFunction parser;
 
     // maps tid -> NcaID of meta
     ::Common::unordered_map<u64, NcaID> meta_id;

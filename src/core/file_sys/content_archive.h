@@ -7,15 +7,10 @@
 #pragma once
 
 #include <array>
-#include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
-#include "common/common_funcs.h"
 #include "common/common_types.h"
-#include "common/swap.h"
-#include "core/crypto/key_manager.h"
 #include "core/file_sys/vfs/vfs.h"
 
 namespace Loader {
@@ -23,8 +18,6 @@ enum class ResultStatus : u16;
 }
 
 namespace FileSys {
-
-class NcaReader;
 
 /// Describes the type of content within an NCA archive.
 enum class NCAContentType : u8 {
@@ -62,8 +55,6 @@ inline bool IsDirectoryLogoPartition(const VirtualDir& pfs) {
            pfs->GetFile("StartupMovie.gif") != nullptr;
 }
 
-// An implementation of VfsDirectory that represents a Nintendo Content Archive (NCA) container.
-// After construction, use GetStatus to determine if the file is valid and ready to be used.
 class NCA : public ReadOnlyVfsDirectory {
 public:
     explicit NCA(VirtualFile file, const NCA* base_nca = nullptr, bool allow_missing_base = false);
@@ -91,21 +82,7 @@ public:
     VirtualDir GetLogoPartition() const;
 
 private:
-    std::vector<VirtualDir> dirs;
-    std::vector<VirtualFile> files;
-
-    VirtualFile romfs = nullptr;
-    VirtualDir exefs = nullptr;
-    VirtualDir logo = nullptr;
     VirtualFile file;
-
-    Loader::ResultStatus status{};
-
-    bool encrypted = false;
-    bool is_update = false;
-
-    Core::Crypto::KeyManager& keys;
-    std::shared_ptr<NcaReader> reader;
 };
 
 } // namespace FileSys

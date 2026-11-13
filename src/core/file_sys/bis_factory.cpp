@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fmt/ranges.h>
-#include "common/fs/path_util.h"
-#include "core/crypto/key_manager.h"
-#include "core/crypto/partition_data_manager.h"
 #include "core/file_sys/bis_factory.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -83,30 +80,8 @@ VirtualDir BISFactory::OpenPartition(BisPartitionId id) const {
     }
 }
 
-VirtualFile BISFactory::OpenPartitionStorage(BisPartitionId id,
-                                             VirtualFilesystem file_system) const {
-    auto& keys = Core::Crypto::KeyManager::Instance();
-    Core::Crypto::PartitionDataManager pdm{file_system->OpenDirectory(
-        Common::FS::GetEdenPathString(Common::FS::EdenPath::NANDDir), OpenMode::Read)};
-    keys.PopulateFromPartitionData(pdm);
-
-    switch (id) {
-    case BisPartitionId::CalibrationBinary:
-        return pdm.GetDecryptedProdInfo();
-    case BisPartitionId::BootConfigAndPackage2Part1:
-    case BisPartitionId::BootConfigAndPackage2Part2:
-    case BisPartitionId::BootConfigAndPackage2Part3:
-    case BisPartitionId::BootConfigAndPackage2Part4:
-    case BisPartitionId::BootConfigAndPackage2Part5:
-    case BisPartitionId::BootConfigAndPackage2Part6: {
-        const auto new_id = static_cast<u8>(id) -
-                            static_cast<u8>(BisPartitionId::BootConfigAndPackage2Part1) +
-                            static_cast<u8>(Core::Crypto::Package2Type::NormalMain);
-        return pdm.GetPackage2Raw(static_cast<Core::Crypto::Package2Type>(new_id));
-    }
-    default:
-        return nullptr;
-    }
+VirtualFile BISFactory::OpenPartitionStorage(BisPartitionId, VirtualFilesystem) const {
+    return nullptr;
 }
 
 VirtualDir BISFactory::GetImageDirectory() const {
