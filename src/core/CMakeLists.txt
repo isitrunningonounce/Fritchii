@@ -25,20 +25,6 @@ add_library(core STATIC
     cpu_manager.h
     launch_params.cpp
     launch_params.h
-    crypto/aes_util.cpp
-    crypto/aes_util.h
-    crypto/ctr_encryption_layer.cpp
-    crypto/ctr_encryption_layer.h
-    crypto/encryption_layer.cpp
-    crypto/encryption_layer.h
-    crypto/key_manager.cpp
-    crypto/key_manager.h
-    crypto/ncz_decompressor.cpp
-    crypto/ncz_decompressor.h
-    crypto/partition_data_manager.cpp
-    crypto/partition_data_manager.h
-    crypto/xts_encryption_layer.cpp
-    crypto/xts_encryption_layer.h
     debugger/debugger.cpp
     debugger/debugger.h
     debugger/debugger_interface.h
@@ -56,8 +42,6 @@ add_library(core STATIC
     device_memory_manager.inc
     file_sys/bis_factory.cpp
     file_sys/bis_factory.h
-    file_sys/card_image.cpp
-    file_sys/card_image.h
     file_sys/common_funcs.h
     file_sys/content_archive.cpp
     file_sys/content_archive.h
@@ -79,49 +63,6 @@ add_library(core STATIC
     file_sys/fsmitm_romfsbuild.cpp
     file_sys/fsmitm_romfsbuild.h
     file_sys/fssrv/fssrv_sf_path.h
-    file_sys/fssystem/fs_i_storage.h
-    file_sys/fssystem/fs_types.h
-    file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.cpp
-    file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h
-    file_sys/fssystem/fssystem_aes_ctr_storage.cpp
-    file_sys/fssystem/fssystem_aes_ctr_storage.h
-    file_sys/fssystem/fssystem_aes_xts_storage.cpp
-    file_sys/fssystem/fssystem_aes_xts_storage.h
-    file_sys/fssystem/fssystem_alignment_matching_storage.h
-    file_sys/fssystem/fssystem_alignment_matching_storage_impl.cpp
-    file_sys/fssystem/fssystem_alignment_matching_storage_impl.h
-    file_sys/fssystem/fssystem_bucket_tree.cpp
-    file_sys/fssystem/fssystem_bucket_tree.h
-    file_sys/fssystem/fssystem_bucket_tree_utils.h
-    file_sys/fssystem/fssystem_compressed_storage.h
-    file_sys/fssystem/fssystem_compression_common.h
-    file_sys/fssystem/fssystem_compression_configuration.cpp
-    file_sys/fssystem/fssystem_compression_configuration.h
-    file_sys/fssystem/fssystem_crypto_configuration.cpp
-    file_sys/fssystem/fssystem_crypto_configuration.h
-    file_sys/fssystem/fssystem_hierarchical_integrity_verification_storage.cpp
-    file_sys/fssystem/fssystem_hierarchical_integrity_verification_storage.h
-    file_sys/fssystem/fssystem_hierarchical_sha3_storage.cpp
-    file_sys/fssystem/fssystem_hierarchical_sha3_storage.h
-    file_sys/fssystem/fssystem_hierarchical_sha256_storage.cpp
-    file_sys/fssystem/fssystem_hierarchical_sha256_storage.h
-    file_sys/fssystem/fssystem_indirect_storage.cpp
-    file_sys/fssystem/fssystem_indirect_storage.h
-    file_sys/fssystem/fssystem_integrity_romfs_storage.cpp
-    file_sys/fssystem/fssystem_integrity_romfs_storage.h
-    file_sys/fssystem/fssystem_integrity_verification_storage.cpp
-    file_sys/fssystem/fssystem_integrity_verification_storage.h
-    file_sys/fssystem/fssystem_memory_resource_buffer_hold_storage.h
-    file_sys/fssystem/fssystem_nca_file_system_driver.cpp
-    file_sys/fssystem/fssystem_nca_file_system_driver.h
-    file_sys/fssystem/fssystem_nca_header.cpp
-    file_sys/fssystem/fssystem_nca_header.h
-    file_sys/fssystem/fssystem_nca_reader.cpp
-    file_sys/fssystem/fssystem_sparse_storage.cpp
-    file_sys/fssystem/fssystem_sparse_storage.h
-    file_sys/fssystem/fssystem_switch_storage.h
-    file_sys/fssystem/fssystem_utility.cpp
-    file_sys/fssystem/fssystem_utility.h
     file_sys/ips_layer.cpp
     file_sys/ips_layer.h
     file_sys/kernel_executable.cpp
@@ -150,8 +91,6 @@ add_library(core STATIC
     file_sys/savedata_factory.h
     file_sys/sdmc_factory.cpp
     file_sys/sdmc_factory.h
-    file_sys/submission_package.cpp
-    file_sys/submission_package.h
     file_sys/system_archive/data/font_chinese_simplified.cpp
     file_sys/system_archive/data/font_chinese_simplified.h
     file_sys/system_archive/data/font_chinese_traditional.cpp
@@ -192,8 +131,6 @@ add_library(core STATIC
     file_sys/vfs/vfs_types.h
     file_sys/vfs/vfs_vector.cpp
     file_sys/vfs/vfs_vector.h
-    file_sys/xts_archive.cpp
-    file_sys/xts_archive.h
     frontend/applets/cabinet.cpp
     frontend/applets/cabinet.h
     frontend/applets/controller.cpp
@@ -1168,20 +1105,12 @@ add_library(core STATIC
     loader/kip.h
     loader/loader.cpp
     loader/loader.h
-    loader/nax.cpp
-    loader/nax.h
-    loader/nca.cpp
-    loader/nca.h
     loader/nro.cpp
     loader/nro.h
     loader/nso.cpp
     loader/nso.h
-    loader/nsp.cpp
-    loader/nsp.h
     loader/nup.cpp
     loader/nup.h
-    loader/xci.cpp
-    loader/xci.h
     memory.cpp
     memory.h
     memory/cheat_engine.cpp

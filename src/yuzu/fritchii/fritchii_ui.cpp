@@ -193,15 +193,12 @@ QIcon Glyph(const QString& name, unsigned rgb, int px) {
 void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& hooks) {
     const auto tr = [](const char* text) { return QObject::tr(text); };
 
-    // File: open, install, folders, settings, exit.
     ui.menuOpen_Eden_Folders->removeAction(ui.action_Log_Folder);
     QMenu* file = ui.menu_File;
     file->clear();
     file->addAction(ui.action_Load_File);
     file->addAction(ui.action_Load_Folder);
     file->addMenu(ui.menu_recent_files);
-    file->addSeparator();
-    file->addAction(ui.action_Install_File_NAND);
     file->addSeparator();
     file->addMenu(ui.menuOpen_Eden_Folders);
     file->addSeparator();
@@ -232,24 +229,14 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     view->addAction(ui.action_Post_Processing_Shaders);
     view->addMenu(ui.menu_View_Debugging);
 
-    // Tools: setup tools first; Amiibo; rarely used things under Advanced.
     QMenu* tools = ui.menu_Tools;
     tools->clear();
-    tools->addAction(ui.action_Install_Keys);
-    tools->addMenu(ui.menuInstall_Firmware);
-    tools->addAction(ui.action_Verify_installed_contents);
     tools->addAction(ui.action_Data_Manager);
     tools->addSeparator();
     tools->addAction(ui.action_Capture_Screenshot);
-    tools->addMenu(ui.menu_Create_Shortcuts);
+    tools->addAction(ui.action_Load_Amiibo);
     tools->addSeparator();
-    QMenu* amiibo = ui.menu_cabinet_applet;
-    QAction* first_cabinet = amiibo->actions().value(0);
-    amiibo->insertAction(first_cabinet, ui.action_Load_Amiibo);
-    amiibo->insertSeparator(first_cabinet);
-    tools->addMenu(amiibo);
     QMenu* advanced = new QMenu(tr("Ad&vanced"), tools);
-    advanced->addMenu(ui.menu_Applets);
     advanced->addMenu(ui.menuTAS);
     advanced->addMenu(ui.menu_Multiplayer);
     advanced->addSeparator();
@@ -284,10 +271,8 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     ui.menu_Game_List_Mode->setTitle(tr("Game &List"));
     ui.menuGame_Icon_Size->setTitle(tr("&Icon Size"));
     ui.menu_Reset_Window_Size->setTitle(tr("&Window Size"));
-    ui.menu_Create_Shortcuts->setTitle(tr("Create &Shortcut"));
     Rename(ui.action_Load_File, tr("&Open Game..."));
     Rename(ui.action_Load_Folder, tr("Open &Extracted Game..."));
-    Rename(ui.action_Install_File_NAND, tr("&Install Update or DLC..."));
     Rename(ui.action_Configure, tr("&Settings..."));
     Rename(ui.action_Configure_Current_Game, tr("Game &Settings..."));
     Rename(ui.action_Root_Data_Folder, tr("&Data"));
@@ -310,8 +295,6 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     Rename(ui.action_Data_Manager, tr("&Data Manager..."));
     Rename(ui.action_Capture_Screenshot, tr("Take &Screenshot"));
     Rename(ui.action_Load_Amiibo, tr("&Load or Remove Amiibo..."));
-    Rename(ui.action_Firmware_From_Folder, tr("From &Folder..."));
-    Rename(ui.action_Firmware_From_ZIP, tr("From &ZIP..."));
     Rename(ui.action_About, tr("&About Fritchii"));
     Rename(ui.action_Eden_Dependencies, tr("&Open-Source Components"));
 }

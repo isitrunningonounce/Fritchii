@@ -211,10 +211,10 @@ Result FSP_SRV::OpenFileSystemWithPatch(OutInterface<IFileSystem> out_interface,
     const auto manual_romfs = romfs_controller->OpenPatchedRomFS(
         open_program_id, FileSys::ContentRecordType::HtmlDocument);
 
-    ASSERT(manual_romfs != nullptr);
+    R_UNLESS(manual_romfs, FileSys::ResultTargetNotFound);
 
     const auto extracted_romfs = FileSys::ExtractRomFS(manual_romfs);
-    ASSERT(extracted_romfs != nullptr);
+    R_UNLESS(extracted_romfs, FileSys::ResultTargetNotFound);
 
     *out_interface = std::make_shared<IFileSystem>(
         system, extracted_romfs, SizeGetter::FromStorageId(fsc, FileSys::StorageId::NandUser));

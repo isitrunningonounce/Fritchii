@@ -13,7 +13,6 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/file_sys/bis_factory.h"
-#include "core/file_sys/card_image.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/patch_manager.h"
@@ -495,23 +494,12 @@ u64 FileSystemController::GetTotalSpaceSize(FileSys::StorageId id) const {
     return 0;
 }
 
-void FileSystemController::SetGameCard(FileSys::VirtualFile file) {
-    gamecard = std::make_unique<FileSys::XCI>(file);
-    const auto dir = gamecard->ConcatenatedPseudoDirectory();
-    gamecard_registered = std::make_unique<FileSys::RegisteredCache>(dir);
-    gamecard_placeholder = std::make_unique<FileSys::PlaceholderCache>(dir);
-}
-
-FileSys::XCI* FileSystemController::GetGameCard() const {
-    return gamecard.get();
-}
-
 FileSys::RegisteredCache* FileSystemController::GetGameCardContents() const {
-    return gamecard_registered.get();
+    return nullptr;
 }
 
 FileSys::PlaceholderCache* FileSystemController::GetGameCardPlaceholder() const {
-    return gamecard_placeholder.get();
+    return nullptr;
 }
 
 FileSys::RegisteredCache* FileSystemController::GetSystemNANDContents() const {

@@ -8,6 +8,7 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/frame_gen_stats.h"
@@ -36,7 +37,6 @@
 #include "about_dialog.h"
 #include "data_dialog.h"
 #include "deps_dialog.h"
-#include "install_dialog.h"
 
 #include "bootmanager.h"
 #include "loading_screen.h"
@@ -87,7 +87,6 @@
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGuiApplication>
-#include <QInputDialog>
 #include <QMimeData>
 #include <QPalette>
 #include <QProgressDialog>
@@ -107,7 +106,6 @@
 #include "qt_common/abstract/frontend.h"
 
 #include "qt_common/qt_common.h"
-#include "qt_common/qt_string_lookup.h"
 
 #include "qt_common/util/content.h"
 #include "qt_common/util/fs.h"
@@ -117,19 +115,8 @@
 
 #include "qt_common/render/emu_thread.h"
 
-// These are wrappers to avoid the calls to CreateDirectory and CreateFile because of the Windows
-// defines.
-static FileSys::VirtualDir VfsFilesystemCreateDirectoryWrapper(const std::string& path,
-                                                               FileSys::OpenMode mode) {
-    return QtCommon::vfs->CreateDirectory(path, mode);
-}
-
-static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::VirtualDir& dir,
-                                                          const std::string& path) {
-    return dir->CreateFile(path);
-}
-
 // Frontend //
+#include "frontend_common/firmware_manager.h"
 #include "frontend_common/play_time_manager.h"
 
 #ifdef ENABLE_UPDATE_CHECKER
@@ -160,18 +147,16 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/frontend/applet_web_browser_types.h"
 
-#include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
+#include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/patch_manager.h"
-#include "core/file_sys/romfs.h"
 #include "core/file_sys/savedata_factory.h"
+#include "core/loader/loader.h"
 
 #include "core/tools/renderdoc.h"
 
 #include "core/perf_stats.h"
-
-#include "core/crypto/key_manager.h"
 
 // Input //
 #include "hid_core/frontend/emulated_controller.h"
@@ -184,11 +169,6 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/shader_notify.h"
 
 #include <SDL3/SDL.h>
-
-#include <boost/container/flat_set.hpp>
-
-// Platform stuff //
-#include <boost/container/flat_set.hpp>
 
 #ifdef __APPLE__
 #include <unistd.h> // for chdir
@@ -335,8 +315,6 @@ constexpr int EmuThreadStopTimeoutMs = 10'000;
 // most before its thread is terminated.
 constexpr qint64 MaxEmuThreadShutdownMs = 180'000;
 
-constexpr size_t CopyBufferSize = 1_MiB;
-
 /**
  * "Callouts" are one-time instructional messages shown to the user. In the config settings, there
  * is a bitfield "callout_flags" options, used to track if a message has already been shown to the
@@ -475,8 +453,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // Setup content providers.
     QtCommon::SetupContentProviders();
 
-    // Gen keys if necessary
-    OnCheckFirmwareDecryption(false);
+    SetFirmwareVersion();
+    UpdateMenuState();
 
 #ifdef __unix__
     OnCheckGraphicsBackend();
@@ -485,9 +463,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // Check for orphaned profiles and reset profile data if necessary
     QtCommon::Content::FixProfiles();
 
-    if (Settings::values.use_dev_keys.GetValue()) {
-        Core::Crypto::KeyManager::Instance().ReloadKeys();
-    }
     game_list->PopulateAsync(UISettings::values.game_dirs);
 
     // Set up game list mode checkboxes.
@@ -565,17 +540,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         if (!lp.filepath.empty()) {
             launched_with_game = true;
             BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
-        } else if (lp.launch_setup) {
-            LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
-        } else if (lp.launch_qlaunch) {
-            LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::QLaunch), std::nullopt);
-        } else if (lp.launch_hlaunch) {
-            std::filesystem::path const sd_dir =
-                Common::FS::GetEdenPathString(Common::FS::EdenPath::SDMCDir);
-            auto const hbl_path = (sd_dir / "atmosphere" / "hbl.nsp").string();
-            BootGame(
-                QString::fromStdString(hbl_path),
-                LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
     }
 
@@ -1637,7 +1601,6 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::RemovePlayTimeRequested, this,
             &MainWindow::OnGameListRemovePlayTimeData);
     connect(game_list, &GameList::SetPlayTimeRequested, this, &MainWindow::OnGameListSetPlayTime);
-    connect(game_list, &GameList::DumpRomFSRequested, this, &MainWindow::OnGameListDumpRomFS);
     connect(game_list, &GameList::VerifyIntegrityRequested, this,
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
@@ -1663,7 +1626,6 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListOpenPerGameProperties);
     connect(game_list, &GameList::LinkToRyujinxRequested, this, &MainWindow::OnLinkToRyujinx);
 
-    connect(this, &MainWindow::UpdateInstallProgress, this, &MainWindow::IncrementInstallProgress);
 
     // Software Keyboard Applet
     connect(this, &MainWindow::EmulationStarting, this, &MainWindow::SoftwareKeyboardExit);
@@ -1687,7 +1649,6 @@ void MainWindow::ConnectMenuEvents() {
     // File
     connect_menu(ui->action_Load_File, &MainWindow::OnMenuLoadFile);
     connect_menu(ui->action_Load_Folder, &MainWindow::OnMenuLoadFolder);
-    connect_menu(ui->action_Install_File_NAND, &MainWindow::OnMenuInstallToNAND);
     connect_menu(ui->action_Exit, &QMainWindow::close);
     connect_menu(ui->action_Load_Amiibo, &MainWindow::OnLoadAmiibo);
 
@@ -1771,39 +1732,6 @@ void MainWindow::ConnectMenuEvents() {
             &MultiplayerState::OnOpenNetworkRoom);
     connect(multiplayer_state, &MultiplayerState::SaveConfig, this, &MainWindow::OnSaveConfig);
 
-    // Tools
-    connect_menu(ui->action_Launch_PhotoViewer, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::PhotoViewer), std::nullopt);
-    });
-    connect_menu(ui->action_Launch_MiiEdit, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::MiiEdit), std::nullopt);
-    });
-    connect_menu(ui->action_Launch_Controller, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Controller), std::nullopt);
-    });
-    connect_menu(ui->action_Launch_QLaunch, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::QLaunch), std::nullopt);
-    });
-    // Tools (cabinet)
-    connect_menu(ui->action_Launch_Cabinet_Nickname_Owner, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Cabinet),
-                             {Service::NFP::CabinetMode::StartNicknameAndOwnerSettings});
-    });
-    connect_menu(ui->action_Launch_Cabinet_Eraser, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Cabinet),
-                             {Service::NFP::CabinetMode::StartGameDataEraser});
-    });
-    connect_menu(ui->action_Launch_Cabinet_Restorer, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Cabinet),
-                             {Service::NFP::CabinetMode::StartRestorer});
-    });
-    connect_menu(ui->action_Launch_Cabinet_Formatter, [this] {
-        LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Cabinet),
-                             {Service::NFP::CabinetMode::StartFormatter});
-    });
-
-    connect_menu(ui->action_Desktop, &MainWindow::OnCreateHomeMenuDesktopShortcut);
-    connect_menu(ui->action_Application_Menu, &MainWindow::OnCreateHomeMenuApplicationMenuShortcut);
     connect_menu(ui->action_Capture_Screenshot, &MainWindow::OnCaptureScreenshot);
 
     // TAS
@@ -1819,10 +1747,6 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Mod_Folder, &MainWindow::OnOpenModFolder);
     connect_menu(ui->action_Log_Folder, &MainWindow::OnOpenLogFolder);
 
-    connect_menu(ui->action_Verify_installed_contents, &MainWindow::OnVerifyInstalledContents);
-    connect_menu(ui->action_Firmware_From_Folder, &MainWindow::OnInstallFirmware);
-    connect_menu(ui->action_Firmware_From_ZIP, &MainWindow::OnInstallFirmwareFromZIP);
-    connect_menu(ui->action_Install_Keys, &MainWindow::OnInstallDecryptionKeys);
     connect_menu(ui->action_About, &MainWindow::OnAbout);
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
@@ -1849,7 +1773,6 @@ void MainWindow::ConnectMenuEvents() {
 
 void MainWindow::UpdateMenuState() {
     const bool is_paused = QtCommon::emu_thread == nullptr || !QtCommon::emu_thread->IsRunning();
-    const bool is_firmware_available = CheckFirmwarePresence();
 
     const std::array running_actions{
         ui->action_Stop,
@@ -1859,25 +1782,11 @@ void MainWindow::UpdateMenuState() {
         ui->action_Pause,
     };
 
-    const std::array applet_actions{
-        ui->action_Launch_PhotoViewer,       ui->action_Launch_Cabinet_Nickname_Owner,
-        ui->action_Launch_Cabinet_Eraser,    ui->action_Launch_Cabinet_Restorer,
-        ui->action_Launch_Cabinet_Formatter, ui->action_Launch_MiiEdit,
-        ui->action_Launch_QLaunch,           ui->action_Launch_Controller};
-
     for (QAction* action : running_actions) {
         action->setEnabled(emulation_running);
     }
     if (action_prepare_shaders_now) {
         action_prepare_shaders_now->setEnabled(emulation_running);
-    }
-
-    ui->action_Firmware_From_Folder->setEnabled(!emulation_running);
-    ui->action_Firmware_From_ZIP->setEnabled(!emulation_running);
-    ui->action_Install_Keys->setEnabled(!emulation_running);
-
-    for (QAction* action : applet_actions) {
-        action->setEnabled(is_firmware_available && !emulation_running);
     }
 
     ui->action_Capture_Screenshot->setEnabled(emulation_running && !is_paused);
@@ -2035,11 +1944,6 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         nullptr,                                             // Net Connect
     });
 
-    /** firmware check */
-
-    if (!QtCommon::Content::CheckGameFirmware(params.program_id))
-        return false;
-
     /** Exec */
     const Core::SystemResultStatus result{
         QtCommon::system->Load(*render_window, filename.toStdString(), params)};
@@ -2063,6 +1967,12 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
             if (result > Core::SystemResultStatus::ErrorLoader) {
                 const u16 loader_id = static_cast<u16>(Core::SystemResultStatus::ErrorLoader);
                 const u16 error_id = static_cast<u16>(result) - loader_id;
+                const auto loader_status = static_cast<Loader::ResultStatus>(error_id);
+                if (loader_status == Loader::ResultStatus::ErrorEncryptedContentUnsupported) {
+                    ShowErrorWithExportLog(tr("Error while loading ROM!"),
+                                           QString::fromStdString(GetResultStatusString(loader_status)));
+                    break;
+                }
                 const std::string error_code = fmt::format("({:04X}-{:04X})", loader_id, error_id);
                 LOG_CRITICAL(Frontend, "Failed to load ROM! {}", error_code);
 
@@ -2073,7 +1983,7 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                     tr("%1<br>Please redump your files or ask on Discord/Stoat for help.",
                        "%1 signifies an error string.")
                         .arg(QString::fromStdString(
-                            GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
+                            GetResultStatusString(loader_status)));
 
                 ShowErrorWithExportLog(title, description);
             } else {
@@ -2729,68 +2639,6 @@ void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
     QDesktopServices::openUrl(QUrl::fromLocalFile(qpath));
 }
 
-static bool RomFSRawCopy(size_t total_size, size_t& read_size, QProgressDialog& dialog,
-                         const FileSys::VirtualDir& src, const FileSys::VirtualDir& dest,
-                         bool full) {
-    if (src == nullptr || dest == nullptr || !src->IsReadable() || !dest->IsWritable())
-        return false;
-    if (dialog.wasCanceled())
-        return false;
-
-    std::vector<u8> buffer(CopyBufferSize);
-    auto last_timestamp = std::chrono::steady_clock::now();
-
-    const auto QtRawCopy = [&](const FileSys::VirtualFile& src_file,
-                               const FileSys::VirtualFile& dest_file) {
-        if (src_file == nullptr || dest_file == nullptr) {
-            return false;
-        }
-        if (!dest_file->Resize(src_file->GetSize())) {
-            return false;
-        }
-
-        for (std::size_t i = 0; i < src_file->GetSize(); i += buffer.size()) {
-            if (dialog.wasCanceled()) {
-                dest_file->Resize(0);
-                return false;
-            }
-
-            using namespace std::literals::chrono_literals;
-            const auto new_timestamp = std::chrono::steady_clock::now();
-
-            if ((new_timestamp - last_timestamp) > 33ms) {
-                last_timestamp = new_timestamp;
-                dialog.setValue(
-                    static_cast<int>((std::min)(read_size, total_size) * 100 / total_size));
-                QCoreApplication::processEvents();
-            }
-
-            const auto read = src_file->Read(buffer.data(), buffer.size(), i);
-            dest_file->Write(buffer.data(), read, i);
-
-            read_size += read;
-        }
-
-        return true;
-    };
-
-    if (full) {
-        for (const auto& file : src->GetFiles()) {
-            const auto out = VfsDirectoryCreateFileWrapper(dest, file->GetName());
-            if (!QtRawCopy(file, out))
-                return false;
-        }
-    }
-
-    for (const auto& dir : src->GetSubdirectories()) {
-        const auto out = dest->CreateSubdirectory(dir->GetName());
-        if (!RomFSRawCopy(total_size, read_size, dialog, dir, out, full))
-            return false;
-    }
-
-    return true;
-}
-
 // TODO(crueter): All this can be transfered to qt_common
 // Aldoe I need to decide re: message boxes for QML
 // translations_common? strings_common? qt_strings? who knows
@@ -2900,125 +2748,8 @@ void MainWindow::OnGameListRemovePlayTimeData(u64 program_id) {
     game_list->PopulateAsync(UISettings::values.game_dirs);
 }
 
-void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_path,
-                                     DumpRomFSTarget target) {
-    const auto failed = [this] {
-        QMessageBox::warning(this, tr("RomFS Extraction Failed!"),
-                             tr("There was an error copying the RomFS files or the user "
-                                "cancelled the operation."));
-    };
-
-    const auto loader = Loader::GetLoader(
-        *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read));
-    if (loader == nullptr) {
-        failed();
-        return;
-    }
-
-    FileSys::VirtualFile packed_update_raw{};
-    loader->ReadUpdateRaw(packed_update_raw);
-
-    const auto& installed = QtCommon::system->GetContentProvider();
-
-    u64 title_id{};
-    u8 raw_type{};
-    if (!SelectRomFSDumpTarget(installed, program_id, &title_id, &raw_type)) {
-        failed();
-        return;
-    }
-
-    const auto type = static_cast<FileSys::ContentRecordType>(raw_type);
-    const auto base_nca = installed.GetEntry(title_id, type);
-    if (!base_nca) {
-        failed();
-        return;
-    }
-
-    const FileSys::NCA update_nca{packed_update_raw, nullptr};
-    if (type != FileSys::ContentRecordType::Program ||
-        update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
-        update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
-        packed_update_raw = {};
-    }
-
-    const auto base_romfs = base_nca->GetRomFS();
-    const auto dump_dir =
-        target == DumpRomFSTarget::Normal
-            ? Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)
-            : Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir) / "atmosphere" / "contents";
-    const auto romfs_dir = fmt::format("{:016X}/romfs", title_id);
-
-    const auto path = Common::FS::PathToUTF8String(dump_dir / romfs_dir);
-
-    const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
-                                   installed};
-    auto romfs = pm.PatchRomFS(base_nca.get(), base_romfs, type, packed_update_raw, false);
-
-    const auto out = VfsFilesystemCreateDirectoryWrapper(path, FileSys::OpenMode::ReadWrite);
-
-    if (out == nullptr) {
-        failed();
-        QtCommon::vfs->DeleteDirectory(path);
-        return;
-    }
-
-    bool ok = false;
-    const QStringList selections{tr("Full"), tr("Skeleton")};
-    const auto res = QInputDialog::getItem(
-        this, tr("Select RomFS Dump Mode"),
-        tr("Please select the how you would like the RomFS dumped.<br>Full will copy all of the "
-           "files into the new directory while <br>skeleton will only create the directory "
-           "structure."),
-        selections, 0, false, &ok);
-    if (!ok) {
-        failed();
-        QtCommon::vfs->DeleteDirectory(path);
-        return;
-    }
-
-    const auto extracted = FileSys::ExtractRomFS(romfs);
-    if (extracted == nullptr) {
-        failed();
-        return;
-    }
-
-    const auto full = res == selections.constFirst();
-
-    // The expected required space is the size of the RomFS + 1 GiB
-    const auto minimum_free_space = romfs->GetSize() + 0x40000000;
-
-    if (full && Common::FS::GetFreeSpaceSize(path) < minimum_free_space) {
-        QMessageBox::warning(this, tr("RomFS Extraction Failed!"),
-                             tr("There is not enough free space at %1 to extract the RomFS. Please "
-                                "free up space or select a different dump directory at "
-                                "Emulation > Configure > System > Filesystem > Dump Root")
-                                 .arg(QString::fromStdString(path)));
-        return;
-    }
-
-    QProgressDialog progress(tr("Extracting RomFS..."), tr("Cancel"), 0, 100, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(100);
-    progress.setAutoClose(false);
-    progress.setAutoReset(false);
-
-    size_t read_size = 0;
-
-    if (RomFSRawCopy(romfs->GetSize(), read_size, progress, extracted, out, full)) {
-        progress.close();
-        QMessageBox::information(this, tr("RomFS Extraction Succeeded!"),
-                                 tr("The operation completed successfully."));
-        QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(path)));
-    } else {
-        progress.close();
-        failed();
-        QtCommon::vfs->DeleteDirectory(path);
-    }
-}
-
-// END
 void MainWindow::OnGameListVerifyIntegrity(const std::string& game_path) {
-    QtCommon::Content::VerifyGameContents(game_path);
+    QtCommon::Content::VerifyNupIntegrity(game_path);
 }
 
 void MainWindow::OnGameListCopyTID(u64 program_id) {
@@ -3187,190 +2918,6 @@ void MainWindow::OnMenuLoadFolder() {
         QMessageBox::warning(this, tr("Invalid Directory Selected"),
                              tr("The directory you have selected does not contain a 'main' file."));
     }
-}
-
-void MainWindow::IncrementInstallProgress() {
-    install_progress->setValue(install_progress->value() + 1);
-}
-
-void MainWindow::OnMenuInstallToNAND() {
-    const QString file_filter =
-        tr("Installable Switch File (*.nca *.nsp *.nsz *.xci *.xcz);;Nintendo Content Archive "
-           "(*.nca);;Nintendo Submission Package (*.nsp *.nsz);;NX Cartridge "
-           "Image (*.xci *.xcz)");
-
-    QStringList filenames = QFileDialog::getOpenFileNames(
-        this, tr("Install Files"), QString::fromStdString(UISettings::values.roms_path),
-        file_filter);
-
-    if (filenames.isEmpty()) {
-        return;
-    }
-
-    InstallDialog installDialog(this, filenames);
-    if (installDialog.exec() == QDialog::Rejected) {
-        return;
-    }
-
-    const QStringList files = installDialog.GetFiles();
-
-    if (files.isEmpty()) {
-        return;
-    }
-
-    // Save folder location of the first selected file
-    UISettings::values.roms_path = QFileInfo(filenames[0]).path().toStdString();
-
-    int remaining = filenames.size();
-
-    // This would only overflow above 2^51 bytes (2.252 PB)
-    int total_size = 0;
-    for (const QString& file : files) {
-        total_size += static_cast<int>(QFile(file).size() / CopyBufferSize);
-    }
-    if (total_size < 0) {
-        LOG_CRITICAL(Frontend, "Attempting to install too many files, aborting.");
-        return;
-    }
-
-    QStringList new_files{};         // Newly installed files that do not yet exist in the NAND
-    QStringList overwritten_files{}; // Files that overwrote those existing in the NAND
-    QStringList failed_files{};      // Files that failed to install due to errors
-    bool detected_base_install{};    // Whether a base game was attempted to be installed
-
-    ui->action_Install_File_NAND->setEnabled(false);
-
-    install_progress = new QProgressDialog(QString{}, tr("Cancel"), 0, total_size, this);
-    install_progress->setWindowFlags(windowFlags() & ~Qt::WindowMaximizeButtonHint);
-    install_progress->setAttribute(Qt::WA_DeleteOnClose, true);
-    install_progress->setFixedWidth(installDialog.GetMinimumWidth() + 40);
-    install_progress->show();
-
-    for (const QString& file : files) {
-        install_progress->setWindowTitle(tr("%n file(s) remaining", "", remaining));
-        install_progress->setLabelText(
-            tr("Installing file \"%1\"...").arg(QFileInfo(file).fileName()));
-
-        QFuture<ContentManager::InstallResult> future;
-        ContentManager::InstallResult result;
-
-        if (file.endsWith(QStringLiteral("nsp"), Qt::CaseInsensitive) ||
-            file.endsWith(QStringLiteral("nsz"), Qt::CaseInsensitive) ||
-            file.endsWith(QStringLiteral("xci"), Qt::CaseInsensitive) ||
-            file.endsWith(QStringLiteral("xcz"), Qt::CaseInsensitive)) {
-            const auto progress_callback = [this](size_t size, size_t progress) {
-                emit UpdateInstallProgress();
-                if (install_progress->wasCanceled()) {
-                    return true;
-                }
-                return false;
-            };
-            future = QtConcurrent::run([&file, progress_callback] {
-                return ContentManager::InstallNSP(*QtCommon::system, *QtCommon::vfs,
-                                                  file.toStdString(), progress_callback);
-            });
-
-            while (!future.isFinished()) {
-                QCoreApplication::processEvents();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-
-            result = future.result();
-
-        } else {
-            result = InstallNCA(file);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-        switch (result) {
-        case ContentManager::InstallResult::Success:
-            new_files.append(QFileInfo(file).fileName());
-            break;
-        case ContentManager::InstallResult::Overwrite:
-            overwritten_files.append(QFileInfo(file).fileName());
-            break;
-        case ContentManager::InstallResult::Failure:
-            failed_files.append(QFileInfo(file).fileName());
-            break;
-        case ContentManager::InstallResult::BaseInstallAttempted:
-            failed_files.append(QFileInfo(file).fileName());
-            detected_base_install = true;
-            break;
-        }
-
-        --remaining;
-    }
-
-    install_progress->close();
-
-    if (detected_base_install) {
-        QMessageBox::warning(
-            this, tr("Install Results"),
-            tr("To avoid possible conflicts, we discourage users from installing base games to the "
-               "NAND.\nPlease, only use this feature to install updates and DLC."));
-    }
-
-    const QString install_results =
-        (new_files.isEmpty() ? QString{}
-                             : tr("%n file(s) were newly installed\n", "", new_files.size())) +
-        (overwritten_files.isEmpty()
-             ? QString{}
-             : tr("%n file(s) were overwritten\n", "", overwritten_files.size())) +
-        (failed_files.isEmpty() ? QString{}
-                                : tr("%n file(s) failed to install\n", "", failed_files.size()));
-
-    QMessageBox::information(this, tr("Install Results"), install_results);
-    Common::FS::RemoveDirRecursively(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                                     "game_list");
-    game_list->PopulateAsync(UISettings::values.game_dirs);
-    ui->action_Install_File_NAND->setEnabled(true);
-}
-
-ContentManager::InstallResult MainWindow::InstallNCA(const QString& filename) {
-    const QStringList tt_options{tr("System Application"),
-                                 tr("System Archive"),
-                                 tr("System Application Update"),
-                                 tr("Firmware Package (Type A)"),
-                                 tr("Firmware Package (Type B)"),
-                                 tr("Game"),
-                                 tr("Game Update"),
-                                 tr("Game DLC"),
-                                 tr("Delta Title")};
-    bool ok;
-    const auto item = QInputDialog::getItem(
-        this, tr("Select NCA Install Type..."),
-        tr("Please select the type of title you would like to install this NCA as:\n(In "
-           "most instances, the default 'Game' is fine.)"),
-        tt_options, 5, false, &ok);
-
-    auto index = tt_options.indexOf(item);
-    if (!ok || index == -1) {
-        QMessageBox::warning(this, tr("Failed to Install"),
-                             tr("The title type you selected for the NCA is invalid."));
-        return ContentManager::InstallResult::Failure;
-    }
-
-    // If index is equal to or past Game, add the jump in TitleType.
-    if (index >= 5) {
-        index += static_cast<size_t>(FileSys::TitleType::Application) -
-                 static_cast<size_t>(FileSys::TitleType::FirmwarePackageB);
-    }
-
-    const bool is_application = index >= static_cast<s32>(FileSys::TitleType::Application);
-    const auto& fs_controller = QtCommon::system->GetFileSystemController();
-    auto* registered_cache = is_application ? fs_controller.GetUserNANDContents()
-                                            : fs_controller.GetSystemNANDContents();
-
-    const auto progress_callback = [this](size_t size, size_t progress) {
-        emit UpdateInstallProgress();
-        if (install_progress->wasCanceled()) {
-            return true;
-        }
-        return false;
-    };
-    return ContentManager::InstallNCA(*QtCommon::vfs, filename.toStdString(), *registered_cache,
-                                      static_cast<FileSys::TitleType>(index), progress_callback);
 }
 
 void MainWindow::OnMenuRecentFile() {
@@ -4300,32 +3847,6 @@ void MainWindow::OnOpenLogFolder() {
     QtCommon::Game::OpenLogFolder();
 }
 
-void MainWindow::OnVerifyInstalledContents() {
-    QtCommon::Content::VerifyInstalledContents();
-}
-
-void MainWindow::OnInstallFirmware() {
-    QtCommon::Content::InstallFirmware();
-    OnCheckFirmwareDecryption();
-}
-
-void MainWindow::OnInstallFirmwareFromZIP() {
-    QtCommon::Content::InstallFirmwareZip();
-    OnCheckFirmwareDecryption();
-}
-
-// TODO(crueter): QtCommon this: game list populate can be a signal?
-void MainWindow::OnInstallDecryptionKeys() {
-    // Don't do this while emulation is running.
-    if (QtCommon::emu_thread != nullptr && QtCommon::emu_thread->IsRunning())
-        return;
-
-    QtCommon::Content::InstallKeys();
-
-    game_list->PopulateAsync(UISettings::values.game_dirs);
-    OnCheckFirmwareDecryption();
-}
-
 void MainWindow::OnAbout() {
     AboutDialog aboutDialog(this);
     aboutDialog.exec();
@@ -4868,100 +4389,6 @@ void MainWindow::OnGameListEditNupMetadata(const std::string& game_path) {
             Qt::QueuedConnection);
         return FileSys::Nup::PackResult::Success;
     }));
-}
-
-void MainWindow::LaunchFirmwareApplet(u64 raw_program_id,
-                                      std::optional<Service::NFP::CabinetMode> cabinet_mode) {
-    auto const program_id = Service::AM::AppletProgramId(raw_program_id);
-    auto result = FirmwareManager::VerifyFirmware(*QtCommon::system.get());
-    using namespace QtCommon::StringLookup;
-    switch (result) {
-    case FirmwareManager::ErrorFirmwareMissing:
-        QMessageBox::warning(this, tr("No firmware available"),
-                             Lookup(FwCheckErrorFirmwareMissing));
-        return;
-    case FirmwareManager::ErrorFirmwareCorrupted:
-        QMessageBox::warning(this, tr("Firmware Corrupted"), Lookup(FwCheckErrorFirmwareCorrupted));
-        return;
-    default:
-        break;
-    }
-    auto bis_system = QtCommon::system->GetFileSystemController().GetSystemNANDContents();
-    if (auto applet_nca =
-            bis_system->GetEntry(u64(program_id), FileSys::ContentRecordType::Program);
-        applet_nca) {
-        if (auto const applet_id =
-                [program_id] {
-                    using namespace Service::AM;
-                    switch (program_id) {
-                    case AppletProgramId::OverlayDisplay:
-                        return AppletId::OverlayDisplay;
-                    case AppletProgramId::QLaunch:
-                        return AppletId::QLaunch;
-                    case AppletProgramId::Starter:
-                        return AppletId::Starter;
-                    case AppletProgramId::Auth:
-                        return AppletId::Auth;
-                    case AppletProgramId::Cabinet:
-                        return AppletId::Cabinet;
-                    case AppletProgramId::Controller:
-                        return AppletId::Controller;
-                    case AppletProgramId::DataErase:
-                        return AppletId::DataErase;
-                    case AppletProgramId::Error:
-                        return AppletId::Error;
-                    case AppletProgramId::NetConnect:
-                        return AppletId::NetConnect;
-                    case AppletProgramId::ProfileSelect:
-                        return AppletId::ProfileSelect;
-                    case AppletProgramId::SoftwareKeyboard:
-                        return AppletId::SoftwareKeyboard;
-                    case AppletProgramId::MiiEdit:
-                        return AppletId::MiiEdit;
-                    case AppletProgramId::Web:
-                        return AppletId::Web;
-                    case AppletProgramId::Shop:
-                        return AppletId::Shop;
-                    case AppletProgramId::PhotoViewer:
-                        return AppletId::PhotoViewer;
-                    case AppletProgramId::Settings:
-                        return AppletId::Settings;
-                    case AppletProgramId::OfflineWeb:
-                        return AppletId::OfflineWeb;
-                    case AppletProgramId::LoginShare:
-                        return AppletId::LoginShare;
-                    case AppletProgramId::WebAuth:
-                        return AppletId::WebAuth;
-                    case AppletProgramId::MyPage:
-                        return AppletId::MyPage;
-                    default:
-                        return AppletId::None;
-                    }
-                }();
-            applet_id != Service::AM::AppletId::None) {
-            QtCommon::system->GetFrontendAppletHolder().SetCurrentAppletId(applet_id);
-            if (cabinet_mode)
-                QtCommon::system->GetFrontendAppletHolder().SetCabinetMode(*cabinet_mode);
-            // ?
-            auto const filename = QString::fromStdString((applet_nca->GetFullPath()));
-            UISettings::values.roms_path = QFileInfo(filename).path().toStdString();
-            BootGame(filename, LibraryAppletParameters(u64(program_id), applet_id));
-        } else {
-            QMessageBox::warning(this, tr("Unknown applet"),
-                                 tr("Applet doesn't map to a known value."));
-        }
-    } else {
-        QMessageBox::warning(this, tr("Record not found"),
-                             tr("Applet not found. Please reinstall firmware."));
-    }
-}
-
-void MainWindow::OnCreateHomeMenuDesktopShortcut() {
-    QtCommon::Game::CreateHomeMenuShortcut(QtCommon::Game::ShortcutTarget::Desktop);
-}
-
-void MainWindow::OnCreateHomeMenuApplicationMenuShortcut() {
-    QtCommon::Game::CreateHomeMenuShortcut(QtCommon::Game::ShortcutTarget::Applications);
 }
 
 void MainWindow::OnCaptureScreenshot() {
@@ -5514,26 +4941,6 @@ void MainWindow::OnMouseActivity() {
     }
 }
 
-void MainWindow::OnCheckFirmwareDecryption(bool prompt) {
-    if (!ContentManager::AreKeysPresent() && !prompt) {
-        // At startup only log it: loose ExeFS/RomFS dumps (all Switch 2 games so far) need no
-        // keys, and a modal question blocked every unattended launch. Tools > Install Decryption
-        // Keys still installs them.
-        LOG_WARNING(Frontend, "Decryption keys are missing: NCA, NSP and XCI games need them");
-    } else if (!ContentManager::AreKeysPresent()) {
-        const auto res = QtCommon::Frontend::Warning(
-            tr("Derivation Components Missing"),
-            tr("Decryption keys are missing. Install them now?"),
-            QtCommon::Frontend::StandardButton::Yes | QtCommon::Frontend::StandardButton::No);
-
-        if (res == QtCommon::Frontend::StandardButton::Yes)
-            OnInstallDecryptionKeys();
-    }
-
-    SetFirmwareVersion();
-    UpdateMenuState();
-}
-
 #ifdef __unix__
 void MainWindow::OnCheckGraphicsBackend() {
     const QString platformName = QGuiApplication::platformName();
@@ -5595,15 +5002,11 @@ void MainWindow::SetFirmwareVersion() {
 
     if (result.IsError() || !CheckFirmwarePresence()) {
         LOG_INFO(Frontend, "Installed firmware: No firmware available");
-        ui->menu_Applets->setEnabled(false);
-        ui->menu_Create_Shortcuts->setEnabled(false);
         firmware_label->setVisible(false);
         return;
     }
 
     firmware_label->setVisible(true);
-    ui->menu_Applets->setEnabled(true);
-    ui->menu_Create_Shortcuts->setEnabled(true);
 
     const std::string display_version(firmware_data.display_version.data());
     const std::string display_title(firmware_data.display_title.data());
@@ -5633,66 +5036,6 @@ void MainWindow::SetFPSSuffix() {
         break;
     }
     }
-}
-
-bool MainWindow::SelectRomFSDumpTarget(const FileSys::ContentProvider& installed, u64 program_id,
-                                       u64* selected_title_id, u8* selected_content_record_type) {
-    using ContentInfo = std::tuple<u64, FileSys::TitleType, FileSys::ContentRecordType>;
-    boost::container::flat_set<ContentInfo> available_title_ids;
-
-    const auto RetrieveEntries = [&](FileSys::TitleType title_type,
-                                     FileSys::ContentRecordType record_type) {
-        const auto entries = installed.ListEntriesFilter(title_type, record_type);
-        for (const auto& entry : entries) {
-            if (FileSys::GetBaseTitleID(entry.title_id) == program_id &&
-                installed.GetEntry(entry)->GetStatus() == Loader::ResultStatus::Success) {
-                available_title_ids.insert({entry.title_id, title_type, record_type});
-            }
-        }
-    };
-
-    RetrieveEntries(FileSys::TitleType::Application, FileSys::ContentRecordType::Program);
-    RetrieveEntries(FileSys::TitleType::Application, FileSys::ContentRecordType::HtmlDocument);
-    RetrieveEntries(FileSys::TitleType::Application, FileSys::ContentRecordType::LegalInformation);
-    RetrieveEntries(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
-
-    if (available_title_ids.empty()) {
-        return false;
-    }
-
-    size_t title_index = 0;
-
-    if (available_title_ids.size() > 1) {
-        QStringList list;
-        for (auto& [title_id, title_type, record_type] : available_title_ids) {
-            const auto hex_title_id = QString::fromStdString(fmt::format("{:X}", title_id));
-            if (record_type == FileSys::ContentRecordType::Program) {
-                list.push_back(QStringLiteral("Program [%1]").arg(hex_title_id));
-            } else if (record_type == FileSys::ContentRecordType::HtmlDocument) {
-                list.push_back(QStringLiteral("HTML document [%1]").arg(hex_title_id));
-            } else if (record_type == FileSys::ContentRecordType::LegalInformation) {
-                list.push_back(QStringLiteral("Legal information [%1]").arg(hex_title_id));
-            } else {
-                list.push_back(
-                    QStringLiteral("DLC %1 [%2]").arg(title_id & 0x7FF).arg(hex_title_id));
-            }
-        }
-
-        bool ok;
-        const auto res = QInputDialog::getItem(
-            this, tr("Select RomFS Dump Target"),
-            tr("Please select which RomFS you would like to dump."), list, 0, false, &ok);
-        if (!ok) {
-            return false;
-        }
-
-        title_index = list.indexOf(res);
-    }
-
-    const auto& [title_id, title_type, record_type] = *available_title_ids.nth(title_index);
-    *selected_title_id = title_id;
-    *selected_content_record_type = static_cast<u8>(record_type);
-    return true;
 }
 
 bool MainWindow::ConfirmClose() {
@@ -5991,15 +5334,6 @@ Service::AM::FrontendAppletParameters MainWindow::ApplicationAppletParameters() 
     return Service::AM::FrontendAppletParameters{
         .applet_id = Service::AM::AppletId::Application,
         .applet_type = Service::AM::AppletType::Application,
-    };
-}
-
-Service::AM::FrontendAppletParameters MainWindow::LibraryAppletParameters(
-    u64 program_id, Service::AM::AppletId applet_id) {
-    return Service::AM::FrontendAppletParameters{
-        .program_id = program_id,
-        .applet_id = applet_id,
-        .applet_type = Service::AM::AppletType::LibraryApplet,
     };
 }
 

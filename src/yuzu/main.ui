@@ -67,7 +67,6 @@
      <addaction name="action_Mod_Folder"/>
      <addaction name="action_Log_Folder"/>
     </widget>
-    <addaction name="action_Install_File_NAND"/>
     <addaction name="separator"/>
     <addaction name="action_Load_File"/>
     <addaction name="action_Load_Folder"/>
@@ -174,24 +173,6 @@
     <property name="title">
      <string>&amp;Tools</string>
     </property>
-    <widget class="QMenu" name="menu_cabinet_applet">
-     <property name="title">
-      <string>Am&amp;iibo</string>
-     </property>
-     <addaction name="action_Launch_Cabinet_Nickname_Owner"/>
-     <addaction name="action_Launch_Cabinet_Eraser"/>
-     <addaction name="action_Launch_Cabinet_Restorer"/>
-     <addaction name="action_Launch_Cabinet_Formatter"/>
-    </widget>
-    <widget class="QMenu" name="menu_Applets">
-     <property name="title">
-      <string>Launch &amp;Applet</string>
-     </property>
-     <addaction name="action_Launch_QLaunch"/>
-     <addaction name="action_Launch_MiiEdit"/>
-     <addaction name="action_Launch_Controller"/>
-     <addaction name="action_Launch_PhotoViewer"/>
-    </widget>
     <widget class="QMenu" name="menuTAS">
      <property name="title">
       <string>&amp;TAS</string>
@@ -202,28 +183,7 @@
      <addaction name="separator"/>
      <addaction name="action_Configure_Tas"/>
     </widget>
-    <widget class="QMenu" name="menu_Create_Shortcuts">
-     <property name="title">
-      <string>&amp;Create Home Menu Shortcut</string>
-     </property>
-     <addaction name="action_Desktop"/>
-     <addaction name="action_Application_Menu"/>
-    </widget>
-    <widget class="QMenu" name="menuInstall_Firmware">
-     <property name="title">
-      <string>Install &amp;Firmware</string>
-     </property>
-     <addaction name="action_Firmware_From_Folder"/>
-     <addaction name="action_Firmware_From_ZIP"/>
-    </widget>
-    <addaction name="action_Install_Keys"/>
-    <addaction name="menuInstall_Firmware"/>
-    <addaction name="action_Verify_installed_contents"/>
     <addaction name="action_Data_Manager"/>
-    <addaction name="separator"/>
-    <addaction name="menu_cabinet_applet"/>
-    <addaction name="menu_Applets"/>
-    <addaction name="menu_Create_Shortcuts"/>
     <addaction name="separator"/>
     <addaction name="action_Capture_Screenshot"/>
     <addaction name="menuTAS"/>
@@ -246,14 +206,6 @@
    <addaction name="menu_Multiplayer"/>
    <addaction name="menu_Help"/>
   </widget>
-  <action name="action_Install_File_NAND">
-   <property name="enabled">
-    <bool>true</bool>
-   </property>
-   <property name="text">
-    <string>&amp;Install Files to NAND...</string>
-   </property>
-  </action>
   <action name="action_Load_File">
    <property name="text">
     <string>L&amp;oad File...</string>
@@ -283,11 +235,6 @@
    </property>
    <property name="text">
     <string>&amp;Stop</string>
-   </property>
-  </action>
-  <action name="action_Verify_installed_contents">
-   <property name="text">
-    <string>&amp;Verify Installed Contents</string>
    </property>
   </action>
   <action name="action_About">
@@ -420,36 +367,6 @@
     <string>&amp;Capture Screenshot</string>
    </property>
   </action>
-  <action name="action_Launch_PhotoViewer">
-   <property name="text">
-    <string>&amp;Album</string>
-   </property>
-  </action>
-  <action name="action_Launch_Cabinet_Nickname_Owner">
-   <property name="text">
-    <string>&amp;Set Nickname and Owner</string>
-   </property>
-  </action>
-  <action name="action_Launch_Cabinet_Eraser">
-   <property name="text">
-    <string>&amp;Delete Game Data</string>
-   </property>
-  </action>
-  <action name="action_Launch_Cabinet_Restorer">
-   <property name="text">
-    <string>&amp;Restore Amiibo</string>
-   </property>
-  </action>
-  <action name="action_Launch_Cabinet_Formatter">
-   <property name="text">
-    <string>&amp;Format Amiibo</string>
-   </property>
-  </action>
-  <action name="action_Launch_MiiEdit">
-   <property name="text">
-    <string>&amp;Mii Editor</string>
-   </property>
-  </action>
   <action name="action_Configure_Tas">
    <property name="text">
     <string>&amp;Configure TAS...</string>
@@ -493,31 +410,6 @@
     <string>R&amp;ecord</string>
    </property>
   </action>
-  <action name="action_Launch_Controller">
-   <property name="text">
-    <string>Open &amp;Controller Menu</string>
-   </property>
-  </action>
-  <action name="action_Install_Keys">
-   <property name="text">
-    <string>Install Decryption &amp;Keys</string>
-   </property>
-  </action>
-  <action name="action_Launch_QLaunch">
-   <property name="text">
-    <string>&amp;Home Menu</string>
-   </property>
-  </action>
-  <action name="action_Desktop">
-   <property name="text">
-    <string>&amp;Desktop</string>
-   </property>
-  </action>
-  <action name="action_Application_Menu">
-   <property name="text">
-    <string>&amp;Application Menu</string>
-   </property>
-  </action>
   <action name="action_Root_Data_Folder">
    <property name="text">
     <string>&amp;Root Data Folder</string>
@@ -541,16 +433,6 @@
   <action name="action_Log_Folder">
    <property name="text">
     <string>&amp;Log Folder</string>
-   </property>
-  </action>
-  <action name="action_Firmware_From_Folder">
-   <property name="text">
-    <string>From Folder</string>
-   </property>
-  </action>
-  <action name="action_Firmware_From_ZIP">
-   <property name="text">
-    <string>From ZIP</string>
    </property>
   </action>
   <action name="action_Eden_Dependencies">
