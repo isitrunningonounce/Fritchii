@@ -15,23 +15,14 @@
 #include "common/logging.h"
 #include "common/random.h"
 #include "common/string_util.h"
-#include "core/crypto/key_manager.h"
-#include "core/crypto/ncz_decompressor.h"
-#include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
-#include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/registered_cache.h"
-#include "core/file_sys/romfs.h"
-#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/loader/loader.h"
 
 namespace FileSys {
-
-// The size of blocks to use when vfs raw copying into nand.
-constexpr size_t VFS_RC_LARGE_COPY_BLOCK = 0x400000;
 
 std::string ContentProviderEntry::DebugInfo() const {
     return fmt::format("title_id={:016X}, content_type={:02X}", title_id, static_cast<u8>(type));
@@ -73,7 +64,7 @@ static std::string GetRelativePathFromNcaID(const std::array<u8, 16>& nca_id, bo
         return fmt::format(format_str, nca_str);
     }
 
-    Core::Crypto::SHA256Hash hash{};
+    std::array<u8, 32> hash{};
     u32 hash_len = 0;
     EVP_Digest(nca_id.data(), nca_id.size(), hash.data(), &hash_len, EVP_sha256(), nullptr);
 
@@ -105,225 +96,6 @@ static std::string GetCNMTName(TitleType type, u64 title_id) {
                  static_cast<std::size_t>(TitleType::FirmwarePackageB);
     }
     return fmt::format("{}_{:016x}.cnmt", TITLE_TYPE_NAMES[index], title_id);
-}
-
-static std::shared_ptr<NSP> OpenContainerAsNsp(const VirtualFile& file, Loader::FileType type) {
-    if (!file) {
-        return nullptr;
-    }
-
-    if (type == Loader::FileType::Unknown || type == Loader::FileType::Error) {
-        type = Loader::IdentifyFile(file);
-        if (type == Loader::FileType::Unknown) {
-            type = Loader::GuessFromFilename(file->GetName());
-        }
-    }
-
-    if (type == Loader::FileType::NSP) {
-        auto nsp = std::make_shared<NSP>(file);
-        return nsp->GetStatus() == Loader::ResultStatus::Success ? nsp : nullptr;
-    }
-
-    if (type == Loader::FileType::XCI) {
-        XCI xci(file);
-        if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return nullptr;
-        }
-
-        auto secure_partition = xci.GetSecurePartitionNSP();
-        if (secure_partition == nullptr) {
-            return nullptr;
-        }
-
-        return secure_partition;
-    }
-
-    // SAF-backed files can occasionally fail type-guessing despite being valid NSP/XCI.
-    // As a last resort, probe both container parsers directly.
-    {
-        auto nsp = std::make_shared<NSP>(file);
-        if (nsp->GetStatus() == Loader::ResultStatus::Success) {
-            return nsp;
-        }
-    }
-    {
-        XCI xci(file);
-        if (xci.GetStatus() == Loader::ResultStatus::Success) {
-            auto secure_partition = xci.GetSecurePartitionNSP();
-            if (secure_partition != nullptr) {
-                return secure_partition;
-            }
-        }
-    }
-
-    return nullptr;
-}
-
-// Checks that every .ncz entry in the container is NCZBLOCK. Solid NCZ has no random access,
-// and the whole point of this build is to reject it at scan time so such files never appear
-// in the game list. Containers without any .ncz (plain NSP/XCI) pass through.
-static bool ContainerIsFullyBlockCompressed(const std::shared_ptr<NSP>& nsp) {
-    if (!nsp) {
-        return false;
-    }
-    for (const auto& entry : nsp->GetFiles()) {
-        const auto name = entry->GetName();
-        if (name.size() < 4 || name.substr(name.size() - 4) != ".ncz") {
-            continue;
-        }
-        if (!Core::Crypto::IsBlockCompressedNCZ(entry)) {
-            return false; // solid NCZ -> reject the whole container
-        }
-    }
-    return true; // no .ncz at all, or all block-compressed
-}
-
-template <typename Callback>
-bool ForEachContainerEntry(const std::shared_ptr<NSP>& nsp, bool only_content,
-                           std::optional<u64> base_program_id, Callback&& on_entry) {
-    if (!nsp) {
-        return false;
-    }
-
-    const auto& ncas = nsp->GetNCAs();
-    if (ncas.empty()) {
-        return false;
-    }
-
-    std::map<u64, u32> versions;
-    std::map<u64, std::string> version_strings;
-
-    for (const auto& [title_id, nca_map] : ncas) {
-        for (const auto& [type_pair, nca] : nca_map) {
-            if (!nca) {
-                continue;
-            }
-
-            const auto& [title_type, content_type] = type_pair;
-
-            if (content_type == ContentRecordType::Meta) {
-                const auto subdirs = nca->GetSubdirectories();
-                if (!subdirs.empty()) {
-                    for (const auto& inner_file : subdirs[0]->GetFiles()) {
-                        if (inner_file->GetExtension() == "cnmt") {
-                            const CNMT cnmt(inner_file);
-                            versions[cnmt.GetTitleID()] = cnmt.GetTitleVersion();
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (title_type == TitleType::Update && content_type == ContentRecordType::Control) {
-                const auto romfs = nca->GetRomFS();
-                if (!romfs) {
-                    continue;
-                }
-
-                const auto extracted = ExtractRomFS(romfs);
-                if (!extracted) {
-                    continue;
-                }
-
-                auto nacp_file = extracted->GetFile("control.nacp");
-                if (!nacp_file) {
-                    nacp_file = extracted->GetFile("Control.nacp");
-                }
-                if (!nacp_file) {
-                    continue;
-                }
-
-                const NACP nacp(nacp_file);
-                auto version_string = nacp.GetVersionString();
-                if (!version_string.empty()) {
-                    version_strings[title_id] = std::move(version_string);
-                }
-            }
-        }
-    }
-
-    bool added_entries = false;
-    for (const auto& [title_id, nca_map] : ncas) {
-        if (base_program_id.has_value() && GetBaseTitleID(title_id) != *base_program_id) {
-            continue;
-        }
-
-        for (const auto& [type_pair, nca] : nca_map) {
-            const auto& [title_type, content_type] = type_pair;
-            if (only_content && title_type != TitleType::Update && title_type != TitleType::AOC) {
-                continue;
-            }
-
-            auto entry_file = nca ? nca->GetBaseFile() : nullptr;
-            if (!entry_file) {
-                continue;
-            }
-
-            u32 version = 0;
-            std::string version_string;
-
-            if (title_type == TitleType::Update) {
-                if (const auto version_it = versions.find(title_id); version_it != versions.end()) {
-                    version = version_it->second;
-                }
-
-                if (const auto version_str_it = version_strings.find(title_id);
-                    version_str_it != version_strings.end()) {
-                    version_string = version_str_it->second;
-                }
-            }
-
-            on_entry(title_type, content_type, title_id, entry_file, version, version_string);
-            added_entries = true;
-        }
-    }
-
-    return added_entries;
-}
-
-static void UpsertExternalVersionEntry(std::vector<ExternalUpdateEntry>& multi_version_entries,
-                                       u64 title_id, u32 version,
-                                       const std::string& version_string,
-                                       ContentRecordType content_type, const VirtualFile& file) {
-    auto it = std::find_if(multi_version_entries.begin(), multi_version_entries.end(),
-                           [title_id, version](const ExternalUpdateEntry& entry) {
-                               return entry.title_id == title_id && entry.version == version;
-                           });
-
-    if (it == multi_version_entries.end()) {
-        ExternalUpdateEntry update_entry;
-        update_entry.title_id = title_id;
-        update_entry.version = version;
-        update_entry.version_string = version_string;
-        update_entry.files[static_cast<std::size_t>(content_type)] = file;
-        multi_version_entries.push_back(std::move(update_entry));
-        return;
-    }
-
-    it->files[static_cast<std::size_t>(content_type)] = file;
-    if (it->version_string.empty() && !version_string.empty()) {
-        it->version_string = version_string;
-    }
-}
-
-template <typename EntryMap, typename VersionMap>
-static bool AddExternalEntriesFromContainer(const std::shared_ptr<NSP>& nsp, EntryMap& entries,
-                                            VersionMap& versions,
-                                            std::vector<ExternalUpdateEntry>& multi_version_entries) {
-    return ForEachContainerEntry(
-        nsp, true, std::nullopt,
-        [&entries, &versions,
-         &multi_version_entries](TitleType title_type, ContentRecordType content_type, u64 title_id,
-                                 const VirtualFile& file, u32 version,
-                                 const std::string& version_string) {
-            entries[{title_id, content_type, title_type}] = file;
-
-            if (title_type == TitleType::Update) {
-                versions[title_id] = version;
-                UpsertExternalVersionEntry(multi_version_entries, title_id, version, version_string,
-                                           content_type, file);
-            }
-        });
 }
 
 ContentRecordType GetCRTypeFromNCAType(NCAContentType type) {
@@ -394,7 +166,7 @@ bool PlaceholderCache::Create(const NcaID& id, u64 size) const {
         return false;
     }
 
-    Core::Crypto::SHA256Hash hash{};
+    std::array<u8, 32> hash{};
     u32 hash_len = 0;
     EVP_Digest(id.data(), id.size(), hash.data(), &hash_len, EVP_sha256(), nullptr);
 
@@ -422,7 +194,7 @@ bool PlaceholderCache::Delete(const NcaID& id) const {
         return false;
     }
 
-    Core::Crypto::SHA256Hash hash{};
+    std::array<u8, 32> hash{};
     u32 hash_len = 0;
     EVP_Digest(id.data(), id.size(), hash.data(), &hash_len, EVP_sha256(), nullptr);
 
@@ -453,20 +225,8 @@ bool PlaceholderCache::Write(const NcaID& id, u64 offset, const std::vector<u8>&
     return file->WriteBytes(data, offset) == data.size();
 }
 
-bool PlaceholderCache::Register(RegisteredCache* cache, const NcaID& placeholder,
-                                const NcaID& install) const {
-    const auto path = GetRelativePathFromNcaID(placeholder, false, true, false);
-    const auto file = dir->GetFileRelative(path);
-
-    if (file == nullptr)
-        return false;
-
-    const auto res = cache->RawInstallNCA(NCA{file}, &VfsRawCopy, false, install);
-
-    if (res != InstallResult::Success)
-        return false;
-
-    return Delete(placeholder);
+bool PlaceholderCache::Register(RegisteredCache*, const NcaID&, const NcaID&) const {
+    return false;
 }
 
 bool PlaceholderCache::CleanAll() const {
@@ -830,167 +590,6 @@ std::vector<ContentProviderEntry> RegisteredCache::ListEntriesFilter(
     return out;
 }
 
-static std::shared_ptr<NCA> GetNCAFromNSPForID(const NSP& nsp, const NcaID& id) {
-    const auto id_string = Common::HexToString(id, false);
-    auto file = nsp.GetFile(fmt::format("{}.nca", id_string));
-    if (file == nullptr) {
-        if (auto ncz_file = nsp.GetFile(fmt::format("{}.ncz", id_string))) {
-            file = Core::Crypto::DecompressNCZForInstall(
-                ncz_file, fmt::format("{}.nca", id_string));
-        }
-    }
-    if (file == nullptr) {
-        return nullptr;
-    }
-    return std::make_shared<NCA>(std::move(file));
-}
-
-InstallResult RegisteredCache::InstallEntry(const XCI& xci, bool overwrite_if_exists,
-                                            const VfsCopyFunction& copy) {
-    return InstallEntry(*xci.GetSecurePartitionNSP(), overwrite_if_exists, copy);
-}
-
-InstallResult RegisteredCache::InstallEntry(const NSP& nsp, bool overwrite_if_exists,
-                                            const VfsCopyFunction& copy) {
-    const auto ncas = nsp.GetNCAsCollapsed();
-    const auto meta_iter = std::find_if(ncas.begin(), ncas.end(), [](const auto& nca) {
-        return nca->GetType() == NCAContentType::Meta;
-    });
-
-    if (meta_iter == ncas.end()) {
-        LOG_ERROR(Loader, "The file you are attempting to install does not have a metadata NCA and "
-                          "is therefore malformed. Check your encryption keys.");
-        return InstallResult::ErrorMetaFailed;
-    }
-
-    const auto meta_id_raw = (*meta_iter)->GetName().substr(0, 32);
-    const auto meta_id_data = Common::HexStringToArray<16>(meta_id_raw);
-
-    if ((*meta_iter)->GetSubdirectories().empty()) {
-        LOG_ERROR(Loader,
-                  "The file you are attempting to install does not contain a section0 within the "
-                  "metadata NCA and is therefore malformed. Verify that the file is valid.");
-        return InstallResult::ErrorMetaFailed;
-    }
-
-    const auto section0 = (*meta_iter)->GetSubdirectories()[0];
-
-    if (section0->GetFiles().empty()) {
-        LOG_ERROR(Loader,
-                  "The file you are attempting to install does not contain a CNMT within the "
-                  "metadata NCA and is therefore malformed. Verify that the file is valid.");
-        return InstallResult::ErrorMetaFailed;
-    }
-
-    const auto cnmt_file = section0->GetFiles()[0];
-    const CNMT cnmt(cnmt_file);
-
-    const auto title_id = cnmt.GetTitleID();
-    const auto version = cnmt.GetTitleVersion();
-
-    if (title_id == GetBaseTitleID(title_id) && version == 0) {
-        return InstallResult::ErrorBaseInstall;
-    }
-
-    const auto result = RemoveExistingEntry(title_id);
-
-    // Install Metadata File
-    const auto meta_result = RawInstallNCA(**meta_iter, copy, overwrite_if_exists, meta_id_data);
-    if (meta_result != InstallResult::Success) {
-        return meta_result;
-    }
-
-    // Install all the other NCAs
-    for (const auto& record : cnmt.GetContentRecords()) {
-        // Ignore DeltaFragments, they are not useful to us
-        if (record.type == ContentRecordType::DeltaFragment) {
-            continue;
-        }
-        const auto nca = GetNCAFromNSPForID(nsp, record.nca_id);
-        if (nca == nullptr) {
-            return InstallResult::ErrorCopyFailed;
-        }
-        if (nca->GetStatus() == Loader::ResultStatus::ErrorMissingBKTRBaseRomFS &&
-            nca->GetTitleId() != title_id) {
-            // Create fake cnmt for patch to multiprogram application
-            const auto sub_nca_result =
-                InstallEntry(*nca, cnmt.GetHeader(), record, overwrite_if_exists, copy);
-            if (sub_nca_result != InstallResult::Success) {
-                return sub_nca_result;
-            }
-            continue;
-        }
-        const auto nca_result = RawInstallNCA(*nca, copy, overwrite_if_exists, record.nca_id);
-        if (nca_result != InstallResult::Success) {
-            return nca_result;
-        }
-    }
-
-    Refresh();
-    if (result) {
-        return InstallResult::OverwriteExisting;
-    }
-    return InstallResult::Success;
-}
-
-InstallResult RegisteredCache::InstallEntry(const NCA& nca, TitleType type,
-                                            bool overwrite_if_exists, const VfsCopyFunction& copy) {
-    const CNMTHeader header{
-        .title_id = nca.GetTitleId(),
-        .title_version = 0,
-        .type = type,
-        .reserved = {},
-        .table_offset = 0x10,
-        .number_content_entries = 1,
-        .number_meta_entries = 0,
-        .attributes = 0,
-        .reserved2 = {},
-        .is_committed = 0,
-        .required_download_system_version = 0,
-        .reserved3 = {},
-    };
-    const OptionalHeader opt_header{0, 0};
-    ContentRecord c_rec{{}, {}, {}, GetCRTypeFromNCAType(nca.GetType()), {}};
-    const auto& data = nca.GetBaseFile()->ReadBytes(0x100000);
-
-    u32 hash_len = 0;
-    EVP_Digest(data.data(), data.size(), c_rec.hash.data(), &hash_len, EVP_sha256(), nullptr);
-
-    LOG_DEBUG(Loader, "Decoded {} bytes, nca {}", hash_len, nca.GetName());
-
-    std::memcpy(&c_rec.nca_id, &c_rec.hash, 16);
-    const CNMT new_cnmt(header, opt_header, {c_rec}, {});
-    if (!RawInstallYuzuMeta(new_cnmt)) {
-        return InstallResult::ErrorMetaFailed;
-    }
-    return RawInstallNCA(nca, copy, overwrite_if_exists, c_rec.nca_id);
-}
-
-InstallResult RegisteredCache::InstallEntry(const NCA& nca, const CNMTHeader& base_header,
-                                            const ContentRecord& base_record,
-                                            bool overwrite_if_exists, const VfsCopyFunction& copy) {
-    const CNMTHeader header{
-        .title_id = nca.GetTitleId(),
-        .title_version = base_header.title_version,
-        .type = base_header.type,
-        .reserved = {},
-        .table_offset = 0x10,
-        .number_content_entries = 1,
-        .number_meta_entries = 0,
-        .attributes = 0,
-        .reserved2 = {},
-        .is_committed = 0,
-        .required_download_system_version = 0,
-        .reserved3 = {},
-    };
-    const OptionalHeader opt_header{0, 0};
-    const CNMT new_cnmt(header, opt_header, {base_record}, {});
-    if (!RawInstallYuzuMeta(new_cnmt)) {
-        return InstallResult::ErrorMetaFailed;
-    }
-    return RawInstallNCA(nca, copy, overwrite_if_exists, base_record.nca_id);
-}
-
 bool RegisteredCache::RemoveExistingEntry(u64 title_id) const {
     bool removed_data = false;
 
@@ -1067,78 +666,6 @@ bool RegisteredCache::Delete(const NcaID& id) const {
     }
 
     return true;
-}
-
-InstallResult RegisteredCache::RawInstallNCA(const NCA& nca, const VfsCopyFunction& copy,
-                                             bool overwrite_if_exists,
-                                             std::optional<NcaID> override_id) {
-    const auto in = nca.GetBaseFile();
-    Core::Crypto::SHA256Hash hash{};
-
-    // Calculate NcaID
-    // NOTE: Because computing the SHA256 of an entire NCA is quite expensive (especially if the
-    // game is massive), we're going to cheat and only hash the first MB of the NCA.
-    // Also, for XCIs the NcaID matters, so if the override id isn't none, use that.
-    NcaID id{};
-    if (override_id) {
-        id = *override_id;
-    } else {
-        const auto& data = in->ReadBytes(0x100000);
-
-        u32 hash_len = 0;
-        EVP_Digest(data.data(), data.size(), hash.data(), &hash_len, EVP_sha256(), nullptr);
-
-        LOG_DEBUG(Loader, "Decoded {} bytes, nca {}", hash_len, nca.GetName());
-
-        memcpy(id.data(), hash.data(), 16);
-    }
-
-    std::string path = GetRelativePathFromNcaID(id, false, true, false);
-
-    if (GetFileAtID(id) != nullptr && !overwrite_if_exists) {
-        LOG_WARNING(Loader, "Attempting to overwrite existing NCA. Skipping...");
-        return InstallResult::ErrorAlreadyExists;
-    }
-
-    if (GetFileAtID(id) != nullptr) {
-        LOG_WARNING(Loader, "Overwriting existing NCA...");
-        VirtualDir c_dir;
-        { c_dir = dir->GetFileRelative(path)->GetContainingDirectory(); }
-        c_dir->DeleteFile(Common::FS::GetFilename(path));
-    }
-
-    auto out = dir->CreateFileRelative(path);
-    if (out == nullptr) {
-        return InstallResult::ErrorCopyFailed;
-    }
-    return copy(in, out, VFS_RC_LARGE_COPY_BLOCK) ? InstallResult::Success
-                                                  : InstallResult::ErrorCopyFailed;
-}
-
-bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
-    // Reasoning behind this method can be found in the comment for InstallEntry, NCA overload.
-    const auto meta_dir = dir->CreateDirectoryRelative("yuzu_meta");
-    const auto filename = GetCNMTName(cnmt.GetType(), cnmt.GetTitleID());
-    if (meta_dir->GetFile(filename) == nullptr) {
-        auto out = meta_dir->CreateFile(filename);
-        const auto buffer = cnmt.Serialize();
-        out->Resize(buffer.size());
-        out->WriteBytes(buffer);
-    } else {
-        auto out = meta_dir->GetFile(filename);
-        CNMT old_cnmt(out);
-        // Returns true on change
-        if (old_cnmt.UnionRecords(cnmt)) {
-            out->Resize(0);
-            const auto buffer = old_cnmt.Serialize();
-            out->Resize(buffer.size());
-            out->WriteBytes(buffer);
-        }
-    }
-    Refresh();
-    return std::find_if(yuzu_meta.begin(), yuzu_meta.end(), [&cnmt](const std::pair<u64, CNMT>& kv) {
-        return kv.second.GetType() == cnmt.GetType() && kv.second.GetTitleID() == cnmt.GetTitleID();
-    }) != yuzu_meta.end();
 }
 
 ContentProviderUnion::~ContentProviderUnion() = default;
@@ -1293,32 +820,6 @@ void ManualContentProvider::AddEntryWithVersion(TitleType title_type, ContentRec
     }
 }
 
-bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_content,
-                                                    std::optional<u64> base_program_id) {
-    const auto nsp = OpenContainerAsNsp(file, Loader::FileType::Unknown);
-    if (!nsp) {
-        return false;
-    }
-
-    // Reject solid NCZ (.nsz without -B): only block-compressed NCZ is supported.
-    if (!ContainerIsFullyBlockCompressed(nsp)) {
-        LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
-        return false;
-    }
-
-    return ForEachContainerEntry(
-        nsp, only_content, base_program_id,
-        [this](TitleType title_type, ContentRecordType content_type, u64 title_id,
-               const VirtualFile& entry_file, u32 version, const std::string& version_string) {
-            if (title_type == TitleType::Update) {
-                AddEntryWithVersion(title_type, content_type, title_id, version, version_string,
-                                    entry_file);
-            } else {
-                AddEntry(title_type, content_type, title_id, entry_file);
-            }
-        });
-}
-
 void ManualContentProvider::ClearAllEntries() {
     entries.clear();
     multi_version_entries.clear();
@@ -1412,7 +913,6 @@ ExternalContentProvider::~ExternalContentProvider() = default;
 void ExternalContentProvider::AddDirectory(VirtualDir directory) {
     if (directory != nullptr) {
         load_dirs.push_back(std::move(directory));
-        ScanDirectory(load_dirs.back());
     }
 }
 
@@ -1427,64 +927,6 @@ void ExternalContentProvider::Refresh() {
     entries.clear();
     versions.clear();
     multi_version_entries.clear();
-    for (const auto& dir : load_dirs) {
-        if (dir != nullptr) {
-            ScanDirectory(dir);
-        }
-    }
-}
-
-void ExternalContentProvider::ScanDirectory(const VirtualDir& dir) {
-    if (dir == nullptr) {
-        return;
-    }
-
-    for (const auto& file : dir->GetFiles()) {
-        const auto filename = file->GetName();
-        const auto dot_pos = filename.find_last_of('.');
-
-        if (dot_pos == std::string::npos) {
-            continue;
-        }
-
-        const auto extension = Common::ToLower(filename.substr(dot_pos + 1));
-        // .xcz is an XCI container, but its updates only work through the NSP/PFS0 path
-        // (DecompressNCZ), not ProcessXCI. So route .xcz here on purpose.
-        if (extension == "nsp" || extension == "nsz" || extension == "xcz") {
-            ProcessNSP(file);
-        } else if (extension == "xci") {
-            ProcessXCI(file);
-        }
-    }
-
-    for (const auto& subdir : dir->GetSubdirectories()) {
-        ScanDirectory(subdir);
-    }
-}
-
-void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
-    const auto nsp = OpenContainerAsNsp(file, Loader::FileType::NSP);
-    if (!nsp) {
-        return;
-    }
-
-    // Reject solid NCZ (.nsz without -B): Eden only supports block-compressed NCZ.
-    if (!ContainerIsFullyBlockCompressed(nsp)) {
-        LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
-        return;
-    }
-
-    LOG_DEBUG(Service_FS, "Processing NSP file: {}", file->GetName());
-    AddExternalEntriesFromContainer(nsp, entries, versions, multi_version_entries);
-}
-
-void ExternalContentProvider::ProcessXCI(const VirtualFile& file) {
-    const auto nsp = OpenContainerAsNsp(file, Loader::FileType::XCI);
-    if (!nsp) {
-        return;
-    }
-
-    AddExternalEntriesFromContainer(nsp, entries, versions, multi_version_entries);
 }
 
 bool ExternalContentProvider::HasEntry(u64 title_id, ContentRecordType type) const {

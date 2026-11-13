@@ -221,10 +221,6 @@ void EmulationSession::ConfigureFilesystemProvider(const std::string& filepath) 
         return;
     }
 
-    if (m_manual_provider->AddEntriesFromContainer(file)) {
-        return;
-    }
-
     auto loader = Loader::GetLoader(m_system, file);
     if (!loader) {
         return;

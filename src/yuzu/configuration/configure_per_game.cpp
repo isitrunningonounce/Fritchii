@@ -54,7 +54,6 @@
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/patch_manager.h"
-#include "core/file_sys/xts_archive.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
 #include "qt_common/abstract/frontend.h"

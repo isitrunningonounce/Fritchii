@@ -9,28 +9,17 @@
 #include <ostream>
 #include <string>
 #include <concepts>
-#include <algorithm>
+#include <array>
 #include "common/concepts.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/string_util.h"
-#include "core/core.h"
-#include "core/file_sys/card_image.h"
 #include "core/file_sys/control_metadata.h"
-#include "core/file_sys/common_funcs.h"
-#include "core/file_sys/content_archive.h"
-#include "core/file_sys/registered_cache.h"
-#include "core/file_sys/submission_package.h"
-#include "core/hle/kernel/k_process.h"
 #include "core/loader/deconstructed_rom_directory.h"
 #include "core/loader/kip.h"
-#include "core/loader/nax.h"
-#include "core/loader/nca.h"
 #include "core/loader/nro.h"
 #include "core/loader/nso.h"
-#include "core/loader/nsp.h"
 #include "core/loader/nup.h"
-#include "core/loader/xci.h"
 
 namespace Loader {
 
@@ -45,100 +34,122 @@ std::optional<FileType> IdentifyFileLoader(FileSys::VirtualFile file) {
     return std::nullopt;
 }
 
-struct IndexedProgram {
-    FileSys::VirtualFile file;
-    u64 program_id;
-    bool update_only;
-};
-
-std::optional<IndexedProgram> ResolveIndexedProgram(Core::System& system, u64 program_id,
-                                                    std::size_t program_index) {
-    if (program_index == 0 || program_id == 0) {
-        return std::nullopt;
-    }
-
-    const auto target_id = FileSys::GetBaseTitleIDWithProgramIndex(program_id, program_index);
-    const auto& provider = system.GetContentProvider();
-
-    if (auto base = provider.GetEntryRaw(target_id, FileSys::ContentRecordType::Program)) {
-        LOG_INFO(Loader, "Program index {} resolved to {:016X}", program_index, target_id);
-        return IndexedProgram{std::move(base), target_id, false};
-    }
-
-    const auto update_id = FileSys::GetUpdateTitleID(target_id);
-    if (auto update = provider.GetEntryRaw(update_id, FileSys::ContentRecordType::Program)) {
-        LOG_INFO(Loader, "Program index {} has no base program, loading it from update {:016X}",
-                 program_index, update_id);
-        return IndexedProgram{std::move(update), target_id, true};
-    }
-
-    LOG_WARNING(Loader, "No program NCA for {:016X} (index {}), falling back to the container",
-                target_id, program_index);
-    return std::nullopt;
-}
-
-std::shared_ptr<FileSys::NSP> OpenContainerAsNsp(FileSys::VirtualFile file, FileType type,
-                                                 u64 program_id = 0,
-                                                 std::size_t program_index = 0) {
-    if (!file) {
-        return nullptr;
-    }
-
-    if (type == FileType::NSP || type == FileType::NSZ) {
-        auto nsp = std::make_shared<FileSys::NSP>(file, program_id, program_index);
-        return nsp->GetStatus() == ResultStatus::Success ? nsp : nullptr;
-    }
-
-    if (type == FileType::XCI || type == FileType::XCZ) {
-        FileSys::XCI xci{file, program_id, program_index};
-        if (xci.GetStatus() == ResultStatus::Success) {
-            auto secure_nsp = xci.GetSecurePartitionNSP();
-            if (secure_nsp != nullptr && secure_nsp->GetStatus() == ResultStatus::Success) {
-                return secure_nsp;
-            }
-        }
-
-        // PFS0-shaped .xcz (NSZ-style container) does not parse as XCI; fall back to NSP.
-        if (type == FileType::XCZ) {
-            auto nsp = std::make_shared<FileSys::NSP>(file, program_id, program_index);
-            return nsp->GetStatus() == ResultStatus::Success ? nsp : nullptr;
-        }
-
-        return nullptr;
-    }
-
-    return nullptr;
-}
-
-bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
-    if (!nsp) {
+bool IsEncryptedContent(FileType type) {
+    switch (type) {
+    case FileType::NSP:
+    case FileType::NSZ:
+    case FileType::XCI:
+    case FileType::XCZ:
+    case FileType::NCA:
+    case FileType::NAX:
+        return true;
+    default:
         return false;
     }
-
-    const auto& ncas = nsp->GetNCAs();
-    return std::any_of(ncas.cbegin(), ncas.cend(), [](const auto& title_entry) {
-        const auto& nca_map = title_entry.second;
-        return nca_map.find(
-                   {FileSys::TitleType::Application, FileSys::ContentRecordType::Program}) !=
-               nca_map.end();
-    });
 }
+
+class AppLoader_Unsupported final : public AppLoader {
+public:
+    AppLoader_Unsupported(FileSys::VirtualFile file, FileType type_)
+        : AppLoader(std::move(file)), type{type_} {}
+
+    FileType GetFileType() const override {
+        return type;
+    }
+
+    LoadResult Load(Kernel::KProcess&, Core::System&) override {
+        return {unsupported, std::nullopt};
+    }
+
+    ResultStatus VerifyIntegrity(std::function<bool(size_t, size_t)>) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadCode(std::vector<u8>&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadIcon(std::vector<u8>&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadBanner(std::vector<u8>&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadLogo(std::vector<u8>&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadProgramId(u64&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadProgramIds(std::vector<u64>&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadRomFS(FileSys::VirtualFile&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadUpdateRaw(FileSys::VirtualFile&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadTitle(std::string&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadControlData(FileSys::NACP&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadDisplayVersion(std::string&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadManualRomFS(FileSys::VirtualFile&) override {
+        return unsupported;
+    }
+
+    ResultStatus ReadNSOModules(Modules&) override {
+        return unsupported;
+    }
+
+private:
+    static constexpr auto unsupported = ResultStatus::ErrorEncryptedContentUnsupported;
+    FileType type;
+};
 
 } // namespace
 
 FileType IdentifyFile(FileSys::VirtualFile file) {
-    if (const auto nsp_type = IdentifyFileLoader<AppLoader_NSP>(file)) {
-        return *nsp_type;
-    } else if (const auto xci_type = IdentifyFileLoader<AppLoader_XCI>(file)) {
-        return *xci_type;
-    } else if (const auto nup_type = IdentifyFileLoader<AppLoader_NUP>(file)) {
+    if (!file) {
+        return FileType::Unknown;
+    }
+
+    const auto name = file->GetName();
+    const auto filename_type = GuessFromFilename(name);
+    if (IsEncryptedContent(filename_type)) {
+        return filename_type;
+    }
+
+    if (Common::FS::GetExtensionFromFilename(name).empty()) {
+        std::array<char, 4> magic{};
+        if (file->ReadObject(&magic) == magic.size() && magic == std::array{'P', 'F', 'S', '0'}) {
+            return FileType::NSP;
+        }
+        if (file->ReadObject(&magic, 0x100) == magic.size() &&
+            magic == std::array{'H', 'E', 'A', 'D'}) {
+            return FileType::XCI;
+        }
+    }
+
+    if (const auto nup_type = IdentifyFileLoader<AppLoader_NUP>(file)) {
         return *nup_type;
     } else if (const auto nro_type = IdentifyFileLoader<AppLoader_NRO>(file)) {
         return *nro_type;
-    } else if (const auto nca_type = IdentifyFileLoader<AppLoader_NCA>(file)) {
-        return *nca_type;
-    } else if (const auto nax_type = IdentifyFileLoader<AppLoader_NAX>(file)) {
-        return *nax_type;
     } else if (const auto kip_type = IdentifyFileLoader<AppLoader_KIP>(file)) {
         return *kip_type;
     } else if (const auto nso_type = IdentifyFileLoader<AppLoader_NSO>(file)) {
@@ -146,49 +157,32 @@ FileType IdentifyFile(FileSys::VirtualFile file) {
     } else if (const auto romdir_type =
                    IdentifyFileLoader<AppLoader_DeconstructedRomDirectory>(file)) {
         return *romdir_type;
-    } else {
-        return FileType::Unknown;
     }
+    return FileType::Unknown;
 }
 
-bool IsContainerType(FileType type) {
-    return type == FileType::NSP || type == FileType::NSZ || type == FileType::XCI ||
-           type == FileType::XCZ || type == FileType::NUP;
-}
-
-bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type, u64 program_id,
-                             std::size_t program_index) {
+bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type) {
     if (!file) {
         return false;
     }
-
     if (type == FileType::Unknown) {
         type = IdentifyFile(file);
     }
-
-    if (type == FileType::NUP) {
-        FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != ResultStatus::Success) {
-            return false;
-        }
-        // A base package boots normally; a standalone update (no base) carries
-        // a complete patched tree and boots on its own (SPEC section 4.1.2).
-        if (const auto base = nup.FindBasePackage();
-            base.has_value() && nup.GetExeFSDir(*base) != nullptr) {
-            return true;
-        }
-        if (const auto update = nup.FindBestUpdatePackage();
-            update.has_value() && nup.GetExeFSDir(*update) != nullptr) {
-            return true;
-        }
+    if (type != FileType::NUP) {
         return false;
     }
 
-    if (!IsContainerType(type)) {
+    FileSys::NupContainer nup{file};
+    if (nup.GetStatus() != ResultStatus::Success) {
         return false;
     }
-
-    return HasApplicationProgramContent(OpenContainerAsNsp(file, type, program_id, program_index));
+    // A standalone update (no base) carries a complete patched tree.
+    if (const auto base = nup.FindBasePackage();
+        base.has_value() && nup.GetExeFSDir(*base) != nullptr) {
+        return true;
+    }
+    const auto update = nup.FindBestUpdatePackage();
+    return update.has_value() && nup.GetExeFSDir(*update) != nullptr;
 }
 
 FileType GuessFromFilename(const std::string& name) {
@@ -203,6 +197,8 @@ FileType GuessFromFilename(const std::string& name) {
         return FileType::NRO;
     else if (extension == "nso")
         return FileType::NSO;
+    else if (extension == "nax")
+        return FileType::NAX;
     else if (extension == "nca")
         return FileType::NCA;
     else if (extension == "xci")
@@ -252,7 +248,7 @@ std::string GetFileTypeString(FileType type) {
     return "unknown";
 }
 
-constexpr std::array<const char*, 70> RESULT_MESSAGES{
+constexpr std::array<const char*, 71> RESULT_MESSAGES{
     "The operation completed successfully.",
     "The loader requested to load is already loaded.",
     "The operation is not implemented.",
@@ -323,6 +319,7 @@ constexpr std::array<const char*, 70> RESULT_MESSAGES{
     "Integrity verification failed.",
     "The NUP container is malformed or its TOC hash does not match.",
     "The NUP container does not contain a loadable base package.",
+    "Encrypted game files are not supported. Use a loose dump or a NUP file.",
 };
 
 std::string GetResultStatusString(ResultStatus status) {
@@ -346,17 +343,7 @@ ResultStatus AppLoader::ReadDisplayVersion(std::string& version) {
     return ResultStatus::Success;
 }
 
-/**
- * Get a loader for a file with a specific type
- * @param system The system context to use.
- * @param file   The file to retrieve the loader for
- * @param type   The file type
- * @param program_index Specifies the index within the container of the program to launch.
- * @return std::unique_ptr<AppLoader> a pointer to a loader object;  nullptr for unsupported type
- */
-static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::VirtualFile file,
-                                                FileType type, u64 program_id,
-                                                std::size_t program_index) {
+static std::unique_ptr<AppLoader> GetFileLoader(FileSys::VirtualFile file, FileType type) {
     switch (type) {
     // NX NSO file format.
     case FileType::NSO:
@@ -366,42 +353,13 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::V
     case FileType::NRO:
         return std::make_unique<AppLoader_NRO>(std::move(file));
 
-    // NX NCA (Nintendo Content Archive) file format.
     case FileType::NCA:
-        return std::make_unique<AppLoader_NCA>(std::move(file));
-
-    // NX XCI (nX Card Image) file format.
     case FileType::XCI:
-        return std::make_unique<AppLoader_XCI>(std::move(file), system.GetFileSystemController(),
-                                               system.GetContentProvider(), program_id,
-                                               program_index);
-
-    // NCZ-compressed XCI container. XCI-shaped .xcz goes to the XCI loader, while
-    // PFS0-shaped (NSZ-style) .xcz containers fall back to the NSP loader.
-    case FileType::XCZ: {
-        FileSys::XCI probe{file, program_id, program_index};
-        if (probe.GetStatus() == ResultStatus::Success &&
-            probe.GetSecurePartitionNSP() != nullptr) {
-            return std::make_unique<AppLoader_XCI>(std::move(file),
-                                                   system.GetFileSystemController(),
-                                                   system.GetContentProvider(), program_id,
-                                                   program_index);
-        }
-        return std::make_unique<AppLoader_NSP>(std::move(file), system.GetFileSystemController(),
-                                               system.GetContentProvider(), program_id,
-                                               program_index);
-    }
-
-    // NX NAX (NintendoAesXts) file format.
+    case FileType::XCZ:
     case FileType::NAX:
-        return std::make_unique<AppLoader_NAX>(std::move(file));
-
-    // NX NSP (Nintendo Submission Package) file format
     case FileType::NSP:
     case FileType::NSZ:
-        return std::make_unique<AppLoader_NSP>(std::move(file), system.GetFileSystemController(),
-                                               system.GetContentProvider(), program_id,
-                                               program_index);
+        return std::make_unique<AppLoader_Unsupported>(std::move(file), type);
 
     // NX KIP (Kernel Internal Process) file format
     case FileType::KIP:
@@ -420,15 +378,9 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::V
     }
 }
 
-std::unique_ptr<AppLoader> GetLoader(Core::System& system, FileSys::VirtualFile file,
-                                     u64 program_id, std::size_t program_index) {
+std::unique_ptr<AppLoader> GetLoader(Core::System&, FileSys::VirtualFile file, u64, std::size_t) {
     if (!file) {
         return nullptr;
-    }
-
-    if (const auto indexed = ResolveIndexedProgram(system, program_id, program_index)) {
-        return std::make_unique<AppLoader_NCA>(
-            indexed->file, indexed->update_only ? indexed->program_id : 0);
     }
 
     FileType type = IdentifyFile(file);
@@ -441,8 +393,7 @@ std::unique_ptr<AppLoader> GetLoader(Core::System& system, FileSys::VirtualFile 
         type = FileType::DeconstructedRomDirectory;
     }
 
-    // Special case: 00 is either a NCA or NAX.
-    if (type != filename_type && !(file->GetName() == "00" && type == FileType::NAX)) {
+    if (type != filename_type && !IsEncryptedContent(type)) {
         LOG_WARNING(Loader, "File {} has a different type ({}) than its extension.",
                     file->GetName(), GetFileTypeString(type));
         if (FileType::Unknown == type) {
@@ -452,7 +403,7 @@ std::unique_ptr<AppLoader> GetLoader(Core::System& system, FileSys::VirtualFile 
 
     LOG_DEBUG(Loader, "Loading file {} as {}...", file->GetName(), GetFileTypeString(type));
 
-    return GetFileLoader(system, std::move(file), type, program_id, program_index);
+    return GetFileLoader(std::move(file), type);
 }
 
 } // namespace Loader

@@ -56,8 +56,6 @@ add_library(core STATIC
     device_memory_manager.inc
     file_sys/bis_factory.cpp
     file_sys/bis_factory.h
-    file_sys/card_image.cpp
-    file_sys/card_image.h
     file_sys/common_funcs.h
     file_sys/content_archive.cpp
     file_sys/content_archive.h
@@ -150,8 +148,6 @@ add_library(core STATIC
     file_sys/savedata_factory.h
     file_sys/sdmc_factory.cpp
     file_sys/sdmc_factory.h
-    file_sys/submission_package.cpp
-    file_sys/submission_package.h
     file_sys/system_archive/data/font_chinese_simplified.cpp
     file_sys/system_archive/data/font_chinese_simplified.h
     file_sys/system_archive/data/font_chinese_traditional.cpp
@@ -192,8 +188,6 @@ add_library(core STATIC
     file_sys/vfs/vfs_types.h
     file_sys/vfs/vfs_vector.cpp
     file_sys/vfs/vfs_vector.h
-    file_sys/xts_archive.cpp
-    file_sys/xts_archive.h
     frontend/applets/cabinet.cpp
     frontend/applets/cabinet.h
     frontend/applets/controller.cpp
@@ -1168,20 +1162,12 @@ add_library(core STATIC
     loader/kip.h
     loader/loader.cpp
     loader/loader.h
-    loader/nax.cpp
-    loader/nax.h
-    loader/nca.cpp
-    loader/nca.h
     loader/nro.cpp
     loader/nro.h
     loader/nso.cpp
     loader/nso.h
-    loader/nsp.cpp
-    loader/nsp.h
     loader/nup.cpp
     loader/nup.h
-    loader/xci.cpp
-    loader/xci.h
     memory.cpp
     memory.h
     memory/cheat_engine.cpp

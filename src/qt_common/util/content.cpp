@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "core/file_sys/card_image.h"
 #include "qt_common/util/content.h"
 #include "qt_common/util/game.h"
 
 #include "common/fs/fs.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/nca_metadata.h"
-#include "core/file_sys/submission_package.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/loader/nup.h"
 #include "frontend_common/data_manager.h"
@@ -285,17 +283,6 @@ void configureFilesystemProvider(const std::string& filepath) {
         QtCommon::provider->AddEntry(FileSys::TitleType::Application,
                                      FileSys::GetCRTypeFromNCAType(FileSys::NCA{file}.GetType()),
                                      program_id, file);
-    } else if (res2 == Loader::ResultStatus::Success &&
-               (file_type == Loader::FileType::XCI || file_type == Loader::FileType::NSP)) {
-        const auto nsp = file_type == Loader::FileType::NSP
-                             ? std::make_shared<FileSys::NSP>(file)
-                             : FileSys::XCI{file}.GetSecurePartitionNSP();
-        for (const auto& title : nsp->GetNCAs()) {
-            for (const auto& entry : title.second) {
-                QtCommon::provider->AddEntry(entry.first.first, entry.first.second, title.first,
-                                             entry.second->GetBaseFile());
-            }
-        }
     }
 }
 

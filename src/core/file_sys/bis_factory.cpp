@@ -3,6 +3,8 @@
 
 #include <fmt/ranges.h>
 #include "common/fs/path_util.h"
+#include "core/crypto/key_manager.h"
+#include "core/crypto/partition_data_manager.h"
 #include "core/file_sys/bis_factory.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs.h"
