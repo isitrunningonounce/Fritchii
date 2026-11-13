@@ -607,15 +607,6 @@ object NativeLibrary {
     external fun removeMod(programId: String, name: String)
 
     /**
-     * Verifies all installed content
-     * @param callback UI callback for verification progress. Return true in the callback to cancel.
-     * @return Array of content that failed verification. Successful if empty.
-     */
-    external fun verifyInstalledContents(
-        callback: (max: Long, progress: Long) -> Boolean
-    ): Array<String>
-
-    /**
      * Verifies the contents of a game
      * @param path String path to a game
      * @param callback UI callback for verification progress. Return true in the callback to cancel.

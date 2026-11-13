@@ -6,7 +6,8 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/file_sys/savedata_factory.h"
-#include "core/hle/service/am/am_types.h"
+#include "core/file_sys/patch_manager.h"
+#include "core/loader/loader.h"
 #include "frontend_common/content_manager.h"
 #include "qt_common/abstract/frontend.h"
 #include "qt_common/config/uisettings.h"
@@ -513,29 +514,6 @@ std::string GetShortcutPath(ShortcutTarget target) {
 
         return shortcut_path;
     }
-}
-
-void CreateHomeMenuShortcut(ShortcutTarget target) {
-    constexpr u64 QLaunchId = static_cast<u64>(Service::AM::AppletProgramId::QLaunch);
-    auto bis_system = QtCommon::system->GetFileSystemController().GetSystemNANDContents();
-    if (!bis_system) {
-        QtCommon::Frontend::Warning(tr("No firmware available"),
-                                    tr("Please install firmware to use the home menu."));
-        return;
-    }
-
-    auto qlaunch_nca = bis_system->GetEntry(QLaunchId, FileSys::ContentRecordType::Program);
-    if (!qlaunch_nca) {
-        QtCommon::Frontend::Warning(tr("Home Menu Applet"),
-                                    tr("Home Menu is not available. Please reinstall firmware."));
-        return;
-    }
-
-    auto qlaunch_applet_nca = bis_system->GetEntry(QLaunchId, FileSys::ContentRecordType::Program);
-    const auto game_path = qlaunch_applet_nca->GetFullPath();
-
-    // TODO(crueter): Make this use the Eden icon
-    CreateShortcut(game_path, QLaunchId, "Switch Home Menu", target, "-qlaunch", false);
 }
 
 bool SaveIconToFile(const std::filesystem::path& icon_path, const QImage& image) {

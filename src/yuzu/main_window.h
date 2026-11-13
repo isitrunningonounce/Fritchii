@@ -23,7 +23,6 @@
 #include "common/common_types.h"
 #include "common/settings_enums.h"
 #include "core/file_sys/nup_writer.h"
-#include "frontend_common/content_manager.h"
 #include "input_common/drivers/tas_input.h"
 #include "qt_common/config/qt_config.h"
 #include "qt_common/qt_common.h"
@@ -66,7 +65,6 @@ class PerformanceOverlay;
 class ConfigurePostProcessing;
 #endif
 enum class GameListOpenTarget;
-enum class DumpRomFSTarget;
 class GameListPlaceholder;
 namespace FritchiiUi {
 class Home;
@@ -128,10 +126,6 @@ enum class WebExitReason : u32;
 namespace Service::NFC {
 class NfcDevice;
 } // namespace Service::NFC
-
-namespace Service::NFP {
-enum class CabinetMode : u8;
-} // namespace Service::NFP
 
 namespace Ui {
 class MainWindow;
@@ -203,7 +197,6 @@ signals:
     // Signal that tells widgets to update icons to use the current theme
     void UpdateThemedIcons();
 
-    void UpdateInstallProgress();
 
     void AmiiboSettingsFinished(bool is_success, const std::string& name);
 
@@ -337,8 +330,6 @@ private:
     void SetGamemodeEnabled(bool state);
 
     Service::AM::FrontendAppletParameters ApplicationAppletParameters();
-    Service::AM::FrontendAppletParameters LibraryAppletParameters(u64 program_id,
-                                                                  Service::AM::AppletId applet_id);
 
 private slots:
     void OnStartGame();
@@ -360,7 +351,6 @@ private slots:
                               const std::string& game_path);
     void OnGameListRemovePlayTimeData(u64 program_id);
     void OnGameListSetPlayTime(u64 program_id);
-    void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void OnGameListVerifyIntegrity(const std::string& game_path);
     void OnGameListConvertToNup(const std::string& game_path);
     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
@@ -378,8 +368,6 @@ private slots:
     void OnLinkToRyujinx(const u64& program_id);
     void OnMenuLoadFile();
     void OnMenuLoadFolder();
-    void IncrementInstallProgress();
-    void OnMenuInstallToNAND();
     void OnMenuRecentFile();
     void OnConfigure();
     /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
@@ -411,10 +399,6 @@ private slots:
     void ShowErrorWithExportLog(const QString& title, const QString& text);
     /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in Lichii builds.
     void SetUpFritchiiUi();
-    void OnVerifyInstalledContents();
-    void OnInstallFirmware();
-    void OnInstallFirmwareFromZIP();
-    void OnInstallDecryptionKeys();
     void OnAbout();
     void OnEdenDependencies();
     void OnDataDialog();
@@ -444,12 +428,7 @@ private slots:
     void CheckIconSize();
     void ToggleShowGameName();
 
-    void LaunchFirmwareApplet(u64 program_id, std::optional<Service::NFP::CabinetMode> mode);
-    void OnCreateHomeMenuDesktopShortcut();
-    void OnCreateHomeMenuApplicationMenuShortcut();
     void OnCaptureScreenshot();
-    /// Checks for decryption keys; `prompt` asks to install them when they are missing.
-    void OnCheckFirmwareDecryption(bool prompt = true);
 #ifdef __unix__
     void OnCheckGraphicsBackend();
 #endif
@@ -471,9 +450,6 @@ private slots:
 
 private:
     void RemovePlayTimeData(u64 program_id);
-    bool SelectRomFSDumpTarget(const FileSys::ContentProvider&, u64 program_id,
-                               u64* selected_title_id, u8* selected_content_record_type);
-    ContentManager::InstallResult InstallNCA(const QString& filename);
     void UpdateWindowTitle(std::string_view title_name = {}, std::string_view title_version = {},
                            std::string_view gpu_vendor = {});
     void OnApplicationChanged(u64 program_id);
@@ -630,8 +606,6 @@ private:
 
     QTranslator translator;
 
-    // Install progress dialog
-    QProgressDialog* install_progress = nullptr;
     NupProgressDialog* nup_progress = nullptr;
     QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
     std::shared_ptr<std::atomic_bool> nup_cancel;

@@ -56,15 +56,12 @@ extern "C" {
 #include "core/constants.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
-#include "core/crypto/key_manager.h"
-#include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/romfs.h"
-#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/applets/cabinet.h"
@@ -82,6 +79,7 @@ extern "C" {
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/set/system_settings_server.h"
 #include "core/loader/loader.h"
+#include "core/loader/nup.h"
 #include "frontend_common/config.h"
 #include "frontend_common/firmware_manager.h"
 #ifdef ENABLE_UPDATE_CHECKER
@@ -767,43 +765,13 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_setAppDirectory(JNIEnv* env, jobject 
     Common::FS::SetAppDirectory(Common::Android::GetJString(env, j_directory));
 }
 
-int Java_org_yuzu_yuzu_1emu_NativeLibrary_installFileToNand(JNIEnv* env, jobject instance,
-                                                            jstring j_file, jobject jcallback) {
-    auto jlambdaClass = env->GetObjectClass(jcallback);
-    auto jlambdaInvokeMethod = env->GetMethodID(
-        jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
-                                                   Common::Android::ToJDouble(env, max),
-                                                   Common::Android::ToJDouble(env, progress));
-        return Common::Android::GetJBoolean(env, jwasCancelled);
-    };
-
-    return static_cast<int>(
-        ContentManager::InstallNSP(EmulationSession::GetInstance().System(),
-                                   *EmulationSession::GetInstance().System().GetFilesystem(),
-                                   Common::Android::GetJString(env, j_file), callback));
+int Java_org_yuzu_yuzu_1emu_NativeLibrary_installFileToNand(JNIEnv*, jobject, jstring, jobject) {
+    return 2;
 }
 
-jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_doesUpdateMatchProgram(JNIEnv* env, jobject jobj,
-                                                                      jstring jprogramId,
-                                                                      jstring jupdatePath) {
-    const u64 program_id = FileSys::GetBaseTitleID(EmulationSession::GetProgramId(env, jprogramId));
-    std::string updatePath = Common::Android::GetJString(env, jupdatePath);
-    std::shared_ptr<FileSys::NSP> nsp = std::make_shared<FileSys::NSP>(
-        EmulationSession::GetInstance().System().GetFilesystem()->OpenFile(
-            updatePath, FileSys::OpenMode::Read));
-    for (const auto& item : nsp->GetNCAs()) {
-        for (const auto& nca_details : item.second) {
-            if (nca_details.second->GetName().ends_with(".cnmt.nca")) {
-                const auto update_id = FileSys::GetBaseTitleID(nca_details.second->GetTitleId());
-                if (update_id == program_id) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
+jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_doesUpdateMatchProgram(JNIEnv*, jobject, jstring,
+                                                                    jstring) {
+    return JNI_FALSE;
 }
 
 void JNICALL Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeGpuDriver(JNIEnv* env,
@@ -921,9 +889,8 @@ jstring Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getGpuModel(JNIEnv *env, j
 #endif
 }
 
-jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_reloadKeys(JNIEnv* env, jclass clazz) {
-    Core::Crypto::KeyManager::Instance().ReloadKeys();
-    return static_cast<jboolean>(Core::Crypto::KeyManager::Instance().AreKeysLoaded());
+jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_reloadKeys(JNIEnv*, jclass) {
+    return JNI_FALSE;
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_unpauseEmulation(JNIEnv* env, jclass clazz) {
@@ -1500,11 +1467,8 @@ jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_gameRequiresFirmware(JNIEnv* env,
     return FirmwareManager::GameRequiresFirmware(program_id);
 }
 
-jint Java_org_yuzu_yuzu_1emu_NativeLibrary_installKeys(JNIEnv* env, jclass clazz, jstring jpath, jstring jext) {
-    const auto path = Common::Android::GetJString(env, jpath);
-    const auto ext = Common::Android::GetJString(env, jext);
-
-    return static_cast<int>(FirmwareManager::InstallKeys(path, ext));
+jint Java_org_yuzu_yuzu_1emu_NativeLibrary_installKeys(JNIEnv*, jclass, jstring, jstring) {
+    return 4; // ErrorFailedInit in installKeysResults.
 }
 
 jstring Java_org_yuzu_yuzu_1emu_NativeLibrary_getLosslessDllPath(JNIEnv* env, jclass clazz) {
@@ -1597,44 +1561,39 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_removeMod(JNIEnv* env, jobject jobj, 
                               program_id, Common::Android::GetJString(env, jname));
 }
 
-jobjectArray Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyInstalledContents(JNIEnv* env,
-                                                                           jobject jobj,
-                                                                           jobject jcallback) {
-    auto jlambdaClass = env->GetObjectClass(jcallback);
-    auto jlambdaInvokeMethod = env->GetMethodID(
-        jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
-                                                   Common::Android::ToJDouble(env, max),
-                                                   Common::Android::ToJDouble(env, progress));
-        return Common::Android::GetJBoolean(env, jwasCancelled);
-    };
-
-    auto& session = EmulationSession::GetInstance();
-    std::vector<std::string> result = ContentManager::VerifyInstalledContents(
-        session.System(), *session.GetContentProvider(), callback);
-    jobjectArray jresult = env->NewObjectArray(result.size(), Common::Android::GetStringClass(),
-                                               Common::Android::ToJString(env, ""));
-    for (size_t i = 0; i < result.size(); ++i) {
-        env->SetObjectArrayElement(jresult, i, Common::Android::ToJString(env, result[i]));
-    }
-    return jresult;
-}
-
-jint Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyGameContents(JNIEnv* env, jobject jobj,
+jint Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyGameContents(JNIEnv* env, jobject,
                                                               jstring jpath, jobject jcallback) {
-    auto jlambdaClass = env->GetObjectClass(jcallback);
-    auto jlambdaInvokeMethod = env->GetMethodID(
-        jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
-                                                   Common::Android::ToJDouble(env, max),
-                                                   Common::Android::ToJDouble(env, progress));
-        return Common::Android::GetJBoolean(env, jwasCancelled);
-    };
-    auto& session = EmulationSession::GetInstance();
-    return static_cast<jint>(ContentManager::VerifyGameContents(
-        session.System(), Common::Android::GetJString(env, jpath), callback));
+    using ContentManager::GameVerificationResult;
+    auto& system = EmulationSession::GetInstance().System();
+    const auto file = system.GetFilesystem()->OpenFile(Common::Android::GetJString(env, jpath),
+                                                       FileSys::OpenMode::Read);
+    if (!FileSys::NupContainer::IsNupFile(file)) {
+        return static_cast<jint>(GameVerificationResult::NotImplemented);
+    }
+
+    const auto long_class = env->FindClass("java/lang/Long");
+    const auto long_constructor = env->GetMethodID(long_class, "<init>", "(J)V");
+    const auto callback_class = env->GetObjectClass(jcallback);
+    const auto invoke = env->GetMethodID(
+        callback_class, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    bool cancelled = false;
+    Loader::AppLoader_NUP loader{file};
+    const auto result = loader.VerifyIntegrity([&](size_t processed, size_t total) {
+        const auto max = env->NewObject(long_class, long_constructor, static_cast<jlong>(total));
+        const auto done = env->NewObject(long_class, long_constructor, static_cast<jlong>(processed));
+        const auto value = env->CallObjectMethod(jcallback, invoke, max, done);
+        cancelled = env->ExceptionCheck() || Common::Android::GetJBoolean(env, value);
+        env->DeleteLocalRef(value);
+        env->DeleteLocalRef(done);
+        env->DeleteLocalRef(max);
+        return !cancelled;
+    });
+    if (cancelled) {
+        return static_cast<jint>(GameVerificationResult::NotImplemented);
+    }
+    return static_cast<jint>(result == Loader::ResultStatus::Success
+                                 ? GameVerificationResult::Success
+                                 : GameVerificationResult::Failed);
 }
 
 jstring Java_org_yuzu_yuzu_1emu_NativeLibrary_getSavePath(JNIEnv* env, jobject jobj,
@@ -1690,10 +1649,8 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_clearFilesystemProvider(JNIEnv* env, 
     EmulationSession::GetInstance().GetContentProvider()->ClearAllEntries();
 }
 
-jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_areKeysPresent(JNIEnv* env, jobject jobj) {
-    auto& system = EmulationSession::GetInstance().System();
-    system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
-    return ContentManager::AreKeysPresent();
+jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_areKeysPresent(JNIEnv*, jobject) {
+    return JNI_FALSE;
 }
 
 jint Java_org_yuzu_yuzu_1emu_NativeLibrary_getVirtualAmiiboState(JNIEnv* env, jobject jobj) {

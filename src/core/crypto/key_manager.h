@@ -314,7 +314,6 @@ private:
     std::array<u8, 576> eticket_extended_kek{};
     RSAKeyPair<2048> eticket_rsa_keypair{};
 
-    bool dev_mode;
     void LoadFromFile(const std::filesystem::path& file_path, bool is_title_keys);
 
     template <size_t Size>

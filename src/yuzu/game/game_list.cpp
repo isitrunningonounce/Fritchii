@@ -497,10 +497,11 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         extract_nup = context_menu.addAction(tr("Dump NUP..."));
         extract_nup->setEnabled(!nup_conversion_running);
     }
-    QMenu* dump_romfs_menu = context_menu.addMenu(tr("Dump RomFS"));
-    QAction* dump_romfs = dump_romfs_menu->addAction(tr("Dump RomFS"));
-    QAction* dump_romfs_sdmc = dump_romfs_menu->addAction(tr("Dump RomFS to SDMC"));
-    QAction* verify_integrity = context_menu.addAction(tr("Verify Integrity"));
+    if (is_nup_archive) {
+        auto* verify_integrity = context_menu.addAction(tr("Verify Integrity"));
+        connect(verify_integrity, &QAction::triggered, this,
+                [this, path]() { emit VerifyIntegrityRequested(path); });
+    }
     QAction* copy_tid = context_menu.addAction(tr("Copy Title ID to Clipboard"));
     QAction* convert_nup = nullptr;
     if (FileSys::Nup::DumpRootFromMain(path)) {
@@ -589,14 +590,6 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         emit RemoveFileRequested(program_id, QtCommon::Game::GameListRemoveTarget::CacheStorage,
                                  path);
     });
-    connect(dump_romfs, &QAction::triggered, this, [this, program_id, path]() {
-        emit DumpRomFSRequested(program_id, path, DumpRomFSTarget::Normal);
-    });
-    connect(dump_romfs_sdmc, &QAction::triggered, this, [this, program_id, path]() {
-        emit DumpRomFSRequested(program_id, path, DumpRomFSTarget::SDMC);
-    });
-    connect(verify_integrity, &QAction::triggered, this,
-            [this, path]() { emit VerifyIntegrityRequested(path); });
     connect(copy_tid, &QAction::triggered, this,
             [this, program_id]() { emit CopyTIDRequested(program_id); });
     if (convert_nup) {

@@ -40,7 +40,6 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
-#include "core/crypto/key_manager.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
