@@ -11,12 +11,14 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "common/common_types.h"
 
 namespace Core::BananzaNvn2Trace {
 
 bool CountEnabled();
+bool HleEnabled();
 
 struct SdkLayout {
     std::array<u8, 32> build_id;
@@ -25,6 +27,9 @@ struct SdkLayout {
     size_t targets;
     size_t text_end;
     size_t entry_count;
+    size_t bootstrap;
+    size_t internal_bootstrap;
+    size_t callback_return{};
 };
 
 const SdkLayout* FindSdk(const std::array<u8, 32>& build_id);
@@ -35,6 +40,8 @@ public:
                                            u64 base);
 
     std::optional<size_t> Find(u64 address) const;
+    std::string_view Name(size_t index) const;
+    u64 Resolve(std::string_view name) const;
     void Count(size_t index, u64 thread, u64 arg1);
     void Present();
     void Finish();

@@ -1822,7 +1822,8 @@ private:
         }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (const auto* process = ctx.GetThread().GetOwnerProcess()) {
-            if (auto* trace = process->GetBananzaNvn2Trace()) {
+            if (auto* trace = process->GetBananzaNvn2Trace();
+                trace && Core::BananzaNvn2Trace::CountEnabled()) {
                 trace->Present();
             }
         }

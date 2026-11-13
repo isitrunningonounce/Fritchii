@@ -8,6 +8,13 @@ add_library(core STATIC
     arm/arm_interface.cpp
     arm/bananza_nvn2_commands.cpp
     arm/bananza_nvn2_commands.h
+    arm/bananza_nvn2_device.h
+    arm/bananza_nvn2_hle.cpp
+    arm/bananza_nvn2_hle.h
+    arm/bananza_nvn2_resources.cpp
+    arm/bananza_nvn2_resources.h
+    arm/bananza_nvn2_texture.cpp
+    arm/bananza_nvn2_texture.h
     arm/bananza_nvn2_trace.cpp
     arm/bananza_nvn2_trace.h
     arm/arm_interface.h

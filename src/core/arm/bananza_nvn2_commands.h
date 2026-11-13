@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "core/arm/bananza_nvn2_resources.h"
 
 namespace Core::BananzaNvn2Commands {
 
@@ -19,6 +20,8 @@ struct Operation {
     u32 id{};
     std::vector<u64> args;
     std::vector<u8> payload;
+    std::vector<BananzaNvn2Hle::ResourceTextureInfo> textures;
+    std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program;
     // A nested recording owns its snapshot even after the original handle is retired.
     std::shared_ptr<const Recording> nested;
 };
@@ -61,9 +64,12 @@ public:
 
     // Memory charges come from the caller's ABI model, not the host record representation.
     bool Record(u64 command_buffer, u32 op, std::span<const u64> args = {},
-                std::span<const u8> payload = {}, u64 command_bytes = 0);
+                std::span<const u8> payload = {}, u64 command_bytes = 0,
+                std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures = {},
+                std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program = {});
     bool AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes = 0);
-    std::optional<u64> End(u64 command_buffer, u64 control_bytes);
+    std::optional<u64> End(u64 command_buffer, u64 control_bytes, u64 guest_handle_offset = 0);
+    bool FinalizeHandle(u64 handle);
     std::optional<State> GetState(u64 command_buffer) const;
 
     // Validates the entire batch and retains its snapshots; it does not execute or complete GPU work.

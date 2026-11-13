@@ -87,8 +87,11 @@ bool Recorder::Begin(u64 command_buffer) {
 }
 
 bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
-                      std::span<const u8> payload, u64 command_bytes) {
-    if (args.size() > MaxPayloadBytes / sizeof(u64) || payload.size() > MaxPayloadBytes) {
+                      std::span<const u8> payload, u64 command_bytes,
+                      std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures,
+                      std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program) {
+    if (args.size() > MaxPayloadBytes / sizeof(u64) || payload.size() > MaxPayloadBytes ||
+        textures.size() > 9) {
         return false;
     }
     std::scoped_lock lock{mutex};
@@ -108,6 +111,8 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
     operation.id = op;
     operation.args.assign(args.begin(), args.end());
     operation.payload.assign(payload.begin(), payload.end());
+    operation.textures.assign(textures.begin(), textures.end());
+    operation.program = std::move(program);
     buffer.operations.push_back(std::move(operation));
     ++buffer.command_count;
     buffer.payload_bytes += payload.size();
@@ -155,7 +160,7 @@ bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u
     return true;
 }
 
-std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes) {
+std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes, u64 guest_handle_offset) {
     std::scoped_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     if (it == buffers.end() || !it->second.state.recording || control_bytes == 0 || next_handle == 0) {
@@ -167,13 +172,22 @@ std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes) {
         return std::nullopt;
     }
     const u64 begin = state.control_base + state.control_used;
+    if (guest_handle_offset >= control_bytes) {
+        return std::nullopt;
+    }
+    const u64 handle = guest_handle_offset ? begin + guest_handle_offset : next_handle;
+    if (live_handles.contains(handle)) {
+        return std::nullopt;
+    }
     auto snapshot = std::make_shared<Recording>();
     snapshot->operations = std::move(buffer.operations);
     snapshot->command_count = buffer.command_count;
     snapshot->payload_bytes = buffer.payload_bytes;
     snapshot->nesting_depth = buffer.nesting_depth;
-    const u64 handle = next_handle++;
     live_handles.emplace(handle, Handle{std::move(snapshot), begin, begin + control_bytes});
+    if (!guest_handle_offset) {
+        ++next_handle;
+    }
     state.control_used += control_bytes;
     state.recording = false;
     return handle;
@@ -183,6 +197,11 @@ std::optional<State> Recorder::GetState(u64 command_buffer) const {
     std::scoped_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     return it != buffers.end() ? std::optional{it->second.state} : std::nullopt;
+}
+
+bool Recorder::FinalizeHandle(u64 handle) {
+    std::scoped_lock lock{mutex};
+    return live_handles.erase(handle) != 0;
 }
 
 std::optional<Submission> Recorder::Submit(u64 queue, std::span<const u64> handles) {

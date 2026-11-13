@@ -23,6 +23,7 @@
 #include "common/zbic_compression.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_trace.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/lichii_hooks.h"
@@ -57,40 +58,57 @@ constexpr u32 PageAlignSize(u32 size) {
     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
 }
 
-void SetUpBananzaNvn2Trace(Kernel::KProcess& process, const NSOHeader& header,
-                          std::span<const u8> image, VAddr base) {
+void SetUpBananzaNvn2(Kernel::KProcess& process, const NSOHeader& header,
+                      std::span<const u8> image, VAddr base, bool debugger_enabled) {
     const char* value = std::getenv("EDEN_NX2_NVN_HLE");
     if (!value || process.GetProgramId() != Settings::DonkeyKongBananzaProgramId) {
         return;
     }
-    const std::string_view mode{value};
-    if (mode == "1") {
-        LOG_WARNING(Loader, "NVN 2 HLE replay is unavailable. Using the guest SDK.");
-        return;
-    }
-    if (!Core::BananzaNvn2Trace::CountEnabled()) {
+    const bool hle = Core::BananzaNvn2Trace::HleEnabled();
+    if (!hle && !Core::BananzaNvn2Trace::CountEnabled()) {
         return;
     }
 #if defined(_M_X64) || defined(__x86_64__)
     const auto* layout = Core::BananzaNvn2Trace::FindSdk(header.build_id);
     if (!layout) {
-        LOG_WARNING(Loader, "NVN 2 count: unsupported SDK build {}. Using the guest SDK.",
+        LOG_WARNING(Loader, "Bananza NVN 2: unsupported SDK build {}. Using the guest SDK.",
                     Common::HexToString(header.build_id));
+        return;
+    }
+    if (hle && (!layout->callback_return || debugger_enabled)) {
+        LOG_WARNING(Loader, "Bananza NVN 2 HLE requires the update SDK and gdbstub off.");
         return;
     }
     auto trace = Core::BananzaNvn2Trace::Session::Create(*layout, image, base);
     if (!trace) {
-        LOG_WARNING(Loader, "NVN 2 count: could not read the SDK procedure table.");
+        LOG_WARNING(Loader, "Bananza NVN 2: could not read the SDK procedure table.");
+        return;
+    }
+    if (hle && (!trace->Resolve("nvnDeviceGetProcAddress") ||
+                !trace->Resolve("nvnDeviceGetInteger") || !trace->Resolve("nvnDeviceInitialize") ||
+                layout->callback_return + sizeof(u32) > image.size() ||
+                std::ranges::any_of(image.subspan(layout->callback_return, sizeof(u32)),
+                                    [](u8 byte) { return byte != 0; }))) {
+        LOG_WARNING(Loader, "Bananza NVN 2 HLE: incomplete bootstrap table. Using the guest SDK.");
         return;
     }
     process.SetBananzaNvn2Trace(std::move(trace));
-    LOG_INFO(Loader, "NVN 2 count: instrumenting {} Bananza SDK procedures at {:#x}",
-             layout->entry_count, base);
+    if (hle) {
+        process.SetBananzaNvn2Hle(std::make_unique<Core::BananzaNvn2Hle::Session>(
+            base + layout->bootstrap, base + layout->internal_bootstrap,
+            base + layout->callback_return));
+        LOG_INFO(Loader, "Bananza NVN 2 HLE: installed {} SDK procedures at {:#x}",
+                 layout->entry_count, base);
+    } else {
+        LOG_INFO(Loader, "NVN 2 count: instrumenting {} Bananza SDK procedures at {:#x}",
+                 layout->entry_count, base);
+    }
 #else
     (void)header;
     (void)image;
     (void)base;
-    LOG_WARNING(Loader, "NVN 2 count requires the x64 Dynarmic backend.");
+    (void)debugger_enabled;
+    LOG_WARNING(Loader, "Bananza NVN 2 instrumentation requires the x64 Dynarmic backend.");
 #endif
 }
 } // Anonymous namespace
@@ -370,9 +388,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Load codeset for current process
     if (name == "sdk") {
-        SetUpBananzaNvn2Trace(process, nso_header,
-                             std::span<const u8>{codeset.memory}.subspan(module_start),
-                             load_base + module_start);
+        SetUpBananzaNvn2(process, nso_header,
+                        std::span<const u8>{codeset.memory}.subspan(module_start),
+                        load_base + module_start, system.DebuggerEnabled());
         const bool matching_sdk =
             Core::WindowTrace::Enabled() && process.GetProgramId() == Core::WindowTrace::ProgramId &&
             Common::HexToString(std::span{nso_header.build_id}.first(20)) ==

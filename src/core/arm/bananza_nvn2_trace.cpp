@@ -26,6 +26,8 @@ constexpr std::array SupportedSdks{
         .targets = 0xD95168,
         .text_end = 0x776A70,
         .entry_count = 698,
+        .bootstrap = 0x6129C0,
+        .internal_bootstrap = 0x612A30,
     },
     SdkLayout{
         .build_id = {0x18, 0x26, 0x5D, 0xAE, 0xA2, 0x10, 0x5B, 0x31, 0xF2, 0x53,
@@ -35,6 +37,9 @@ constexpr std::array SupportedSdks{
         .targets = 0xE056E0,
         .text_end = 0x7B65A0,
         .entry_count = 726,
+        .bootstrap = 0x632C60,
+        .internal_bootstrap = 0x632CC0,
+        .callback_return = 0x632CCC,
     },
 };
 
@@ -44,6 +49,14 @@ bool CountEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_NVN_HLE");
         return value && std::string_view{value} == "count";
+    }();
+    return enabled;
+}
+
+bool HleEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_HLE");
+        return value && std::string_view{value} == "1";
     }();
     return enabled;
 }
@@ -123,6 +136,17 @@ std::optional<size_t> Session::Find(u64 address) const {
         return std::nullopt;
     }
     return static_cast<size_t>(it - active_entries.begin());
+}
+
+std::string_view Session::Name(size_t index) const {
+    return entries[index].name;
+}
+
+u64 Session::Resolve(std::string_view name) const {
+    const auto active_entries = std::span{entries}.first(entry_count);
+    const auto it = std::ranges::find_if(active_entries,
+                                         [&](const Entry& entry) { return entry.name == name; });
+    return it == active_entries.end() ? 0 : it->address;
 }
 
 void Session::Count(size_t index, u64 thread, u64 arg1) {

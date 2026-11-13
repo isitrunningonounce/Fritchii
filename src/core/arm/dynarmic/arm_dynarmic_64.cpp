@@ -18,6 +18,7 @@
 #include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_trace.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -97,6 +98,16 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    if (const auto* hle = m_process->GetBananzaNvn2Hle()) {
+        const auto& procs = *m_process->GetBananzaNvn2Trace();
+        if (hle->IsBootstrap(vaddr) || hle->IsCallbackReturn(vaddr)) {
+            return LichiiHooks::Brk;
+        }
+        if (const auto index = procs.Find(vaddr);
+            index && !hle->UseGuestStateHelper(procs.Name(*index))) {
+            return LichiiHooks::Brk;
+        }
+    }
     if (instruction == LichiiHooks::Pacibsp) {
         if (ZstdHle::IsHookedEntry(vaddr, m_process->GetProgramId(), m_memory) ||
             ZstdHle::IsHookedStreamEntry(vaddr, m_process->GetProgramId(), m_memory)) {
@@ -177,6 +188,54 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (auto* hle = m_process->GetBananzaNvn2Hle();
+        hle && exception == Dynarmic::A64::Exception::Breakpoint) {
+        auto& jit = *m_parent.m_jit;
+        const auto& procs = *m_process->GetBananzaNvn2Trace();
+        const auto return_to_guest = [&](size_t index, const BananzaNvn2Hle::GuestCall& call,
+                                         u64 link) {
+            const u64 result = hle->Dispatch(procs, m_memory, index, call);
+            if (hle->IsFloatReturn(procs.Name(index))) {
+                jit.SetVector(0, {result, 0});
+            } else {
+                jit.SetRegister(0, result);
+            }
+            jit.SetRegister(30, link);
+            jit.SetPC(link);
+        };
+        if (hle->IsBootstrap(pc)) {
+            const u64 name = jit.GetRegister(0);
+            jit.SetRegister(0, name ? procs.Resolve(m_memory.ReadCString(name, 96)) : 0);
+            jit.SetPC(jit.GetRegister(30));
+            return;
+        }
+        if (hle->IsCallbackReturn(pc)) {
+            if (const auto continuation = hle->EndCallback(m_nvn2_thread_id)) {
+                return_to_guest(continuation->procedure, continuation->call, continuation->link);
+                return;
+            }
+        }
+        if (const auto index = procs.Find(pc);
+            index && !hle->UseGuestStateHelper(procs.Name(*index))) {
+            BananzaNvn2Hle::GuestCall call{};
+            for (size_t i = 0; i < call.x.size(); ++i) {
+                call.x[i] = jit.GetRegister(i);
+                call.v[i] = jit.GetVector(i)[0];
+            }
+            const u64 link = jit.GetRegister(30);
+            if (const auto callback =
+                    hle->BeginCallback(m_nvn2_thread_id, *index, procs.Name(*index), call, link)) {
+                for (size_t i = 0; i < callback->args.size(); ++i) {
+                    jit.SetRegister(i, callback->args[i]);
+                }
+                jit.SetRegister(30, hle->CallbackReturn());
+                jit.SetPC(callback->address);
+            } else {
+                return_to_guest(*index, call, link);
+            }
+            return;
+        }
+    }
     if (exception == Dynarmic::A64::Exception::Breakpoint &&
         ZstdHle::GetMode() != ZstdHle::Mode::Off && pc == ZstdHle::Target()) {
         // LICHII_ZSTD_HLE: decoded on the host and back to the caller, or on into the guest
