@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <vector>
+
+#include "common/common_types.h"
+
+namespace Core::BananzaNvn2Commands {
+
+struct Recording;
+
+struct Operation {
+    u32 id{};
+    std::vector<u64> args;
+    std::vector<u8> payload;
+    // A nested recording owns its snapshot even after the original handle is retired.
+    std::shared_ptr<const Recording> nested;
+};
+
+struct Recording {
+    std::vector<Operation> operations;
+    u64 command_count{};
+    u64 payload_bytes{};
+    u32 nesting_depth{1};
+};
+
+struct State {
+    bool recording{};
+    u64 command_size{};
+    u64 command_used{};
+    u64 control_base{};
+    u64 control_size{};
+    u64 control_used{};
+};
+
+struct Submission {
+    static constexpr bool ExecutesGpuWork = false;
+
+    u64 sequence{};
+    u64 queue{};
+    std::vector<u64> handles;
+    std::vector<std::shared_ptr<const Recording>> recordings;
+    u64 command_count{};
+    u64 payload_bytes{};
+};
+
+// One instance belongs to one guest process. Guest pointers are opaque addresses, never host pointers.
+class Recorder {
+public:
+    bool Initialize(u64 command_buffer);
+    bool Finalize(u64 command_buffer);
+    bool SetCommandMemory(u64 command_buffer, u64 size);
+    bool SetControlMemory(u64 command_buffer, u64 guest_base, u64 size);
+    bool Begin(u64 command_buffer);
+
+    // Memory charges come from the caller's ABI model, not the host record representation.
+    bool Record(u64 command_buffer, u32 op, std::span<const u64> args = {},
+                std::span<const u8> payload = {}, u64 command_bytes = 0);
+    bool AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes = 0);
+    std::optional<u64> End(u64 command_buffer, u64 control_bytes);
+    std::optional<State> GetState(u64 command_buffer) const;
+
+    // Validates the entire batch and retains its snapshots; it does not execute or complete GPU work.
+    std::optional<Submission> Submit(u64 queue, std::span<const u64> handles);
+
+private:
+    struct Buffer {
+        State state;
+        std::vector<Operation> operations;
+        u64 command_count{};
+        u64 payload_bytes{};
+        u64 argument_bytes{};
+        u32 nesting_depth{1};
+    };
+
+    struct Handle {
+        std::shared_ptr<const Recording> recording;
+        u64 control_begin{};
+        u64 control_end{};
+    };
+
+    mutable std::mutex mutex;
+    std::unordered_map<u64, Buffer> buffers;
+    std::unordered_map<u64, Handle> live_handles;
+    u64 next_handle{1};
+    u64 next_submission{1};
+};
+
+} // namespace Core::BananzaNvn2Commands
