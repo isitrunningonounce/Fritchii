@@ -894,19 +894,36 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             }
             if (dispatch && storage_pending) {
                 storage_pending = false;
-                for (auto range : queue.storage_ranges[5]) {
-                    if (range.first && !range.second) {
-                        const auto upper = gpu_pools.upper_bound(range.first);
-                        if (upper != gpu_pools.begin()) {
-                            const auto& pool = pools.at(std::prev(upper)->second);
-                            const u64 offset = range.first - pool.gpu_address;
-                            if (offset < pool.size) {
-                                range.second = std::min(MaxRange, pool.size - offset);
-                                if (pool.flags & VirtualPool) {
-                                    range.second = std::min(range.second,
-                                                            PoolAlignment - range.first % PoolAlignment);
+                const auto snapshot_storage = [&](std::pair<u64, u64> range) {
+                    const bool unsized = range.first && !range.second;
+                    if (unsized) {
+                        const auto guest = ResolveGpuRange(range.first, 1);
+                        if (!guest || !ValidRange(memory, *guest, 1)) {
+                            batch.unsized_storage_sizes.try_emplace(range.first, 0);
+                            return;
+                        }
+                        const auto& pool = pools.at(std::prev(gpu_pools.upper_bound(range.first))->second);
+                        const u64 offset = range.first - pool.gpu_address;
+                        range.second = std::min(MaxRange, pool.size - offset);
+                        if (pool.flags & VirtualPool) {
+                            range.second = std::min(range.second, PoolAlignment - range.first % PoolAlignment);
+                        }
+                        const auto mapped_range = [&](u64 size) {
+                            return ResolveGpuRange(range.first, size) && ValidRange(memory, *guest, size);
+                        };
+                        if (!mapped_range(range.second)) {
+                            // Keep the mapped prefix when an unsized binding crosses a hole.
+                            u64 mapped = 1;
+                            u64 end = range.second;
+                            while (mapped < end) {
+                                const u64 size = mapped + (end - mapped + 1) / 2;
+                                if (mapped_range(size)) {
+                                    mapped = size;
+                                } else {
+                                    end = size - 1;
                                 }
                             }
+                            range.second = mapped;
                         }
                     }
                     snapshot(range.first, range.second);
@@ -914,17 +931,17 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                         if (const auto guest = ResolveGpuRange(range.first, range.second);
                             guest && ValidRange(memory, *guest, range.second)) {
                             batch.storage_addresses.try_emplace(range, *guest);
-                            batch.unsized_storage_sizes.try_emplace(range.first, range.second);
+                            if (unsized) {
+                                batch.unsized_storage_sizes.try_emplace(range.first, range.second);
+                            }
                         }
                     }
+                };
+                for (const auto& range : queue.storage_ranges[5]) {
+                    snapshot_storage(range);
                 }
                 for (const auto& range : queue.uniform_ranges[5]) {
-                    if (batch.buffer_snapshots.contains(range)) {
-                        if (const auto guest = ResolveGpuRange(range.first, range.second);
-                            guest && ValidRange(memory, *guest, range.second)) {
-                            batch.storage_addresses.try_emplace(range, *guest);
-                        }
-                    }
+                    snapshot_storage(range);
                 }
             }
             if ((draw || dispatch) && descriptors_pending) {

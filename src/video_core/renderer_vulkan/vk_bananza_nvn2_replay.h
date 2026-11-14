@@ -94,6 +94,8 @@ private:
         u64 cpu_serial{};
         u64 checked_submission{};
         u64 write_version{};
+        u64 allocation_bytes{};
+        u64 last_present{};
     };
 
     struct AttachmentView {
@@ -104,6 +106,7 @@ private:
     };
     struct FeedbackImage {
         vk::Image image;
+        u64 allocation_bytes{};
         std::map<std::tuple<VkFormat, u32, u32, u32, u32, VkImageViewType, VkImageAspectFlags,
                             std::array<u32, 4>>,
                  vk::ImageView> views;
@@ -112,6 +115,7 @@ private:
     struct DepthComparisonImage {
         vk::Image image;
         u64 write_version{};
+        u64 allocation_bytes{};
     };
 
     struct UnboundTexture {
@@ -198,6 +202,7 @@ private:
     };
 
     Image* FindImage(const Texture& texture, bool create);
+    bool ReserveImageBytes(u64 bytes);
     VkImageView GetAttachmentView(Image& image, const AttachmentView& view);
     void ReplayRecording(const Recording& recording, const Submission& submission);
     void ClearColor(const Operation& operation);

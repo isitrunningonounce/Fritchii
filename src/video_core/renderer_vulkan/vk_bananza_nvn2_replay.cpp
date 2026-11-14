@@ -325,6 +325,55 @@ BananzaNvn2Replay::BananzaNvn2Replay(const Device& device_, MemoryAllocator& all
       pipeline_cache{pipeline_cache_}, frame_dump{frame_dump_},
       trace_images{std::getenv("EDEN_NX2_NVN_TRACE_IMAGES") != nullptr} {}
 
+bool BananzaNvn2Replay::ReserveImageBytes(u64 bytes) {
+    const u64 limit = std::clamp<u64>(device.GetDeviceLocalMemory() / 4,
+                                     384ULL << 20, 4ULL << 30);
+    if (image_bytes <= limit && bytes <= limit - image_bytes) {
+        return true;
+    }
+    if (bytes > limit) {
+        return false;
+    }
+    std::vector<decltype(images)::iterator> cold;
+    for (auto it = images.begin(); it != images.end(); ++it) {
+        const auto& image = it->second;
+        if (!image.gpu_written && image.cpu_serial && present_count - image.last_present >= 4) {
+            cold.push_back(it);
+        }
+    }
+    if (cold.empty()) {
+        return false;
+    }
+    std::ranges::sort(cold, {}, [](const auto& it) { return it->second.last_present; });
+    // Finish outstanding transfers and presentation reads before releasing Vulkan objects.
+    scheduler.Finish();
+    const u64 previous_bytes = image_bytes;
+    // Leave room for the next resources in the same load transition.
+    const u64 target = std::min(limit - bytes, limit - limit / 8);
+    for (const auto it : cold) {
+        const auto& image = it->second;
+        if (const auto feedback = feedback_images.find(&image); feedback != feedback_images.end()) {
+            image_bytes -= feedback->second.allocation_bytes;
+            feedback_images.erase(feedback);
+        }
+        if (const auto depth = depth_comparison_images.find(&image);
+            depth != depth_comparison_images.end()) {
+            image_bytes -= depth->second.allocation_bytes;
+            depth_comparison_images.erase(depth);
+        }
+        image_bytes -= image.allocation_bytes;
+        images.erase(it);
+        if (image_bytes <= target) {
+            break;
+        }
+    }
+    if (trace_images) {
+        LOG_INFO(Render_Vulkan, "NVN 2 reclaimed {} MiB of cold texture allocations",
+                 (previous_bytes - image_bytes) >> 20);
+    }
+    return image_bytes <= limit - bytes;
+}
+
 BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, bool create) {
     const auto& d = texture.description;
     const u32 layers = texture.layout.layers;
@@ -344,6 +393,7 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
     const ImageKey key{texture.storage.gpu_address + texture.offset, d.width, d.height, d.format,
                        d.levels, d.target, layers, depth};
     if (const auto it = images.find(key); it != images.end()) {
+        it->second.last_present = present_count;
         return &it->second;
     }
     if (!create) {
@@ -369,18 +419,6 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
     const bool storage = !depth_stencil && block && block->width == 1 &&
                          device.IsFormatSupported(format->vk, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
                                                   FormatType::Optimal);
-    const u64 bytes = std::max<u64>(texture.layout.size,
-                                    u64{d.width} * d.height * format->bytes * layers * depth);
-    const u64 max_image_bytes = std::clamp<u64>(device.GetDeviceLocalMemory() / 4,
-                                                384ULL << 20, 4ULL << 30);
-    if (bytes > max_image_bytes - image_bytes) {
-        if (!image_budget_logged) {
-            image_budget_logged = true;
-            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 image limit reached at {} MiB for format {:#x}, {}x{}",
-                        image_bytes >> 20, d.format, d.width, d.height);
-        }
-        return nullptr;
-    }
     const VkExtent2D extent{d.width, d.height};
     const bool mutable_format = d.format == 0x25 || d.format == 0x38 ||
                                 d.format == 0x9a || d.format == 0x9c;
@@ -404,6 +442,15 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     });
+    const u64 bytes = image.GetMemoryBlock().size;
+    if (!ReserveImageBytes(bytes)) {
+        if (!image_budget_logged) {
+            image_budget_logged = true;
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 image limit reached at {} MiB for format {:#x}, {}x{}",
+                        image_bytes >> 20, d.format, d.width, d.height);
+        }
+        return nullptr;
+    }
     if (trace_images) {
         image.SetObjectNameEXT(fmt::format("NVN 2 {:#x} format {:#x} {}x{}",
                                            std::get<0>(key), d.format, d.width, d.height).c_str());
@@ -416,10 +463,12 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
         .subresourceRange = {format->aspects, 0, 1, 0, 1},
     });
     image_bytes += bytes;
-    return &images.emplace(key, Image{std::move(image), std::move(view), extent, format->vk,
-                                      format->surface, d.levels, layers, depth, volume, attachment, storage,
-                                      format->aspects})
-                .first->second;
+    auto& result = images.emplace(key, Image{std::move(image), std::move(view), extent, format->vk,
+                                            format->surface, d.levels, layers, depth, volume,
+                                            attachment, storage, format->aspects}).first->second;
+    result.allocation_bytes = bytes;
+    result.last_present = present_count;
+    return &result;
 }
 
 VkImageView BananzaNvn2Replay::GetAttachmentView(Image& image, const AttachmentView& view) {
@@ -1226,10 +1275,7 @@ VkImage BananzaNvn2Replay::PrepareDepthComparisonImage(const Image& source, VkFo
         depth_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         bytes = Common::AlignUp(bytes + u64{width} * height * source.layers * texel_bytes, u64{4});
     }
-    const u64 max_image_bytes = std::clamp<u64>(device.GetDeviceLocalMemory() / 4,
-                                                384ULL << 20, 4ULL << 30);
-    if (bytes > (64ULL << 20) ||
-        (found == depth_comparison_images.end() && bytes > max_image_bytes - image_bytes)) {
+    if (bytes > (64ULL << 20)) {
         return VK_NULL_HANDLE;
     }
 
@@ -1250,8 +1296,13 @@ VkImage BananzaNvn2Replay::PrepareDepthComparisonImage(const Image& source, VkFo
             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         });
+        const u64 allocation_bytes = image.GetMemoryBlock().size;
+        if (!ReserveImageBytes(allocation_bytes)) {
+            return VK_NULL_HANDLE;
+        }
         entry = depth_comparison_images.emplace(&source, DepthComparisonImage{std::move(image)}).first;
-        image_bytes += bytes;
+        entry->second.allocation_bytes = allocation_bytes;
+        image_bytes += allocation_bytes;
         if (trace_images) {
             LOG_INFO(Render_Vulkan, "NVN 2 depth comparison copy: {}x{}, {} layers, {} levels, format {}",
                      source.extent.width, source.extent.height, source.layers, source.levels,
@@ -1617,7 +1668,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         const auto [found, inserted] = feedback_images.try_emplace(image);
         auto& copy = found->second;
         if (inserted) {
-            copy.image = allocator.CreateImage(VkImageCreateInfo{
+            auto feedback_image = allocator.CreateImage(VkImageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                 .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                          (d.target == 8 || d.target == 9 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U),
@@ -1632,6 +1683,15 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             });
+            const u64 allocation_bytes = feedback_image.GetMemoryBlock().size;
+            if (!ReserveImageBytes(allocation_bytes)) {
+                feedback_images.erase(found);
+                NoteSkip("feedback image exceeds replay budget");
+                return std::nullopt;
+            }
+            copy.image = std::move(feedback_image);
+            copy.allocation_bytes = allocation_bytes;
+            image_bytes += allocation_bytes;
         }
         sampled_image = *copy.image;
         views = &copy.views;
@@ -4053,9 +4113,16 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
             const auto size = submission.unsized_storage_sizes.find(range.first);
             if (size != submission.unsized_storage_sizes.end()) {
                 range.second = size->second;
+                if (!range.second && (device.HasNullDescriptor() || device.IsRobustBufferAccessEnabled())) {
+                    range.first = 0;
+                }
             }
         }
         if (!range.first && !range.second) {
+            if (device.HasNullDescriptor()) {
+                storage.push_back({VK_NULL_HANDLE, 0, VK_WHOLE_SIZE});
+                continue;
+            }
             if (!unbound_storage) {
                 unbound_storage = allocator.CreateBuffer({
                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

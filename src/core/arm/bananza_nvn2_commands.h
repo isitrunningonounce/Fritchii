@@ -134,6 +134,7 @@ struct Submission {
     u64 payload_bytes{};
     std::map<std::pair<u64, u64>, std::vector<u8>> buffer_snapshots;
     std::map<std::pair<u64, u64>, u64> storage_addresses;
+    // Zero denotes an unsized binding whose first byte is unmapped at submit.
     std::map<u64, u64> unsized_storage_sizes;
     std::map<u64, u64> indirect_index_sizes;
     std::map<std::tuple<u64, u64, u64>, std::pair<u64, u64>> indirect_index_slices;
