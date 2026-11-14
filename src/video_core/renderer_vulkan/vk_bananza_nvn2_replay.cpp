@@ -541,6 +541,7 @@ void BananzaNvn2Replay::ClearColor(const Operation& op) {
     std::memcpy(&value, op.payload.data(), op.payload.size());
     TraceImage("clear", *colors[op.args[0]]);
     image->gpu_written = true;
+    ++image->write_version;
     scheduler.Record([attachment, value, extent, rect, whole, initialized,
                       layers = view.layers](vk::CommandBuffer cmdbuf) {
         const VkRenderingAttachmentInfo color{
@@ -601,6 +602,7 @@ void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
     const bool initialized = image->initialized;
     Initialize(*image);
     image->gpu_written = true;
+    ++image->write_version;
     Barrier();
     scheduler.Record([view = attachment, rect, aspects, image_aspects = image->aspects, value,
                       initialized, extent, layers = depth_view.layers](vk::CommandBuffer cmdbuf) {
@@ -761,6 +763,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
         }
         uploads.push_back(std::move(scratch));
         dest->gpu_written = true;
+        ++dest->write_version;
         TraceImage("depth copy", op.textures[1], source_address);
         ++copies;
         return;
@@ -809,6 +812,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
         return;
     }
     dest->gpu_written = true;
+    ++dest->write_version;
     TraceImage("copy", op.textures[1], source_address);
     for (u32 slice = 0; slice < to.depth; ++slice) {
         const u32 source_slice = flip_z ? from.depth - 1 - slice : slice;
@@ -927,6 +931,7 @@ void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submissio
     });
     uploads.push_back(std::move(upload));
     image->gpu_written = true;
+    ++image->write_version;
     TraceImage("buffer copy", texture, op.args[0]);
     ++copies;
 }
@@ -1000,7 +1005,29 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
     if (const auto storage = FindStorageRange(range); storage != storage_uploads.end()) {
         return {*storage->second.buffer, range.first - storage->first.first};
     }
+    if (const auto [upload, offset] = WritableStorage(submission, range); upload) {
+        return {*upload->buffer, offset};
+    }
     return {UploadRange(submission, range), 0};
+}
+
+void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
+    storage_spans.clear();
+    const u64 alignment =
+        device.GetPhysical().GetProperties().limits.minStorageBufferOffsetAlignment;
+    StorageSpan* span{};
+    for (const auto& [range, guest] : submission.storage_addresses) {
+        const auto [address, size] = range;
+        // Only share Vulkan storage when both addresses describe the same aligned bytes.
+        if (!span || address >= span->range.first + span->range.second ||
+            address - span->range.first != guest - span->guest_address ||
+            (address - span->range.first) % alignment) {
+            span = &storage_spans.emplace(range, StorageSpan{range, guest, {range}}).first->second;
+            continue;
+        }
+        span->range.second = std::max(span->range.second, address - span->range.first + size);
+        span->snapshots.push_back(range);
+    }
 }
 
 std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::WritableStorage(
@@ -1011,38 +1038,52 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::WritableSto
         return offset % align == 0 ? std::pair{&found->second, offset}
                                    : std::pair<StorageUpload*, u64>{};
     }
-    const auto data = submission.buffer_snapshots.find(range);
-    const auto guest = submission.storage_addresses.find(range);
-    if (data == submission.buffer_snapshots.end() || guest == submission.storage_addresses.end()) {
+    if (!submission.storage_addresses.contains(range)) {
         return {};
     }
-    const u64 end = guest->second + range.second;
+    auto entry = storage_spans.upper_bound({range.first, std::numeric_limits<u64>::max()});
+    if (entry == storage_spans.begin()) {
+        return {};
+    }
+    const auto& span = std::prev(entry)->second;
+    const u64 offset = range.first - span.range.first;
+    if (offset >= span.range.second || range.second > span.range.second - offset ||
+        !std::ranges::binary_search(span.snapshots, range)) {
+        return {};
+    }
+    const u64 end = span.guest_address + span.range.second;
     for (const auto& [other_range, upload] : storage_uploads) {
-        if (upload.guest_address < end && guest->second < upload.guest_address + other_range.second) {
+        if (upload.guest_address < end && span.guest_address < upload.guest_address + other_range.second) {
             return {};
         }
     }
     auto buffer = allocator.CreateBuffer({
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = range.second,
+        .size = span.range.second,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     }, MemoryUsage::Download);
     auto mapped = buffer.Mapped();
-    std::ranges::copy(data->second, mapped.begin());
+    for (const auto& snapshot : span.snapshots) {
+        const auto& bytes = submission.buffer_snapshots.at(snapshot);
+        std::ranges::copy(bytes, mapped.begin() + (snapshot.first - span.range.first));
+    }
     for (const auto& write : buffer_updates) {
-        const auto begin = std::max(range.first, write.address);
-        const auto limit = std::min(range.first + range.second, write.address + write.bytes.size());
+        const auto begin = std::max(span.range.first, write.address);
+        const auto limit = std::min(span.range.first + span.range.second,
+                                    write.address + write.bytes.size());
         if (begin < limit) {
-            std::memcpy(mapped.data() + begin - range.first, write.bytes.data() + begin - write.address,
+            std::memcpy(mapped.data() + begin - span.range.first,
+                        write.bytes.data() + begin - write.address,
                         limit - begin);
         }
     }
     buffer.Flush();
-    const auto entry = storage_uploads.emplace(range, StorageUpload{std::move(buffer), guest->second});
-    return {&entry.first->second, 0};
+    const auto upload = storage_uploads.emplace(
+        span.range, StorageUpload{std::move(buffer), span.guest_address});
+    return {&upload.first->second, offset};
 }
 
 void BananzaNvn2Replay::WriteBackStorage(const Submission& submission) {
@@ -1152,7 +1193,169 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
         cmdbuf.CopyBufferToImage(buffer, target, VK_IMAGE_LAYOUT_GENERAL, copies);
     });
     uploads.push_back(std::move(upload));
+    ++image.write_version;
     return true;
+}
+
+VkImage BananzaNvn2Replay::PrepareDepthComparisonImage(const Image& source, VkFormat depth_format) {
+    const auto found = depth_comparison_images.find(&source);
+    if (found != depth_comparison_images.end() && found->second.write_version == source.write_version) {
+        return *found->second.image;
+    }
+    const auto features = device.GetPhysical().GetFormatProperties3(depth_format).optimalTilingFeatures;
+    constexpr auto required = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT |
+                              VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+    if ((features & required) != required ||
+        (depth_format == VK_FORMAT_D32_SFLOAT && !device.IsExtDepthRangeUnrestrictedSupported())) {
+        return VK_NULL_HANDLE;
+    }
+
+    std::vector<VkBufferImageCopy> color_regions;
+    std::vector<VkBufferImageCopy> depth_regions;
+    color_regions.reserve(source.levels);
+    depth_regions.reserve(source.levels);
+    u64 bytes{};
+    const u32 texel_bytes = depth_format == VK_FORMAT_D32_SFLOAT ? 4 : 2;
+    for (u32 level = 0; level < source.levels; ++level) {
+        const u32 width = std::max(1U, source.extent.width >> level);
+        const u32 height = std::max(1U, source.extent.height >> level);
+        color_regions.push_back({
+            .bufferOffset = bytes,
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, source.layers},
+            .imageExtent = {width, height, 1},
+        });
+        auto& depth_region = depth_regions.emplace_back(color_regions.back());
+        depth_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        bytes = Common::AlignUp(bytes + u64{width} * height * source.layers * texel_bytes, u64{4});
+    }
+    const u64 max_image_bytes = std::clamp<u64>(device.GetDeviceLocalMemory() / 4,
+                                                384ULL << 20, 4ULL << 30);
+    if (bytes > (64ULL << 20) ||
+        (found == depth_comparison_images.end() && bytes > max_image_bytes - image_bytes)) {
+        return VK_NULL_HANDLE;
+    }
+
+    auto entry = found;
+    const bool created = entry == depth_comparison_images.end();
+    if (created) {
+        auto image = allocator.CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags = source.layers >= 6 && source.extent.width == source.extent.height
+                         ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = depth_format,
+            .extent = {source.extent.width, source.extent.height, 1},
+            .mipLevels = source.levels,
+            .arrayLayers = source.layers,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        });
+        entry = depth_comparison_images.emplace(&source, DepthComparisonImage{std::move(image)}).first;
+        image_bytes += bytes;
+        if (trace_images) {
+            LOG_INFO(Render_Vulkan, "NVN 2 depth comparison copy: {}x{}, {} layers, {} levels, format {}",
+                     source.extent.width, source.extent.height, source.layers, source.levels,
+                     static_cast<u32>(depth_format));
+        }
+    }
+    auto& depth = entry->second;
+    auto scratch = CreateWrappedBuffer(allocator, bytes, MemoryUsage::DeviceLocal);
+    const auto target = *depth.image;
+    Barrier();
+    // Preserve the texel bits across the color and depth formats, as in DKB Recomp.
+    scheduler.Record([src = *source.image, target, buffer = *scratch,
+                      color_regions = std::move(color_regions),
+                      depth_regions = std::move(depth_regions),
+                      created, levels = source.levels, layers = source.layers](
+                         vk::CommandBuffer cmdbuf) {
+        if (created) {
+            const VkImageMemoryBarrier transition{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = target,
+                .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, levels, 0, layers},
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, transition);
+        }
+        cmdbuf.CopyImageToBuffer(src, VK_IMAGE_LAYOUT_GENERAL, buffer, color_regions);
+        const VkMemoryBarrier transfer{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, transfer);
+        cmdbuf.CopyBufferToImage(buffer, target, VK_IMAGE_LAYOUT_GENERAL, depth_regions);
+    });
+    uploads.push_back(std::move(scratch));
+    depth.write_version = source.write_version;
+    ++copies;
+    return target;
+}
+
+VkDescriptorImageInfo BananzaNvn2Replay::BindUnboundTexture(VkImageViewType type) {
+    const auto& logical = device.GetLogical();
+    auto found = unbound_textures.find(type);
+    if (found == unbound_textures.end()) {
+        const bool cube = type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        const u32 layers = cube ? 6 : 1;
+        constexpr VkFormat Format = VK_FORMAT_R8G8B8A8_UNORM;
+        auto image = allocator.CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U,
+            .imageType = type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+            .format = Format,
+            .extent = {1, 1, 1},
+            .mipLevels = 1,
+            .arrayLayers = layers,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        });
+        const VkImageSubresourceRange subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+        auto view = logical.CreateImageView({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = *image,
+            .viewType = type,
+            .format = Format,
+            .subresourceRange = subresource,
+        });
+        if (!unbound_texture_sampler) {
+            unbound_texture_sampler = logical.CreateSampler({
+                .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            });
+        }
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([handle = *image, subresource](vk::CommandBuffer cmdbuf) {
+            const VkImageMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = handle,
+                .subresourceRange = subresource,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+            constexpr VkClearColorValue zero{};
+            cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, zero, {subresource});
+        });
+        found = unbound_textures.emplace(type, UnboundTexture{std::move(image), std::move(view)}).first;
+        ++clears;
+    }
+    return {*unbound_texture_sampler, *found->second.view, VK_IMAGE_LAYOUT_GENERAL};
 }
 
 std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
@@ -1307,59 +1510,18 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     } else if (binding.type == Shader::TextureType::ColorArrayCube && target == 9 && layers % 6 == 0) {
         view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
     }
-    if (binding.type == Shader::TextureType::Color3D && target != 2 && !binding.is_depth) {
-        // A non-volume descriptor has no texels addressable by a 3D instruction.
-        const auto& logical = device.GetLogical();
-        if (!unbound_volume) {
-            auto image = allocator.CreateImage({
-                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                .imageType = VK_IMAGE_TYPE_3D,
-                .format = VK_FORMAT_R8G8B8A8_UNORM,
-                .extent = {1, 1, 1},
-                .mipLevels = 1,
-                .arrayLayers = 1,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            });
-            constexpr VkImageSubresourceRange subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            auto view = logical.CreateImageView({
-                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .image = *image,
-                .viewType = VK_IMAGE_VIEW_TYPE_3D,
-                .format = VK_FORMAT_R8G8B8A8_UNORM,
-                .subresourceRange = subresource,
-            });
-            auto sampler = logical.CreateSampler({
-                .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            });
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([handle = *image, subresource](vk::CommandBuffer cmdbuf) {
-                const VkImageMemoryBarrier barrier{
-                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = handle,
-                    .subresourceRange = subresource,
-                };
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       0, barrier);
-                constexpr VkClearColorValue zero{};
-                cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, zero, {subresource});
-            });
-            unbound_volume = std::move(image);
-            unbound_volume_view = std::move(view);
-            unbound_volume_sampler = std::move(sampler);
-            ++clears;
+    if (!binding.is_depth && !binding.is_integer && view_type == VK_IMAGE_VIEW_TYPE_MAX_ENUM) {
+        // Incompatible targets have no texels addressable by the shader's view type.
+        if (binding.type == Shader::TextureType::Color3D && target != 2) {
+            return BindUnboundTexture(VK_IMAGE_VIEW_TYPE_3D);
         }
-        return VkDescriptorImageInfo{*unbound_volume_sampler, *unbound_volume_view,
-                                     VK_IMAGE_LAYOUT_GENERAL};
+        if (target == 1 && binding.type == Shader::TextureType::ColorCube) {
+            return BindUnboundTexture(VK_IMAGE_VIEW_TYPE_CUBE);
+        }
+        if (target == 1 && binding.type == Shader::TextureType::ColorArrayCube &&
+            device.GetPhysical().GetFeatures().imageCubeArray) {
+            return BindUnboundTexture(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
+        }
     }
     if (view_type == VK_IMAGE_VIEW_TYPE_MAX_ENUM ||
         first_layer >= tex.layout.layers || !layers || layers > tex.layout.layers - first_layer ||
@@ -1384,7 +1546,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     const VkImageAspectFlags aspect = !image ? 0 : image->aspects == VK_IMAGE_ASPECT_COLOR_BIT
         ? VK_IMAGE_ASPECT_COLOR_BIT
         : depth_mode ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
-    if (!image || !(image->aspects & aspect) || (binding.is_depth && aspect != VK_IMAGE_ASPECT_DEPTH_BIT)) {
+    if (!image || !(image->aspects & aspect) || (binding.is_depth && aspect == VK_IMAGE_ASPECT_STENCIL_BIT)) {
         if (trace_images && draw_diagnostics.emplace(bound_program->serial,
                                                       "sampled texture format detail").second) {
             LOG_WARNING(Render_Vulkan, "NVN 2 program {} texture format {:#x}, target {}, depth mode {}, compare {}, image {}",
@@ -1420,9 +1582,27 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
                                     color ? VK_FORMAT_UNDEFINED : image->format, first_level,
                                     first_layer, bound_program->serial);
     }
-    const auto vk_format = FindColorFormat(format)->vk;
+    auto vk_format = FindColorFormat(format)->vk;
+    auto sampled_aspect = aspect;
+    VkImage sampled_image = *image->image;
+    bool comparison_copy{};
+    if (binding.is_depth && color &&
+        !(device.GetPhysical().GetFormatProperties3(vk_format).optimalTilingFeatures &
+          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT)) {
+        const VkFormat depth_format = vk_format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT
+                                      : vk_format == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM
+                                                                        : VK_FORMAT_UNDEFINED;
+        if (depth_format == VK_FORMAT_UNDEFINED || image->volume || vk_format != image->format ||
+            !(sampled_image = PrepareDepthComparisonImage(*image, depth_format))) {
+            NoteSkip("sampled color texture has no depth comparison view");
+            return std::nullopt;
+        }
+        comparison_copy = true;
+        vk_format = depth_format;
+        sampled_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
     const auto key = std::tuple{vk_format, first_level, levels, first_layer, layers, view_type,
-                                aspect, swizzle};
+                                sampled_aspect, swizzle};
     const auto overlaps = [&](size_t slot) {
         const auto& attachment = color_views[slot];
         return destinations[slot] == image && attachment.level >= first_level &&
@@ -1435,8 +1615,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         feedback |= overlaps(i);
     }
     auto* views = &image->sampled_views;
-    VkImage sampled_image = *image->image;
-    if (feedback) {
+    if (feedback && !comparison_copy) {
         const auto [found, inserted] = feedback_images.try_emplace(image);
         auto& copy = found->second;
         if (inserted) {
@@ -1506,7 +1685,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
             .format = vk_format,
             .components = {components[swizzle[0]], components[swizzle[1]],
                            components[swizzle[2]], components[swizzle[3]]},
-            .subresourceRange = {aspect, first_level, levels, first_layer, layers},
+            .subresourceRange = {sampled_aspect, first_level, levels, first_layer, layers},
         });
         sampled_view = views->emplace(key, std::move(view)).first;
     }
@@ -1532,6 +1711,19 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         device.IsExtSamplerFilterMinmaxSupported() &&
         (physical.GetFormatProperties(vk_format).optimalTilingFeatures &
          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT);
+    const bool anisotropic = desc.anisotropy > 1.0f && desc.mag_filter == 1 &&
+                             (desc.min_filter & 1) && !point_depth && !binding.is_depth &&
+                             !use_reduction && physical.GetFeatures().samplerAnisotropy;
+    const auto& limits = physical.GetProperties().limits;
+    VkBorderColor border = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    if (std::ranges::find(desc.wrap, 5U) != desc.wrap.end() && desc.border_kind == 0) {
+        const auto rgba = std::bit_cast<std::array<float, 4>>(desc.border);
+        if (rgba == std::array{1.0f, 1.0f, 1.0f, 1.0f}) {
+            border = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        } else if (rgba == std::array{0.0f, 0.0f, 0.0f, 1.0f}) {
+            border = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        }
+    }
     auto host_sampler = device.GetLogical().CreateSampler({
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = use_reduction ? &reduction : nullptr,
@@ -1542,14 +1734,15 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         .addressModeU = modes[desc.wrap[0]],
         .addressModeV = modes[desc.wrap[1]],
         .addressModeW = modes[desc.wrap[2]],
-        .mipLodBias = std::clamp(desc.lod_bias, -device.GetPhysical().GetProperties().limits.maxSamplerLodBias,
-                                device.GetPhysical().GetProperties().limits.maxSamplerLodBias),
+        .mipLodBias = std::clamp(desc.lod_bias, -limits.maxSamplerLodBias, limits.maxSamplerLodBias),
+        .anisotropyEnable = anisotropic,
+        .maxAnisotropy = anisotropic ? std::min(desc.anisotropy, limits.maxSamplerAnisotropy) : 1.0f,
         .compareEnable = binding.is_depth,
         .compareOp = binding.is_depth ? static_cast<VkCompareOp>(desc.compare_func - 1)
                                       : VK_COMPARE_OP_ALWAYS,
         .minLod = desc.min_filter < 2 ? 0.0f : std::clamp(desc.min_lod, 0.0f, float(levels - 1)),
-        .maxLod = desc.min_filter < 2 ? 0.0f : std::clamp(desc.max_lod, 0.0f, float(levels - 1)),
-        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        .maxLod = desc.min_filter < 2 ? 0.25f : std::clamp(desc.max_lod, 0.0f, float(levels - 1)),
+        .borderColor = border,
     });
     const VkSampler handle_sampler = *host_sampler;
     samplers.push_back(std::move(host_sampler));
@@ -2040,7 +2233,8 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
                                    VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX};
     for (u32 slot = 0; slot < color_count; ++slot) {
         auto& attachment = attachments[slot];
-        attachment.colorWriteMask = (color_state.channel_mask >> (slot * 4)) & 15;
+        const u32 shader_mask = fs.info ? fs.info->frag_color_components[slot] : 0;
+        attachment.colorWriteMask = ((color_state.channel_mask >> (slot * 4)) & 15) & shader_mask;
         attachment.blendEnable = (color_state.control >> (slot + 8)) & 1;
         if (!attachment.blendEnable) {
             continue;
@@ -2689,6 +2883,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         if (target) {
             Initialize(*target);
             target->gpu_written = true;
+            ++target->write_version;
         }
     }
     VkRenderingAttachmentInfo depth_attachment{
@@ -2702,6 +2897,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     if (depth) {
         Initialize(*depth);
         depth->gpu_written = true;
+        ++depth->write_version;
     }
     for (const auto& [upload, size] : written_storage) {
         upload->written_bytes = std::max(upload->written_bytes, size);
@@ -3272,6 +3468,7 @@ void BananzaNvn2Replay::ReplayEvent(const Operation& op, const Submission& submi
 
 void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& submission) {
     origin_lower_left = submission.origin_lower_left;
+    CollectStorageSpans(submission);
     const u64 previous_work = clears + copies + draws + dispatches + texture_uploads;
     for (const auto& recording : submission.recordings) {
         ReplayRecording(*recording, submission);
@@ -3444,6 +3641,7 @@ public:
     }
 
     bool Matches(const VideoCommon::RecordedEnvQueries& queries) {
+        missing_texture = false;
         const auto handle_at = [&](const Shader::HandleKey& at) {
             const u32 first = ReadCbufValue(at.index, at.offset) << at.shift_left;
             return at.has_secondary
@@ -3792,19 +3990,21 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
     ComputeEnvironment environment{*shader, submission, texture_pool, layout,
                                    std::span{driver}.first(at), uniform_buffers[stage],
                                    storage_buffers[stage]};
-    auto& cached = compute_pipelines[program.serial];
-    if (cached) {
-        environment.texture_bank = cached->texture_bank;
-        if (!environment.Matches(cached->queries)) {
-            skip("compute translation inputs changed");
+    auto& variants = compute_pipelines[program.serial];
+    auto cached = std::ranges::find_if(variants, [&](const ComputePipeline& pipeline) {
+        environment.texture_bank = pipeline.texture_bank;
+        return environment.Matches(pipeline.queries);
+    });
+    if (cached == variants.end()) {
+        constexpr size_t MaxVariants = 32;
+        if (variants.size() >= MaxVariants) {
+            skip("compute translation variant limit");
             return;
         }
-    } else {
-        if (failed_compute_pipelines.contains(program.serial)) {
-            return;
-        }
+        std::optional<ComputePipeline> compiled;
+        environment.missing_texture = false;
         try {
-            cached = CreateComputePipeline(environment);
+            compiled = CreateComputePipeline(environment);
         } catch (const vk::Exception& e) {
             if (e.GetResult() == VK_ERROR_DEVICE_LOST) {
                 throw;
@@ -3813,10 +4013,12 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         } catch (const std::invalid_argument& e) {
             LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute pipeline {}: {}", program.serial, e.what());
         }
-        if (!cached) {
-            failed_compute_pipelines.insert(program.serial);
+        if (!compiled) {
+            skip("compute pipeline unavailable");
             return;
         }
+        variants.push_back(std::move(*compiled));
+        cached = std::prev(variants.end());
     }
     const auto& pipeline = *cached;
     std::vector<VkDescriptorBufferInfo> uniforms;
@@ -3989,6 +4191,7 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
     });
     for (auto* image : writes_to_images) {
         image->gpu_written = true;
+        ++image->write_version;
     }
     for (const auto& [upload, bytes] : writes_to_buffers) {
         upload->written_bytes = std::max(upload->written_bytes, bytes);

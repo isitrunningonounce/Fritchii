@@ -93,6 +93,7 @@ private:
         u64 cpu_hash{};
         u64 cpu_serial{};
         u64 checked_submission{};
+        u64 write_version{};
     };
 
     struct AttachmentView {
@@ -106,6 +107,16 @@ private:
         std::map<std::tuple<VkFormat, u32, u32, u32, u32, VkImageViewType, VkImageAspectFlags,
                             std::array<u32, 4>>,
                  vk::ImageView> views;
+    };
+
+    struct DepthComparisonImage {
+        vk::Image image;
+        u64 write_version{};
+    };
+
+    struct UnboundTexture {
+        vk::Image image;
+        vk::ImageView view;
     };
 
     struct UniformBinding {
@@ -175,6 +186,12 @@ private:
         u64 written_bytes{};
     };
 
+    struct StorageSpan {
+        Range range;
+        u64 guest_address;
+        std::vector<Range> snapshots;
+    };
+
     struct BufferUpdate {
         u64 address;
         std::span<const u8> bytes;
@@ -203,6 +220,7 @@ private:
     VkBuffer UploadRange(const Submission& submission, Range range);
     VkBuffer Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage = 0);
     std::map<Range, StorageUpload>::iterator FindStorageRange(Range range);
+    void CollectStorageSpans(const Submission& submission);
     std::pair<VkBuffer, u64> UploadBufferRange(const Submission& submission, Range range);
     std::pair<StorageUpload*, u64> WritableStorage(const Submission& submission, Range range);
     void WriteBackStorage(const Submission& submission);
@@ -211,6 +229,8 @@ private:
                                                     std::span<Image* const> destinations,
                                                     std::optional<u64> compute_handle = std::nullopt);
     bool PrepareSampledImage(Image& image, const Texture& texture, const Submission& submission);
+    VkImage PrepareDepthComparisonImage(const Image& source, VkFormat depth_format);
+    VkDescriptorImageInfo BindUnboundTexture(VkImageViewType type);
     bool UploadTexture(Image& image, const Texture& texture, std::span<const u8> data);
     void NoteSkip(std::string_view reason);
     void TraceImage(std::string_view operation, const Texture& texture, u64 detail = 0);
@@ -225,6 +245,7 @@ private:
     FrameDump& frame_dump;
     std::map<ImageKey, Image> images;
     std::map<const Image*, FeedbackImage> feedback_images;
+    std::map<const Image*, DepthComparisonImage> depth_comparison_images;
     std::array<std::optional<Texture>, 8> colors;
     std::array<AttachmentView, 8> color_views{};
     std::optional<Texture> depth_texture;
@@ -260,14 +281,13 @@ private:
     bool render_enabled{true};
     bool origin_lower_left{};
     std::map<PipelineKey, std::optional<Pipeline>> pipelines;
-    std::map<u64, std::optional<ComputePipeline>> compute_pipelines;
-    std::set<u64> failed_compute_pipelines;
+    std::map<u64, std::vector<ComputePipeline>> compute_pipelines;
     std::map<Range, VkBuffer> uploaded_ranges;
     std::map<Range, StorageUpload> storage_uploads;
+    std::map<Range, StorageSpan> storage_spans;
     vk::Buffer unbound_storage;
-    vk::Image unbound_volume;
-    vk::ImageView unbound_volume_view;
-    vk::Sampler unbound_volume_sampler;
+    std::map<VkImageViewType, UnboundTexture> unbound_textures;
+    vk::Sampler unbound_texture_sampler;
     std::vector<BufferUpdate> buffer_updates;
     std::set<u64> reset_indirect_draws;
     std::vector<vk::Buffer> uploads;
