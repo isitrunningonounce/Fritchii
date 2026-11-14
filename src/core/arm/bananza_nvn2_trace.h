@@ -41,6 +41,7 @@ public:
 
     std::optional<size_t> Find(u64 address) const;
     std::string_view Name(size_t index) const;
+    size_t Size() const { return entry_count; }
     u64 Resolve(std::string_view name) const;
     void Count(size_t index, u64 thread, u64 arg1);
     void Present();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -159,9 +160,53 @@ u64 CommandBytes(std::string_view name, const GuestCall& call) {
 
 } // Anonymous namespace
 
-Session::Session(System& system_, u64 bootstrap_, u64 internal_bootstrap_, u64 callback_return_)
+Session::Session(System& system_, const BananzaNvn2Trace::Session& trace, u64 bootstrap_,
+                 u64 internal_bootstrap_, u64 callback_return_)
     : bootstrap{bootstrap_}, internal_bootstrap{internal_bootstrap_},
-      callback_return{callback_return_}, system{system_} {}
+      callback_return{callback_return_}, procedures(trace.Size()), system{system_} {
+    for (size_t index = 0; index < procedures.size(); ++index) {
+        const auto name = trace.Name(index);
+        auto& procedure = procedures[index];
+        procedure.name = name;
+        procedure.guest_helper = UseGuestStateHelper(name);
+        procedure.float_return = Resources::IsFloatReturn(name);
+        if (name == "nvnDeviceGetProcAddress") {
+            procedure.handler = Handler::GetProcAddress;
+        } else if (name == "nvnDeviceGetTextureHandle") {
+            procedure.handler = Handler::GetTextureHandle;
+        } else if (name.starts_with("nvnDevice")) {
+            procedure.handler = Handler::Device;
+        } else if (name.starts_with("nvnMemoryPool")) {
+            procedure.handler = Handler::Pool;
+        } else if (name.starts_with("nvnBuffer")) {
+            procedure.handler = Handler::Buffer;
+        } else if (name.starts_with("nvnQueue")) {
+            procedure.handler = Handler::Queue;
+        } else if (name.starts_with("nvnWindow")) {
+            procedure.handler = Handler::Window;
+        } else if (name.starts_with("nvnSync") || name.starts_with("nvnEvent")) {
+            procedure.handler = Handler::SyncEvent;
+        } else if (name.starts_with("nvnCommandBuffer")) {
+            procedure.handler = Handler::Command;
+            procedure.begins_recording = name == "nvnCommandBufferBeginRecording";
+            procedure.ends_recording = name == "nvnCommandBufferEndRecording";
+            const auto scalar = std::ranges::find(ScalarCommands, name, &ScalarCommand::name);
+            const auto state = std::ranges::find(StateBindings, name, &StateBinding::name);
+            if (scalar != ScalarCommands.end()) {
+                procedure.scalar_command = &*scalar;
+            }
+            if (state != StateBindings.end()) {
+                procedure.state_binding = &*state;
+            }
+        }
+    }
+    if (const char* value = std::getenv("EDEN_NX2_NVN_RECORDING_STATS"); value && *value == '1') {
+        recording_stats.emplace();
+    }
+    if (const char* value = std::getenv("EDEN_NX2_NVN_CALL_PROFILE"); value && *value == '1') {
+        call_profile.emplace();
+    }
+}
 
 bool Session::IsBootstrap(u64 pc) const {
     return pc == bootstrap || pc == internal_bootstrap;
@@ -209,16 +254,37 @@ bool Session::UseGuestStateHelper(std::string_view name) {
     return std::ranges::any_of(prefixes, [&](auto prefix) { return name.starts_with(prefix); });
 }
 
-bool Session::IsFloatReturn(std::string_view name) {
-    return Resources::IsFloatReturn(name);
+bool Session::UsesGuestStateHelper(size_t index) const {
+    return procedures[index].guest_helper;
+}
+
+bool Session::ReturnsFloat(size_t index) const {
+    return procedures[index].float_return;
+}
+
+bool Session::ProfilesCalls() const {
+    return call_profile.has_value();
+}
+
+void Session::ProfileCall(size_t index, std::string_view name, u64 nanoseconds, bool continuation) {
+    auto& profile = *call_profile;
+    std::scoped_lock lock{profile.mutex};
+    auto& entry = profile.entries[index];
+    entry.name = name;
+    entry.calls += !continuation;
+    entry.nanoseconds += nanoseconds;
 }
 
 std::optional<GuestCallback> Session::BeginCallback(u64 thread, size_t procedure,
-                                                   std::string_view name, const GuestCall& call,
-                                                   u64 link) {
+                                                   const GuestCall& call, u64 link) {
+    const auto& route = procedures[procedure];
+    if (route.handler != Handler::Command) {
+        return std::nullopt;
+    }
+    const auto name = route.name;
     const u64 command_bytes = CommandBytes(name, call);
-    const bool beginning = name == "nvnCommandBufferBeginRecording";
-    const bool ending = name == "nvnCommandBufferEndRecording";
+    const bool beginning = route.begins_recording;
+    const bool ending = route.ends_recording;
     if (!beginning && !ending && !command_bytes) {
         return std::nullopt;
     }
@@ -273,35 +339,53 @@ std::optional<CallbackContinuation> Session::EndCallback(u64 thread) {
 u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& memory, size_t index,
                       const GuestCall& call) {
     const std::string_view name = procs.Name(index);
+    const auto handler = procedures[index].handler;
     const auto& x = call.x;
-    if (name == "nvnDeviceGetProcAddress") {
+    if (handler == Handler::GetProcAddress) {
         return x[1] ? procs.Resolve(memory.ReadCString(x[1], 96)) : 0;
+    }
+    if (handler == Handler::GetTextureHandle) {
+        return (x[1] & 0xfffff) | ((x[2] & 0xfff) << 20);
     }
     std::scoped_lock lock{mutex};
     if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
         ReportMissing(false);
+        ReportRecordingStats();
+        ReportCallProfile();
         next_report = now + std::chrono::seconds{10};
     }
     std::optional<u64> result;
-    if (name.starts_with("nvnDevice")) {
+    switch (handler) {
+    case Handler::Device:
         result = HandleDevice(memory, name, call);
-    } else if (name.starts_with("nvnMemoryPool")) {
+        break;
+    case Handler::Pool:
         result = HandlePool(memory, name, call);
-    } else if (name.starts_with("nvnBuffer")) {
+        break;
+    case Handler::Buffer:
         result = HandleBuffer(memory, name, call);
-    } else if (name.starts_with("nvnQueue")) {
+        break;
+    case Handler::Queue:
         result = HandleQueue(memory, name, call);
-    } else if (name.starts_with("nvnWindow")) {
+        break;
+    case Handler::Window:
         result = HandleWindow(memory, name, call);
-    } else if (name.starts_with("nvnSync") || name.starts_with("nvnEvent")) {
+        break;
+    case Handler::SyncEvent:
         result = HandleSyncEvent(memory, name, call);
-    } else if (name.starts_with("nvnCommandBuffer")) {
+        break;
+    case Handler::Command:
         result = HandleCommands(memory, index, name, call);
-    } else {
+        break;
+    case Handler::Resource:
         result = resources.Dispatch(
             memory, name, call, [&](u64 device) { return devices.contains(device); },
             [&](u64 address) { return GetPool(address); },
             [&](u64 address, u64 size) { return ResolveGpuRange(address, size); });
+        break;
+    case Handler::GetProcAddress:
+    case Handler::GetTextureHandle:
+        break;
     }
     if (result) {
         return *result;
@@ -359,8 +443,6 @@ std::optional<u64> Session::HandleDevice(Memory::Memory& memory, std::string_vie
                                                       : device->second.depth_mode;
     } else if (name == "nvnDeviceFinalizeCommandHandle") {
         recorder.FinalizeHandle(x[1]);
-    } else if (name == "nvnDeviceGetTextureHandle") {
-        return (x[1] & 0xfffff) | ((x[2] & 0xfff) << 20);
     } else if (name == "nvnDeviceGetSeparateSamplerHandle") {
         return static_cast<u64>(static_cast<s64>(static_cast<s32>(x[1]))) << 20;
     } else if (name == "nvnDeviceGetImageHandle" || name == "nvnDeviceGetSeparateTextureHandle") {
@@ -926,6 +1008,9 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
             SnapshotResources(memory, *submission, queue->second);
             ++accepted_submissions;
             accepted_commands += submission->command_count;
+            if (recording_stats) {
+                CountRecordings(*submission);
+            }
             if (!logged_submit) {
                 logged_submit = true;
                 LOG_INFO(Core_ARM,
@@ -990,6 +1075,13 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
                 return 0;
             }
             const auto& description = texture->description;
+            if (recording_stats) {
+                ++recording_stats->presents;
+            }
+            if (call_profile) {
+                std::scoped_lock profile_lock{call_profile->mutex};
+                ++call_profile->presents;
+            }
             Tegra::FramebufferConfig config{
                 .width = description.width,
                 .height = description.height,
@@ -1254,8 +1346,7 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
         }
         return false;
     };
-    if (const auto binding = std::ranges::find(StateBindings, name, &StateBinding::name);
-        binding != StateBindings.end()) {
+    if (const auto* binding = static_cast<const StateBinding*>(procedures[index].state_binding)) {
         replay = binding->replay;
         valid = copy(x[1], binding->bytes);
     } else if (name == "nvnCommandBufferBindProgram") {
@@ -1439,6 +1530,11 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             recorder.Begin(x[0]);
         }
         if (const auto handle = recorder.End(x[0], ControlRecordBytes, ControlHandleOffset)) {
+            if (recording_stats) {
+                ++last_recording_serial;
+                ++recording_stats->recorded;
+                recording_stats->rerecorded += !recording_stats->recorded_buffers.insert(x[0]).second;
+            }
             // A guest-visible handle points into its control allocation.
             constexpr std::array<u8, ControlRecordBytes> header{1};
             memory.WriteBlock(*handle - ControlHandleOffset, header.data(), header.size());
@@ -1452,9 +1548,8 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             recorder.Begin(x[0]);
         }
         const auto handles = ReadHandles(memory, x[2], static_cast<u32>(x[1]));
-        ok = handles && recorder.AppendHandles(x[0], *handles);
-    } else if (const auto command = std::ranges::find(ScalarCommands, name, &ScalarCommand::name);
-               command != ScalarCommands.end()) {
+        ok = handles && recorder.AppendHandles(x[0], *handles, 0, name == "nvnCommandBufferCallCommands");
+    } else if (const auto* command = static_cast<const ScalarCommand*>(procedures[index].scalar_command)) {
         if (memory.Read8(x[0] + 0x11)) {
             recorder.Begin(x[0]);
         }
@@ -1579,6 +1674,84 @@ void Session::ReportMissing(bool final) {
 void Session::Finish() {
     std::scoped_lock lock{mutex};
     ReportMissing(true);
+    ReportRecordingStats();
+    ReportCallProfile();
+}
+
+void Session::CountRecordings(const BananzaNvn2Commands::Submission& batch) {
+    auto& stats = *recording_stats;
+    ++stats.submissions;
+    stats.commands += batch.command_count;
+    const auto walk = [&](auto&& self, const BananzaNvn2Commands::Recording& recording,
+                          bool nested) -> void {
+        ++stats.recording_uses;
+        stats.repeated_uses += !stats.used.insert(recording.serial).second;
+        stats.prior_window_uses += recording.serial <= last_reported_recording_serial;
+        stats.command_buffers.insert(recording.command_buffer);
+        (nested ? stats.nested : stats.submitted).insert(recording.serial);
+        for (const auto& op : recording.operations) {
+            if (op.nested) {
+                self(self, *op.nested, true);
+            }
+        }
+    };
+    for (const auto& recording : batch.recordings) {
+        stats.draws += recording->draw_count;
+        stats.called_commands += recording->called_commands;
+        stats.called_draws += recording->called_draws;
+        stats.copied_commands += recording->copied_commands;
+        stats.copied_draws += recording->copied_draws;
+        walk(walk, *recording, false);
+    }
+}
+
+void Session::ReportRecordingStats() {
+    if (!recording_stats) {
+        return;
+    }
+    const auto& stats = *recording_stats;
+    LOG_INFO(Core_ARM,
+             "Bananza NVN 2 recordings: presents={} submits={} commands={} draws={} through_call={}/{} through_copy={}/{} distinct_submitted={} distinct_nested={} used_buffers={} new_recordings={} rerecorded={} uses={} repeats={} from_prior_windows={}",
+             stats.presents, stats.submissions, stats.commands, stats.draws,
+             stats.called_commands, stats.called_draws, stats.copied_commands, stats.copied_draws,
+             stats.submitted.size(), stats.nested.size(), stats.command_buffers.size(), stats.recorded,
+             stats.rerecorded, stats.recording_uses, stats.repeated_uses, stats.prior_window_uses);
+    last_reported_recording_serial = last_recording_serial;
+    recording_stats.emplace();
+}
+
+void Session::ReportCallProfile() {
+    if (!call_profile) {
+        return;
+    }
+    auto& profile = *call_profile;
+    std::array<CallStats, 726> entries;
+    u64 presents;
+    {
+        std::scoped_lock lock{profile.mutex};
+        entries = std::exchange(profile.entries, {});
+        presents = std::exchange(profile.presents, 0);
+    }
+    u64 calls{};
+    u64 elapsed{};
+    for (const auto& entry : entries) {
+        calls += entry.calls;
+        elapsed += entry.nanoseconds;
+    }
+    if (!calls) {
+        return;
+    }
+    LOG_INFO(Core_ARM,
+             "Bananza NVN 2 call profile: calls={} presents={} host_ns={} ns/call={:.1f} ms/present={:.3f}",
+             calls, presents, elapsed, double(elapsed) / calls,
+             presents ? double(elapsed) / presents / 1e6 : 0.0);
+    std::ranges::partial_sort(entries, entries.begin() + 10, std::greater{}, &CallStats::calls);
+    for (const auto& entry : std::span{entries}.first<10>()) {
+        if (entry.calls) {
+            LOG_INFO(Core_ARM, "Bananza NVN 2 call profile: {} calls={} ns/call={:.1f}",
+                     entry.name, entry.calls, double(entry.nanoseconds) / entry.calls);
+        }
+    }
 }
 
 } // namespace Core::BananzaNvn2Hle

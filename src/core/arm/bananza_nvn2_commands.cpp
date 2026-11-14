@@ -81,6 +81,11 @@ bool Recorder::Begin(u64 command_buffer) {
     buffer.command_count = 0;
     buffer.payload_bytes = 0;
     buffer.argument_bytes = 0;
+    buffer.draw_count = 0;
+    buffer.called_commands = 0;
+    buffer.called_draws = 0;
+    buffer.copied_commands = 0;
+    buffer.copied_draws = 0;
     buffer.nesting_depth = 1;
     buffer.state.recording = true;
     return true;
@@ -117,13 +122,15 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
     operation.program = std::move(program);
     buffer.operations.push_back(std::move(operation));
     ++buffer.command_count;
+    buffer.draw_count += replay >= ReplayOp::Draw && replay <= ReplayOp::DrawInstanced;
     buffer.payload_bytes += payload.size();
     buffer.argument_bytes += argument_bytes;
     buffer.state.command_used += command_bytes;
     return true;
 }
 
-bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes) {
+bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes,
+                             bool call) {
     std::scoped_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     if (it == buffers.end() || !it->second.state.recording) {
@@ -153,6 +160,14 @@ bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u
     for (const u64 handle : handles) {
         Operation operation;
         operation.nested = live_handles.at(handle).recording;
+        buffer.draw_count += operation.nested->draw_count;
+        if (call) {
+            buffer.called_commands += operation.nested->command_count;
+            buffer.called_draws += operation.nested->draw_count;
+        } else {
+            buffer.copied_commands += operation.nested->command_count;
+            buffer.copied_draws += operation.nested->draw_count;
+        }
         buffer.operations.push_back(std::move(operation));
     }
     buffer.command_count = count;
@@ -165,7 +180,8 @@ bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u
 std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes, u64 guest_handle_offset) {
     std::scoped_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
-    if (it == buffers.end() || !it->second.state.recording || control_bytes == 0 || next_handle == 0) {
+    if (it == buffers.end() || !it->second.state.recording || control_bytes == 0 ||
+        next_handle == 0 || next_recording == 0) {
         return std::nullopt;
     }
     auto& buffer = it->second;
@@ -182,6 +198,13 @@ std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes, u64 gues
         return std::nullopt;
     }
     auto snapshot = std::make_shared<Recording>();
+    snapshot->serial = next_recording++;
+    snapshot->command_buffer = command_buffer;
+    snapshot->draw_count = buffer.draw_count;
+    snapshot->called_commands = buffer.called_commands;
+    snapshot->called_draws = buffer.called_draws;
+    snapshot->copied_commands = buffer.copied_commands;
+    snapshot->copied_draws = buffer.copied_draws;
     snapshot->operations = std::move(buffer.operations);
     snapshot->command_count = buffer.command_count;
     snapshot->payload_bytes = buffer.payload_bytes;

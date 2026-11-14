@@ -74,6 +74,13 @@ struct Operation {
 
 struct Recording {
     std::vector<Operation> operations;
+    u64 serial{};
+    u64 command_buffer{};
+    u64 draw_count{};
+    u64 called_commands{};
+    u64 called_draws{};
+    u64 copied_commands{};
+    u64 copied_draws{};
     u64 command_count{};
     u64 payload_bytes{};
     u32 nesting_depth{1};
@@ -123,7 +130,8 @@ public:
                 std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures = {},
                 std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program = {},
                 ReplayOp replay = ReplayOp::Unsupported);
-    bool AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes = 0);
+    bool AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes = 0,
+                       bool call = true);
     std::optional<u64> End(u64 command_buffer, u64 control_bytes, u64 guest_handle_offset = 0);
     bool FinalizeHandle(u64 handle);
     std::optional<State> GetState(u64 command_buffer) const;
@@ -138,6 +146,11 @@ private:
         u64 command_count{};
         u64 payload_bytes{};
         u64 argument_bytes{};
+        u64 draw_count{};
+        u64 called_commands{};
+        u64 called_draws{};
+        u64 copied_commands{};
+        u64 copied_draws{};
         u32 nesting_depth{1};
     };
 
@@ -151,6 +164,7 @@ private:
     std::unordered_map<u64, Buffer> buffers;
     std::unordered_map<u64, Handle> live_handles;
     u64 next_handle{1};
+    u64 next_recording{1};
     u64 next_submission{1};
 };
 

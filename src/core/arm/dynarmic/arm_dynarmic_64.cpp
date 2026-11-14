@@ -17,6 +17,7 @@
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_trace.h"
@@ -104,7 +105,7 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
             return LichiiHooks::Brk;
         }
         if (const auto index = procs.Find(vaddr);
-            index && !hle->UseGuestStateHelper(procs.Name(*index))) {
+            index && !hle->UsesGuestStateHelper(*index)) {
             return LichiiHooks::Brk;
         }
     }
@@ -192,10 +193,21 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         hle && exception == Dynarmic::A64::Exception::Breakpoint) {
         auto& jit = *m_parent.m_jit;
         const auto& procs = *m_process->GetBananzaNvn2Trace();
+        const bool profile = hle->ProfilesCalls();
+        const auto start = profile ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+        const auto report = [&](size_t index, bool continuation) {
+            if (profile) {
+                const auto elapsed = std::chrono::steady_clock::now() - start;
+                hle->ProfileCall(index, procs.Name(index),
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+                                 continuation);
+            }
+        };
         const auto return_to_guest = [&](size_t index, const BananzaNvn2Hle::GuestCall& call,
                                          u64 link) {
             const u64 result = hle->Dispatch(procs, m_memory, index, call);
-            if (hle->IsFloatReturn(procs.Name(index))) {
+            if (hle->ReturnsFloat(index)) {
                 jit.SetVector(0, {result, 0});
             } else {
                 jit.SetRegister(0, result);
@@ -212,11 +224,13 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         if (hle->IsCallbackReturn(pc)) {
             if (const auto continuation = hle->EndCallback(m_nvn2_thread_id)) {
                 return_to_guest(continuation->procedure, continuation->call, continuation->link);
+                report(continuation->procedure, true);
                 return;
             }
         }
         if (const auto index = procs.Find(pc);
-            index && !hle->UseGuestStateHelper(procs.Name(*index))) {
+            index && !hle->UsesGuestStateHelper(*index)) {
+            SCOPE_EXIT { report(*index, false); };
             BananzaNvn2Hle::GuestCall call{};
             for (size_t i = 0; i < call.x.size(); ++i) {
                 call.x[i] = jit.GetRegister(i);
@@ -224,7 +238,7 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
             }
             const u64 link = jit.GetRegister(30);
             if (const auto callback =
-                    hle->BeginCallback(m_nvn2_thread_id, *index, procs.Name(*index), call, link)) {
+                    hle->BeginCallback(m_nvn2_thread_id, *index, call, link)) {
                 for (size_t i = 0; i < callback->args.size(); ++i) {
                     jit.SetRegister(i, callback->args[i]);
                 }

@@ -99,7 +99,7 @@ void SetUpBananzaNvn2(Core::System& system, Kernel::KProcess& process, const NSO
     process.SetBananzaNvn2Trace(std::move(trace));
     if (hle) {
         process.SetBananzaNvn2Hle(std::make_unique<Core::BananzaNvn2Hle::Session>(
-            system, base + layout->bootstrap, base + layout->internal_bootstrap,
+            system, *process.GetBananzaNvn2Trace(), base + layout->bootstrap, base + layout->internal_bootstrap,
             base + layout->callback_return));
         LOG_INFO(Loader, "Bananza NVN 2 HLE: installed {} SDK procedures at {:#x}",
                  layout->entry_count, base);

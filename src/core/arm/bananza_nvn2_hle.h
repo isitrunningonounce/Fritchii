@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -48,14 +49,16 @@ struct CallbackContinuation {
 
 class Session {
 public:
-    Session(System& system, u64 bootstrap, u64 internal_bootstrap, u64 callback_return);
+    Session(System& system, const BananzaNvn2Trace::Session& procedures, u64 bootstrap,
+            u64 internal_bootstrap, u64 callback_return);
     bool IsBootstrap(u64 pc) const;
     bool IsCallbackReturn(u64 pc) const;
     u64 CallbackReturn() const;
-    static bool UseGuestStateHelper(std::string_view name);
-    static bool IsFloatReturn(std::string_view name);
-    std::optional<GuestCallback> BeginCallback(u64 thread, size_t procedure,
-                                               std::string_view name, const GuestCall& call,
+    bool UsesGuestStateHelper(size_t index) const;
+    bool ReturnsFloat(size_t index) const;
+    bool ProfilesCalls() const;
+    void ProfileCall(size_t index, std::string_view name, u64 nanoseconds, bool continuation);
+    std::optional<GuestCallback> BeginCallback(u64 thread, size_t procedure, const GuestCall& call,
                                                u64 link);
     std::optional<CallbackContinuation> EndCallback(u64 thread);
     u64 Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& memory, size_t index,
@@ -63,6 +66,20 @@ public:
     void Finish();
 
 private:
+    enum class Handler : u8 { Resource, Device, Pool, Buffer, Queue, Window, SyncEvent, Command,
+                              GetProcAddress, GetTextureHandle };
+    struct Procedure {
+        std::string_view name;
+        Handler handler{};
+        bool guest_helper{};
+        bool float_return{};
+        bool begins_recording{};
+        bool ends_recording{};
+        const void* scalar_command{};
+        const void* state_binding{};
+    };
+    static bool UseGuestStateHelper(std::string_view name);
+
     struct Device {
         u32 flags{};
         u32 origin{};
@@ -151,6 +168,39 @@ private:
         u64 reported{};
     };
 
+    struct RecordingStats {
+        std::unordered_set<u64> submitted;
+        std::unordered_set<u64> nested;
+        std::unordered_set<u64> command_buffers;
+        std::unordered_set<u64> used;
+        std::unordered_set<u64> recorded_buffers;
+        u64 presents{};
+        u64 submissions{};
+        u64 recorded{};
+        u64 rerecorded{};
+        u64 commands{};
+        u64 draws{};
+        u64 called_commands{};
+        u64 called_draws{};
+        u64 copied_commands{};
+        u64 copied_draws{};
+        u64 recording_uses{};
+        u64 repeated_uses{};
+        u64 prior_window_uses{};
+    };
+
+    struct CallStats {
+        std::string_view name;
+        u64 calls{};
+        u64 nanoseconds{};
+    };
+
+    struct CallProfile {
+        std::mutex mutex;
+        std::array<CallStats, 726> entries;
+        u64 presents{};
+    };
+
     std::optional<u64> HandleDevice(Memory::Memory& memory, std::string_view name,
                                     const GuestCall& call);
     std::optional<u64> HandlePool(Memory::Memory& memory, std::string_view name,
@@ -177,10 +227,14 @@ private:
                              const BananzaNvn2Commands::State& state);
     void NoteMissing(std::string_view name);
     void ReportMissing(bool final);
+    void CountRecordings(const BananzaNvn2Commands::Submission& batch);
+    void ReportRecordingStats();
+    void ReportCallProfile();
 
     const u64 bootstrap;
     const u64 internal_bootstrap;
     const u64 callback_return;
+    std::vector<Procedure> procedures;
     System& system;
     std::mutex mutex;
     std::unordered_map<u64, Device> devices;
@@ -200,6 +254,10 @@ private:
     BananzaNvn2Commands::Recorder recorder;
     Resources resources;
     std::map<std::string, MissingCall, std::less<>> missing;
+    std::optional<RecordingStats> recording_stats;
+    std::optional<CallProfile> call_profile;
+    u64 last_recording_serial{};
+    u64 last_reported_recording_serial{};
     std::chrono::steady_clock::time_point next_report =
         std::chrono::steady_clock::now() + std::chrono::seconds{10};
     u64 next_gpu_address = 0x1000000000ULL;
