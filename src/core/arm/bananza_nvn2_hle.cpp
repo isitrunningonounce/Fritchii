@@ -968,7 +968,19 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         if (texture->layout.size <= (1ULL << 20) || !(texture->storage.flags & VirtualPool)) {
             return 0;
         }
-        return block && block->width > 1 ? 1 : 2;
+        if (block && block->width > 1) {
+            return 1;
+        }
+        // Depth and single-channel float inputs can be read before their first replayed write.
+        switch (texture->description.format) {
+        case 0x05: // R16_FLOAT
+        case 0x0a: // R32_FLOAT
+        case 0x32: // D16_UNORM
+        case 0x34: // D32_FLOAT
+            return 2;
+        default:
+            return 3;
+        }
     };
     // Small CPU textures, font atlases and compressed assets need their backing bytes.
     // Large render targets usually get their contents from replayed work.
