@@ -1687,6 +1687,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     }
     runtime.previous_stage_stores.mask.set();
     runtime.convert_depth_mode = raster.negative_one_to_one;
+    runtime.y_negate = raster.origin_lower_left;
     const auto alpha_func = (color_state.control >> 24) & 15;
     if (alpha_func >= 1 && alpha_func < 8) {
         runtime.alpha_test_func = static_cast<Shader::CompareFunction>(alpha_func - 1);
@@ -1993,8 +1994,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         NoteSkip("unsupported polygon mode");
         return std::nullopt;
     }
-    // Vulkan's framebuffer-space winding is opposite NVN's clip-space winding.
-    const bool clockwise = (raster.polygon & 4) != 0;
+    const bool clockwise = ((raster.polygon & 4) == 0) != raster.origin_lower_left;
     const auto features = device.GetPhysical().GetFeatures();
     const VkPipelineRasterizationStateCreateInfo rasterization{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -2428,6 +2428,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         }
     }
     if (!entry->second) {
+        NoteSkip("graphics pipeline unavailable");
         if (!missing_draw_logged) {
             missing_draw_logged = true;
             LOG_WARNING(Render_Vulkan, "Bananza NVN 2 Vulkan replay skipped a draw with unsupported pipeline state");
@@ -2670,10 +2671,10 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         return;
     }
     const VkRect2D draw_scissor = ScissorFor(extent);
-    if (submission.origin_lower_left) {
-        draw_viewport.y = static_cast<float>(extent.height) - draw_viewport.y;
-        draw_viewport.height = -draw_viewport.height;
-    }
+    draw_viewport.y = submission.origin_lower_left
+                          ? static_cast<float>(extent.height) - draw_viewport.y
+                          : draw_viewport.y + draw_viewport.height;
+    draw_viewport.height = -draw_viewport.height;
     std::array<VkRenderingAttachmentInfo, 8> attachments{};
     for (u32 i = 0; i < color_count; ++i) {
         auto* target = targets[i];
@@ -2895,7 +2896,8 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 u32_le value;
                 std::memcpy(&value, op.payload.data(), sizeof(value));
                 raster_state.polygon = value & 31;
-                const u32 offset_enables = (value >> 5) & 7;
+                // Compact NVN polygon state stores offset enables above the mode fields.
+                const u32 offset_enables = (value >> 15) & 7;
                 const u32 mode = (value >> 3) & 3;
                 raster_state.depth_bias = mode < 3 && (offset_enables & (1U << mode)) != 0;
             }
