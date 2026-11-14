@@ -64,31 +64,32 @@ std::optional<u64> RawStorageClass(const TextureDescription& d) {
 }
 
 std::optional<u64> StorageClass(const TextureDescription& d) {
-    if (!GetTextureFormatBlock(d.format) || d.target > 10) return std::nullopt;
+    const auto block = GetTextureFormatBlock(d.format);
+    if (!block || d.target > 10) return std::nullopt;
     // SDK +0x5ED260: linear textures and buffers use the device's pitch kind.
     // Native Bananza probes verify the resulting class is 0x100.
     if ((d.flags & 0x50) || d.target == 10) return 0x100;
-    if (d.samples != 0 || (d.flags & 0x1000)) return std::nullopt;
+    if ((d.samples != 0 && d.samples != 2 && d.samples != 4 && d.samples != 8) ||
+        (d.flags & 0x1000)) return std::nullopt;
 
     // SDK format table +0xE03968, stride 0x2C. Formats without bit 0 in
     // byte 0 return kind zero before calling the driver (+0x5E2F90).
-    if ((d.format >= 0x19 && d.format <= 0x21) ||
+    if (block->width > 1 || (d.format >= 0x19 && d.format <= 0x21) ||
         (d.format >= 0x51 && d.format <= 0x6C)) return 0x100;
 
-    // These color formats have the same driver arguments as the 40 formats
-    // sampled in stage1-native-probe.txt: size codes 1/2/4/5 and no extra
-    // format modifier. Only sample count zero was captured by the probe.
+    // Bananza's boot probe returns the same kind for 0, 2, 4 and 8 samples.
+    if (d.format >= 0x32 && d.format <= 0x36) {
+        constexpr std::array<u64, 5> depth_classes{0x10B, 0x10C, 0x109, 0x10C, 0x10D};
+        return d.flags & 8 ? depth_classes[d.format - 0x32] : 0x100;
+    }
     const bool known_color = d.format <= 0x18 ||
-        (d.format >= 0x22 && d.format <= 0x2D) ||
+        (d.format >= 0x22 && d.format <= 0x30) ||
         (d.format >= 0x38 && d.format <= 0x40) ||
-        d.format == 0x41 || d.format == 0x42 || d.format == 0x45 ||
-        d.format == 0x46 || d.format == 0x49 || d.format == 0x4A ||
         (d.format >= 0x6D && d.format <= 0x75) ||
         (d.format >= 0x95 && d.format <= 0x98) ||
         d.format == 0x9A || d.format == 0x9C;
     if (!known_color) return std::nullopt;
-    const auto block = GetTextureFormatBlock(d.format);
-    return (d.flags & 8) && block->width == 1 ? 0x108 : 0x100;
+    return d.flags & 8 ? 0x108 : 0x100;
 }
 
 std::optional<u64> ZCullStorageSize(const TextureDescription& d) {

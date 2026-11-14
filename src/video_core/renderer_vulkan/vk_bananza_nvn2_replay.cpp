@@ -685,9 +685,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
     auto* source = FindImage(op.textures[0], true);
     if (!source || (source->aspects != VK_IMAGE_ASPECT_COLOR_BIT &&
                     source->aspects != VK_IMAGE_ASPECT_DEPTH_BIT) ||
-        !(source->aspects == VK_IMAGE_ASPECT_COLOR_BIT
-              ? PrepareSampledImage(*source, op.textures[0], submission)
-              : source->initialized)) {
+        !PrepareSampledImage(*source, op.textures[0], submission)) {
         reject("copy source unavailable");
         return;
     }
@@ -1148,7 +1146,7 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
         upload_size = (upload_size + alignment - 1) / alignment * alignment;
         copies.push_back({
             .bufferOffset = upload_size,
-            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, image.layers},
+            .imageSubresource = {image.aspects, level, 0, image.layers},
             .imageExtent = {width, height, depth},
         });
         const auto upload_stride = decode_astc ? size_t{width} * height * depth * 4
@@ -1557,7 +1555,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         return std::nullopt;
     }
     const bool color = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
-    if (!(color ? PrepareSampledImage(*image, tex, submission) : image->initialized)) {
+    if (!PrepareSampledImage(*image, tex, submission)) {
         TraceImage("missing sampled snapshot", tex, bound_program->serial);
         if (trace_images && draw_diagnostics.emplace(bound_program->serial,
                                                       "sample snapshot detail").second) {
@@ -1751,6 +1749,10 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
 
 bool BananzaNvn2Replay::PrepareSampledImage(Image& image, const Texture& texture,
                                            const Submission& submission) {
+    if (image.aspects != VK_IMAGE_ASPECT_COLOR_BIT && image.format != VK_FORMAT_D16_UNORM &&
+        image.format != VK_FORMAT_D32_SFLOAT) {
+        return image.initialized;
+    }
     if (!image.gpu_written && image.checked_submission != submission.sequence) {
         const auto data = submission.texture_snapshots.find(texture.serial);
         if (data != submission.texture_snapshots.end()) {

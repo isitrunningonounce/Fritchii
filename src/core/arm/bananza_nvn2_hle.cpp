@@ -615,7 +615,7 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                                 Queue& queue) {
     batch.guest_memory = &memory;
     constexpr u64 MaxBufferBytes = 96ULL << 20;
-    constexpr u64 MaxTextureBytes = 96ULL << 20;
+    constexpr u64 MaxTextureBytes = 128ULL << 20;
     constexpr u64 MaxRange = 8ULL << 20;
     u64 buffer_bytes{};
     u64 texture_bytes{};
