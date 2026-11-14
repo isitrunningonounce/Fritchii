@@ -7,11 +7,16 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
 #include "core/arm/bananza_nvn2_resources.h"
+
+namespace Core::Memory {
+class Memory;
+}
 
 namespace Core::BananzaNvn2Commands {
 
@@ -58,7 +63,27 @@ enum class ReplayOp : u8 {
     DrawIndexedBaseVertex,
     DrawIndexedInstanced,
     DrawInstanced,
+    DrawIndirect,
+    DrawIndexedIndirect,
     Dispatch,
+    SignalEvent,
+    WaitEvent,
+    ReportCounter,
+    ResetCounter,
+    SetRenderEnable,
+    SetRenderEnableConditional,
+    BindStorageBuffer,
+    BindStorageBuffers,
+    BindImage,
+    PushComputeConstants,
+    CopyBufferToTexture,
+    SetCopyRowStride,
+    SetDepthClamp,
+    SetRasterizerDiscard,
+    SetPolygonOffsetClamp,
+    SetViewports,
+    SetScissors,
+    SetDepthRanges,
 };
 
 struct Operation {
@@ -100,6 +125,7 @@ struct Submission {
 
     u64 sequence{};
     u64 queue{};
+    u64 submitted_ns{};
     bool depth_minus_one_to_one{};
     bool origin_lower_left{};
     std::vector<u64> handles;
@@ -107,12 +133,19 @@ struct Submission {
     u64 command_count{};
     u64 payload_bytes{};
     std::map<std::pair<u64, u64>, std::vector<u8>> buffer_snapshots;
+    std::map<std::pair<u64, u64>, u64> storage_addresses;
+    std::map<u64, u64> unsized_storage_sizes;
+    std::map<u64, u64> indirect_index_sizes;
+    std::map<std::tuple<u64, u64, u64>, std::pair<u64, u64>> indirect_index_slices;
+    std::map<u64, u64> indirect_reset_addresses;
     std::map<std::pair<u64, u64>, std::vector<u8>> deferred_data;
     std::unordered_map<u64, std::unordered_map<u32, BananzaNvn2Hle::ResourceTextureDescriptor>>
         texture_descriptors;
     std::unordered_map<u64, std::unordered_map<u32, BananzaNvn2Hle::ResourceSamplerInfo>>
         sampler_descriptors;
     std::map<u64, std::vector<u8>> texture_snapshots;
+    Memory::Memory* guest_memory{};
+    std::map<u64, u64> event_addresses;
 };
 
 // One instance belongs to one guest process. Guest pointers are opaque addresses, never host pointers.

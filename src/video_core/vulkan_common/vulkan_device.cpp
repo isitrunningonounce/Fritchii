@@ -1681,7 +1681,8 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
 
     // VK_EXT_descriptor_buffer
-    extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer;
+    extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer &&
+                                   std::getenv("ENABLE_VULKAN_RENDERDOC_CAPTURE") == nullptr;
     RemoveExtensionFeatureIfUnsuitable(extensions.descriptor_buffer, features.descriptor_buffer,
                                        VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
 

@@ -125,7 +125,8 @@ public:
     void CapturePresent(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
                         u32 height, GPUVAddr address);
     void CaptureNvn2Input(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
-                          u32 height, GPUVAddr address);
+                          u32 height, GPUVAddr address, VkFormat depth_format = VK_FORMAT_UNDEFINED,
+                          u32 level = 0, u32 layer = 0, u64 program = 0);
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
     void TickFrame();

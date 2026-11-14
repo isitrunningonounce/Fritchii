@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <utility>
@@ -17,6 +19,7 @@
 #include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_resources.h"
 #include "core/memory.h"
+#include "video_core/native_indirect_reset.h"
 
 namespace Core::BananzaNvn2Hle {
 namespace {
@@ -156,12 +159,18 @@ bool TransferTexels(Memory::Memory& memory, const ResourceTextureInfo& texture,
         const u8 flags = (*view)[7];
         if (flags & 1) {
             level = (*view)[4];
-            if (!(*view)[5] || !Fits(level, (*view)[5], d.levels)) return false;
+            if (level >= d.levels || ((*view)[5] && !Fits(level, (*view)[5], d.levels))) {
+                return false;
+            }
         }
         if (flags & 2) {
             first_layer = u32{(*view)[0]} | (u32{(*view)[1]} << 8);
             view_layers = u32{(*view)[2]} | (u32{(*view)[3]} << 8);
-            if (!view_layers || !Fits(first_layer, view_layers, texture.layout.layers)) return false;
+            if (first_layer >= texture.layout.layers) return false;
+            if (!view_layers) {
+                view_layers = texture.layout.layers - first_layer;
+            }
+            if (!Fits(first_layer, view_layers, texture.layout.layers)) return false;
         }
         if ((flags & 4) && memory.Read32(x[1] + 8) != d.format) return false;
         if ((flags & 0x20) && (*view)[6] != d.target) return false;
@@ -553,9 +562,22 @@ std::optional<u64> Resources::HandleTexture(Memory::Memory& memory, std::string_
     if (name == "nvnTextureWriteTexels" || name == "nvnTextureWriteTexelsStrided" ||
         name == "nvnTextureReadTexels" || name == "nvnTextureReadTexelsStrided") {
         const auto pool = find_pool ? find_pool(texture.pool) : std::nullopt;
-        if (!pool || pool->gpu_address != texture.storage.gpu_address ||
-            !TransferTexels(memory, texture, call, name.starts_with("nvnTextureWrite"),
-                            name.ends_with("Strided"), resolve_gpu)) {
+        const bool write = name.starts_with("nvnTextureWrite");
+        const bool transferred = pool && pool->gpu_address == texture.storage.gpu_address &&
+                                 TransferTexels(memory, texture, call, write,
+                                                name.ends_with("Strided"), resolve_gpu);
+        static const bool trace = [] {
+            const char* flag = std::getenv("EDEN_NX2_NVN_TRACE_IMAGES");
+            return flag && *flag == '1';
+        }();
+        if (trace && write && d.width >= 900 && ValidRange(memory, x[2], 24)) {
+            LOG_INFO(Core_ARM, "NVN 2 texture write {:#x} {}x{} region {} {} {} {} {} {}, success {}",
+                     texture.storage.gpu_address + texture.offset, d.width, d.height,
+                     memory.Read32(x[2]), memory.Read32(x[2] + 4), memory.Read32(x[2] + 8),
+                     memory.Read32(x[2] + 12), memory.Read32(x[2] + 16),
+                     memory.Read32(x[2] + 20), transferred);
+        }
+        if (!transferred) {
             return std::nullopt;
         }
         return 0;
@@ -955,6 +977,12 @@ std::shared_ptr<const ResourceProgramInfo> Resources::StageProgram(
         }
         if (stages & (1U << copy.stage)) return reject("duplicate stage in shader variant");
         stages |= 1U << copy.stage;
+        if (copy.stage == 0 &&
+            copy.code_size >= copy.header_size + sizeof(VideoCommon::NativeIndirectReset::Program)) {
+            std::array<u32, VideoCommon::NativeIndirectReset::Program.size()> instructions;
+            std::memcpy(instructions.data(), copy.code.data() + copy.header_size, sizeof(instructions));
+            snapshot->resets_indirect_draws = VideoCommon::NativeIndirectReset::Matches(instructions);
+        }
         total_bytes += u64{control_size} + storage_size;
         snapshot->shaders.push_back(std::move(copy));
     }

@@ -114,9 +114,13 @@ private:
         u64 fence{};
         u64 texture_pool{};
         u64 sampler_pool{};
+        u64 copy_row_stride{};
         std::array<std::pair<u64, u64>, 32> vertex_ranges{};
-        std::array<std::array<std::pair<u64, u64>, 32>, 2> uniform_ranges{};
-        std::array<std::array<u64, 64>, 2> texture_handles{};
+        std::array<std::array<std::pair<u64, u64>, 32>, 6> uniform_ranges{};
+        std::array<std::array<std::pair<u64, u64>, 32>, 6> storage_ranges{};
+        std::array<std::array<u64, 64>, 6> texture_handles{};
+        std::array<std::array<u64, 32>, 6> image_handles{};
+        bool resets_indirect_draws{};
         u32 flags{};
         bool rejected_submit{};
     };

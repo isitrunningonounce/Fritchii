@@ -58,6 +58,7 @@ struct ResourceProgramInfo {
     u64 device{};
     u64 serial{};
     std::vector<ResourceShaderInfo> shaders;
+    bool resets_indirect_draws{};
 };
 
 struct ResourceSamplerInfo {

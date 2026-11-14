@@ -2,17 +2,24 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 
 #include "common/logging.h"
+#include "common/cityhash.h"
 #include "common/swap.h"
 #include "core/arm/bananza_nvn2_commands.h"
+#include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/profile.h"
+#include "video_core/native_indirect_reset.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_replay.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_shaders.h"
@@ -29,6 +36,7 @@ namespace {
 
 using Core::BananzaNvn2Commands::ReplayOp;
 using VideoCore::Surface::PixelFormat;
+constexpr std::array<u32, 3> GraphicsStorageBase{0x110, 0x510, 0x410};
 
 struct ColorFormat {
     VkFormat vk;
@@ -47,22 +55,60 @@ std::optional<ColorFormat> FindColorFormat(u32 format) {
     switch (format) {
     case 0x01:
         return ColorFormat{VK_FORMAT_R8_UNORM, PixelFormat::R8_UNORM, 1};
+    case 0x02:
+        return ColorFormat{VK_FORMAT_R8_SNORM, PixelFormat::R8_SNORM, 1};
+    case 0x03:
+        return ColorFormat{VK_FORMAT_R8_UINT, PixelFormat::R8_UINT, 1};
+    case 0x04:
+        return ColorFormat{VK_FORMAT_R8_SINT, PixelFormat::R8_SINT, 1};
     case 0x05:
         return ColorFormat{VK_FORMAT_R16_SFLOAT, PixelFormat::R16_FLOAT, 2};
     case 0x06:
         return ColorFormat{VK_FORMAT_R16_UNORM, PixelFormat::R16_UNORM, 2};
+    case 0x07:
+        return ColorFormat{VK_FORMAT_R16_SNORM, PixelFormat::R16_SNORM, 2};
+    case 0x08:
+        return ColorFormat{VK_FORMAT_R16_UINT, PixelFormat::R16_UINT, 2};
+    case 0x09:
+        return ColorFormat{VK_FORMAT_R16_SINT, PixelFormat::R16_SINT, 2};
     case 0x0a:
         return ColorFormat{VK_FORMAT_R32_SFLOAT, PixelFormat::R32_FLOAT, 4};
+    case 0x0b:
+        return ColorFormat{VK_FORMAT_R32_UINT, PixelFormat::R32_UINT, 4};
+    case 0x0c:
+        return ColorFormat{VK_FORMAT_R32_SINT, PixelFormat::R32_SINT, 4};
     case 0x0d:
         return ColorFormat{VK_FORMAT_R8G8_UNORM, PixelFormat::R8G8_UNORM, 2};
+    case 0x0e:
+        return ColorFormat{VK_FORMAT_R8G8_SNORM, PixelFormat::R8G8_SNORM, 2};
+    case 0x0f:
+        return ColorFormat{VK_FORMAT_R8G8_UINT, PixelFormat::R8G8_UINT, 2};
+    case 0x10:
+        return ColorFormat{VK_FORMAT_R8G8_SINT, PixelFormat::R8G8_SINT, 2};
     case 0x11:
         return ColorFormat{VK_FORMAT_R16G16_SFLOAT, PixelFormat::R16G16_FLOAT, 4};
     case 0x12:
         return ColorFormat{VK_FORMAT_R16G16_UNORM, PixelFormat::R16G16_UNORM, 4};
+    case 0x13:
+        return ColorFormat{VK_FORMAT_R16G16_SNORM, PixelFormat::R16G16_SNORM, 4};
+    case 0x14:
+        return ColorFormat{VK_FORMAT_R16G16_UINT, PixelFormat::R16G16_UINT, 4};
+    case 0x15:
+        return ColorFormat{VK_FORMAT_R16G16_SINT, PixelFormat::R16G16_SINT, 4};
     case 0x16:
         return ColorFormat{VK_FORMAT_R32G32_SFLOAT, PixelFormat::R32G32_FLOAT, 8};
+    case 0x17:
+        return ColorFormat{VK_FORMAT_R32G32_UINT, PixelFormat::R32G32_UINT, 8};
+    case 0x18:
+        return ColorFormat{VK_FORMAT_R32G32_SINT, PixelFormat::R32G32_SINT, 8};
     case 0x25:
         return ColorFormat{VK_FORMAT_R8G8B8A8_UNORM, PixelFormat::A8B8G8R8_UNORM, 4};
+    case 0x26:
+        return ColorFormat{VK_FORMAT_R8G8B8A8_SNORM, PixelFormat::A8B8G8R8_SNORM, 4};
+    case 0x27:
+        return ColorFormat{VK_FORMAT_R8G8B8A8_UINT, PixelFormat::A8B8G8R8_UINT, 4};
+    case 0x28:
+        return ColorFormat{VK_FORMAT_R8G8B8A8_SINT, PixelFormat::A8B8G8R8_SINT, 4};
     case 0x38:
         return ColorFormat{VK_FORMAT_R8G8B8A8_SRGB, PixelFormat::A8B8G8R8_SRGB, 4};
     case 0x9a:
@@ -73,8 +119,18 @@ std::optional<ColorFormat> FindColorFormat(u32 format) {
         return ColorFormat{VK_FORMAT_R16G16B16A16_SFLOAT, PixelFormat::R16G16B16A16_FLOAT, 8};
     case 0x2a:
         return ColorFormat{VK_FORMAT_R16G16B16A16_UNORM, PixelFormat::R16G16B16A16_UNORM, 8};
+    case 0x2b:
+        return ColorFormat{VK_FORMAT_R16G16B16A16_SNORM, PixelFormat::R16G16B16A16_SNORM, 8};
+    case 0x2c:
+        return ColorFormat{VK_FORMAT_R16G16B16A16_UINT, PixelFormat::R16G16B16A16_UINT, 8};
+    case 0x2d:
+        return ColorFormat{VK_FORMAT_R16G16B16A16_SINT, PixelFormat::R16G16B16A16_SINT, 8};
     case 0x2e:
         return ColorFormat{VK_FORMAT_R32G32B32A32_SFLOAT, PixelFormat::R32G32B32A32_FLOAT, 16};
+    case 0x2f:
+        return ColorFormat{VK_FORMAT_R32G32B32A32_UINT, PixelFormat::R32G32B32A32_UINT, 16};
+    case 0x30:
+        return ColorFormat{VK_FORMAT_R32G32B32A32_SINT, PixelFormat::R32G32B32A32_SINT, 16};
     case 0x31:
         return ColorFormat{VK_FORMAT_S8_UINT, PixelFormat::S8_UINT, 1, VK_IMAGE_ASPECT_STENCIL_BIT};
     case 0x32:
@@ -92,6 +148,8 @@ std::optional<ColorFormat> FindColorFormat(u32 format) {
                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT};
     case 0x3d:
         return ColorFormat{VK_FORMAT_A2B10G10R10_UNORM_PACK32, PixelFormat::A2B10G10R10_UNORM, 4};
+    case 0x3e:
+        return ColorFormat{VK_FORMAT_A2B10G10R10_UINT_PACK32, PixelFormat::A2B10G10R10_UINT, 4};
     case 0x3f:
         return ColorFormat{VK_FORMAT_B10G11R11_UFLOAT_PACK32, PixelFormat::B10G11R11_FLOAT, 4};
     case 0x41:
@@ -158,21 +216,6 @@ bool HasCompatibleFormat(u32 format, u32 base) {
            ((format == 0x9a || format == 0x9c) && (base == 0x9a || base == 0x9c));
 }
 
-bool IsBaseView(std::span<const u8> data, const Core::BananzaNvn2Hle::TextureDescription& d,
-                bool allow_format_view = false) {
-    if (data.size() != 16) {
-        return false;
-    }
-    const u8 flags = data[7];
-    const u32 format = ViewFormat(data, d.format);
-    return (!(flags & 1) || data[4] == 0) &&
-           (!(flags & 2) || (data[0] == 0 && data[1] == 0)) &&
-           (format == d.format || (allow_format_view && HasCompatibleFormat(format, d.format))) &&
-           (!(flags & 8) || std::ranges::equal(data.subspan(12, 4), d.swizzle)) &&
-           (!(flags & 0x10) || (flags >> 6) == d.depth_mode) &&
-           (!(flags & 0x20) || data[6] == d.target);
-}
-
 struct CopyRegion {
     u32 x;
     u32 y;
@@ -182,26 +225,54 @@ struct CopyRegion {
     u32 depth;
 };
 
-bool Fits(CopyRegion region, VkExtent2D extent) {
-    return !region.z && region.depth == 1 && region.width && region.height &&
-           region.x <= extent.width && region.width <= extent.width - region.x &&
-           region.y <= extent.height && region.height <= extent.height - region.y;
-}
-
 VkFormat VertexFormat(u32 format) {
     switch (format) {
-    case 0x01: return VK_FORMAT_R8_UNORM;
-    case 0x0a: return VK_FORMAT_R32_SFLOAT;
-    case 0x0d: return VK_FORMAT_R8G8_UNORM;
-    case 0x11: return VK_FORMAT_R16G16_SFLOAT;
-    case 0x16: return VK_FORMAT_R32G32_SFLOAT;
+    case 0x02: return VK_FORMAT_R8_SNORM;
+    case 0x03: return VK_FORMAT_R8_UINT;
+    case 0x04: return VK_FORMAT_R8_SINT;
+    case 0x07: return VK_FORMAT_R16_SNORM;
+    case 0x08: return VK_FORMAT_R16_UINT;
+    case 0x09: return VK_FORMAT_R16_SINT;
+    case 0x0b: return VK_FORMAT_R32_UINT;
+    case 0x0c: return VK_FORMAT_R32_SINT;
+    case 0x0e: return VK_FORMAT_R8G8_SNORM;
+    case 0x0f: return VK_FORMAT_R8G8_UINT;
+    case 0x10: return VK_FORMAT_R8G8_SINT;
+    case 0x13: return VK_FORMAT_R16G16_SNORM;
+    case 0x14: return VK_FORMAT_R16G16_UINT;
+    case 0x15: return VK_FORMAT_R16G16_SINT;
+    case 0x17: return VK_FORMAT_R32G32_UINT;
+    case 0x18: return VK_FORMAT_R32G32_SINT;
     case 0x19: return VK_FORMAT_R8G8B8_UNORM;
+    case 0x1a: return VK_FORMAT_R8G8B8_SNORM;
+    case 0x1b: return VK_FORMAT_R8G8B8_UINT;
+    case 0x1c: return VK_FORMAT_R8G8B8_SINT;
     case 0x1d: return VK_FORMAT_R16G16B16_SFLOAT;
+    case 0x1e: return VK_FORMAT_R16G16B16_UNORM;
+    case 0x1f: return VK_FORMAT_R16G16B16_SNORM;
+    case 0x20: return VK_FORMAT_R16G16B16_UINT;
+    case 0x21: return VK_FORMAT_R16G16B16_SINT;
     case 0x22: return VK_FORMAT_R32G32B32_SFLOAT;
-    case 0x25: return VK_FORMAT_R8G8B8A8_UNORM;
-    case 0x29: return VK_FORMAT_R16G16B16A16_SFLOAT;
-    case 0x2e: return VK_FORMAT_R32G32B32A32_SFLOAT;
-    default: return VK_FORMAT_UNDEFINED;
+    case 0x23: return VK_FORMAT_R32G32B32_UINT;
+    case 0x24: return VK_FORMAT_R32G32B32_SINT;
+    case 0x26: return VK_FORMAT_R8G8B8A8_SNORM;
+    case 0x27: return VK_FORMAT_R8G8B8A8_UINT;
+    case 0x28: return VK_FORMAT_R8G8B8A8_SINT;
+    case 0x2b: return VK_FORMAT_R16G16B16A16_SNORM;
+    case 0x2c: return VK_FORMAT_R16G16B16A16_UINT;
+    case 0x2d: return VK_FORMAT_R16G16B16A16_SINT;
+    case 0x2f: return VK_FORMAT_R32G32B32A32_UINT;
+    case 0x30: return VK_FORMAT_R32G32B32A32_SINT;
+    case 0x3e: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case 0x6a: return VK_FORMAT_A2B10G10R10_SINT_PACK32;
+    case 0x6b: return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
+    case 0x6c: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
+    default: {
+        const auto color = FindColorFormat(format);
+        return color && color->aspects == VK_IMAGE_ASPECT_COLOR_BIT ? color->vk
+                                                                   : VK_FORMAT_UNDEFINED;
+    }
     }
 }
 
@@ -257,15 +328,21 @@ BananzaNvn2Replay::BananzaNvn2Replay(const Device& device_, MemoryAllocator& all
 BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, bool create) {
     const auto& d = texture.description;
     const u32 layers = texture.layout.layers;
-    if (!texture.serial || !texture.storage.gpu_address || (d.target != 1 && d.target != 4) ||
+    const bool volume = d.target == 2;
+    const u32 depth = volume ? d.depth : 1;
+    const auto& limits = device.GetPhysical().GetProperties().limits;
+    if (!texture.serial || !texture.storage.gpu_address ||
+        (d.target != 1 && !volume && d.target != 4 && d.target != 8 && d.target != 9) ||
         !layers || layers > device.GetPhysical().GetProperties().limits.maxImageArrayLayers ||
-        d.samples > 1 ||
-        !d.width || !d.height || d.width > 4096 || d.height > 4096 || !d.levels ||
-        d.levels > static_cast<u32>(std::bit_width(std::max(d.width, d.height)))) {
+        d.samples > 1 || !depth || !d.width || !d.height ||
+        d.width > (volume ? limits.maxImageDimension3D : limits.maxImageDimension2D) ||
+        d.height > (volume ? limits.maxImageDimension3D : limits.maxImageDimension2D) ||
+        (volume && depth > limits.maxImageDimension3D) || !d.levels ||
+        d.levels > static_cast<u32>(std::bit_width(std::max({d.width, d.height, depth})))) {
         return nullptr;
     }
     const ImageKey key{texture.storage.gpu_address + texture.offset, d.width, d.height, d.format,
-                       d.levels, d.target, layers};
+                       d.levels, d.target, layers, depth};
     if (const auto it = images.find(key); it != images.end()) {
         return &it->second;
     }
@@ -288,10 +365,20 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
                                                       VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
                                                       FormatType::Optimal) &&
                             !(d.format >= 0x79 && d.format <= 0x94);
+    const auto block = Core::BananzaNvn2Hle::GetTextureFormatBlock(d.format);
+    const bool storage = !depth_stencil && block && block->width == 1 &&
+                         device.IsFormatSupported(format->vk, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                                  FormatType::Optimal);
     const u64 bytes = std::max<u64>(texture.layout.size,
-                                    u64{d.width} * d.height * format->bytes * layers);
-    constexpr u64 MaxImageBytes = 384ULL << 20;
-    if (bytes > MaxImageBytes - image_bytes) {
+                                    u64{d.width} * d.height * format->bytes * layers * depth);
+    const u64 max_image_bytes = std::clamp<u64>(device.GetDeviceLocalMemory() / 4,
+                                                384ULL << 20, 4ULL << 30);
+    if (bytes > max_image_bytes - image_bytes) {
+        if (!image_budget_logged) {
+            image_budget_logged = true;
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 image limit reached at {} MiB for format {:#x}, {}x{}",
+                        image_bytes >> 20, d.format, d.width, d.height);
+        }
         return nullptr;
     }
     const VkExtent2D extent{d.width, d.height};
@@ -299,32 +386,80 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
                                 d.format == 0x9a || d.format == 0x9c;
     auto image = allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .flags = mutable_format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0U,
-        .imageType = VK_IMAGE_TYPE_2D,
+        .flags = (mutable_format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                                       VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0U) |
+                 (d.target == 8 || d.target == 9 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U) |
+                 (volume && attachment ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0U),
+        .imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
         .format = format->vk,
-        .extent = {extent.width, extent.height, 1},
+        .extent = {extent.width, extent.height, depth},
         .mipLevels = d.levels,
         .arrayLayers = layers,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                  VK_IMAGE_USAGE_SAMPLED_BIT | (attachment ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0U) |
-                 (depth_stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0U),
+                 (depth_stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0U) |
+                 (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0U),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     });
+    if (trace_images) {
+        image.SetObjectNameEXT(fmt::format("NVN 2 {:#x} format {:#x} {}x{}",
+                                           std::get<0>(key), d.format, d.width, d.height).c_str());
+    }
     auto view = device.GetLogical().CreateImageView({
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = *image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .viewType = volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
         .format = format->vk,
         .subresourceRange = {format->aspects, 0, 1, 0, 1},
     });
     image_bytes += bytes;
     return &images.emplace(key, Image{std::move(image), std::move(view), extent, format->vk,
-                                      format->surface, d.levels, layers, attachment,
+                                      format->surface, d.levels, layers, depth, volume, attachment, storage,
                                       format->aspects})
                 .first->second;
+}
+
+VkImageView BananzaNvn2Replay::GetAttachmentView(Image& image, const AttachmentView& view) {
+    if (!view.format || view.level >= image.levels) {
+        return VK_NULL_HANDLE;
+    }
+    const u32 layer_count = image.volume ? std::max(1U, image.depth >> view.level)
+                                          : image.layers;
+    if (view.layer >= layer_count || !view.layers || view.layers > layer_count - view.layer) {
+        return VK_NULL_HANDLE;
+    }
+    if (!image.volume && view.format == image.format && !view.level && !view.layer &&
+        view.layers == 1) {
+        return *image.view;
+    }
+    const auto key = std::tuple{view.format, view.level, view.layer, view.layers};
+    auto found = image.attachment_views.find(key);
+    if (found != image.attachment_views.end()) {
+        return *found->second;
+    }
+    const bool color = image.aspects == VK_IMAGE_ASPECT_COLOR_BIT;
+    const auto feature = color ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+                               : VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (!device.IsFormatSupported(view.format, feature, FormatType::Optimal)) {
+        return VK_NULL_HANDLE;
+    }
+    const VkImageViewUsageCreateInfo usage{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+        .usage = color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                       : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    };
+    auto host_view = device.GetLogical().CreateImageView({
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = &usage,
+        .image = *image.image,
+        .viewType = view.layers == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+        .format = view.format,
+        .subresourceRange = {image.aspects, view.level, 1, view.layer, view.layers},
+    });
+    return *image.attachment_views.emplace(key, std::move(host_view)).first->second;
 }
 
 void BananzaNvn2Replay::Initialize(Image& image) {
@@ -363,33 +498,90 @@ void BananzaNvn2Replay::Barrier() {
     });
 }
 
+VkRect2D BananzaNvn2Replay::ScissorFor(VkExtent2D extent) const {
+    if (!has_scissor) {
+        return {{}, extent};
+    }
+    const s64 left = std::clamp<s64>(scissor.offset.x, 0, extent.width);
+    const s64 top = std::clamp<s64>(scissor.offset.y, 0, extent.height);
+    const s64 right = std::clamp<s64>(s64{scissor.offset.x} + scissor.extent.width, left,
+                                      extent.width);
+    const s64 bottom = std::clamp<s64>(s64{scissor.offset.y} + scissor.extent.height, top,
+                                       extent.height);
+    const s64 y = origin_lower_left ? extent.height - bottom : top;
+    return {{static_cast<s32>(left), static_cast<s32>(y)},
+            {static_cast<u32>(right - left), static_cast<u32>(bottom - top)}};
+}
+
 void BananzaNvn2Replay::ClearColor(const Operation& op) {
-    if (op.args.size() != 2 || op.payload.size() != 16 || op.args[0] >= colors.size() ||
-        op.args[1] != 0xf || !colors[op.args[0]] || !base_color_views[op.args[0]] ||
-        op.replay != ReplayOp::ClearColor) {
+    if (!render_enabled || op.args.size() != 2 || op.payload.size() != 16 || op.args[0] >= colors.size() ||
+        op.args[1] != 0xf || !colors[op.args[0]] || !color_views[op.args[0]].format) {
         return;
     }
     auto* image = FindImage(*colors[op.args[0]], true);
     if (!image || !image->color_attachment) {
         return;
     }
+    const auto& view = color_views[op.args[0]];
+    const auto attachment = GetAttachmentView(*image, view);
+    if (!attachment) {
+        return;
+    }
+    const VkExtent2D extent{std::max(1U, image->extent.width >> view.level),
+                            std::max(1U, image->extent.height >> view.level)};
+    const VkRect2D rect = ScissorFor(extent);
+    if (!rect.extent.width || !rect.extent.height) {
+        return;
+    }
+    const bool whole = rect.extent.width == extent.width && rect.extent.height == extent.height;
+    const bool initialized = image->initialized;
     Initialize(*image);
     Barrier();
     VkClearColorValue value{};
-    std::memcpy(value.float32, op.payload.data(), op.payload.size());
+    std::memcpy(&value, op.payload.data(), op.payload.size());
     TraceImage("clear", *colors[op.args[0]]);
-    scheduler.Record([handle = *image->image, value](vk::CommandBuffer cmdbuf) {
-        cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, value, {BaseColorRange});
+    image->gpu_written = true;
+    scheduler.Record([attachment, value, extent, rect, whole, initialized,
+                      layers = view.layers](vk::CommandBuffer cmdbuf) {
+        const VkRenderingAttachmentInfo color{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = attachment,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .loadOp = whole ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                            : initialized ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                          : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.color = value},
+        };
+        cmdbuf.BeginRendering({
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = {{}, extent},
+            .layerCount = layers,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color,
+        });
+        if (!whole) {
+            const VkClearAttachment clear{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .clearValue = {.color = value},
+            };
+            cmdbuf.ClearAttachments({clear}, {VkClearRect{rect, 0, layers}});
+        }
+        cmdbuf.EndRendering();
     });
     ++clears;
 }
 
 void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
-    if (!depth_texture || op.args.size() != 3 || op.payload.size() != sizeof(float)) {
+    if (!render_enabled || !depth_texture || op.args.size() != 3 || op.payload.size() != sizeof(float)) {
         return;
     }
     auto* image = FindImage(*depth_texture, true);
     if (!image || image->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+        return;
+    }
+    const auto attachment = GetAttachmentView(*image, depth_view);
+    if (!attachment) {
         return;
     }
     const VkImageAspectFlags mask = ((op.args[0] & 255) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0U) |
@@ -400,29 +592,18 @@ void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
     }
     VkClearDepthStencilValue value{.stencil = static_cast<u32>(op.args[1]) & 255};
     std::memcpy(&value.depth, op.payload.data(), sizeof(value.depth));
-    VkRect2D rect{{}, image->extent};
-    if (has_scissor) {
-        const s64 left = std::clamp<s64>(scissor.offset.x, 0, rect.extent.width);
-        const s64 top = std::clamp<s64>(scissor.offset.y, 0, rect.extent.height);
-        const s64 right = std::clamp<s64>(s64{scissor.offset.x} + scissor.extent.width,
-                                          left, rect.extent.width);
-        const s64 bottom = std::clamp<s64>(s64{scissor.offset.y} + scissor.extent.height,
-                                           top, rect.extent.height);
-        rect = {{static_cast<s32>(left), static_cast<s32>(top)},
-                {static_cast<u32>(right - left), static_cast<u32>(bottom - top)}};
-    }
+    const VkExtent2D extent{std::max(1U, image->extent.width >> depth_view.level),
+                            std::max(1U, image->extent.height >> depth_view.level)};
+    const VkRect2D rect = ScissorFor(extent);
     if (!rect.extent.width || !rect.extent.height) {
         return;
     }
-    if (origin_lower_left) {
-        rect.offset.y = static_cast<s32>(image->extent.height) - rect.offset.y -
-                        static_cast<s32>(rect.extent.height);
-    }
     const bool initialized = image->initialized;
     Initialize(*image);
+    image->gpu_written = true;
     Barrier();
-    scheduler.Record([view = *image->view, rect, aspects, image_aspects = image->aspects, value,
-                      initialized, extent = image->extent](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([view = attachment, rect, aspects, image_aspects = image->aspects, value,
+                      initialized, extent, layers = depth_view.layers](vk::CommandBuffer cmdbuf) {
         const VkRenderingAttachmentInfo target{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = view,
@@ -433,46 +614,171 @@ void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
         cmdbuf.BeginRendering({
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
             .renderArea = {{}, extent},
-            .layerCount = 1,
+            .layerCount = layers,
             .pDepthAttachment = image_aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? &target : nullptr,
             .pStencilAttachment = image_aspects & VK_IMAGE_ASPECT_STENCIL_BIT ? &target : nullptr,
         });
         const VkClearAttachment clear{.aspectMask = aspects, .clearValue = {.depthStencil = value}};
-        const VkClearRect clear_rect{.rect = rect, .layerCount = 1};
+        const VkClearRect clear_rect{.rect = rect, .layerCount = layers};
         cmdbuf.ClearAttachments({clear}, {clear_rect});
         cmdbuf.EndRendering();
     });
     ++clears;
 }
 
-void BananzaNvn2Replay::CopyTexture(const Operation& op) {
+void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submission) {
     if (op.textures.size() != 2 || op.args.size() != 5 ||
-        op.payload.size() != 32 + 2 * sizeof(CopyRegion) ||
-        (op.args[2] & ~3ULL) ||
-        (op.args[3] && !IsBaseView(std::span{op.payload}.first(16), op.textures[0].description)) ||
-        (op.args[4] && !IsBaseView(std::span{op.payload}.subspan(16, 16), op.textures[1].description))) {
+        op.payload.size() != 32 + 2 * sizeof(CopyRegion)) {
         return;
     }
     const auto source_address = op.textures[0].storage.gpu_address + op.textures[0].offset;
+    const auto reject = [&](const char* reason) {
+        TraceImage(reason, op.textures[1], source_address);
+    };
     TraceImage("copy request", op.textures[1], source_address);
-    auto* source = FindImage(op.textures[0], false);
-    if (!source || !source->initialized || source->aspects != VK_IMAGE_ASPECT_COLOR_BIT) {
-        TraceImage("copy source unavailable", op.textures[1], source_address);
+    if (op.args[2] & ~0x1fULL) {
+        reject("copy flags unsupported");
+        return;
+    }
+    struct CopyView {
+        u32 level;
+        u32 layer;
+        bool volume;
+        CopyRegion region;
+    };
+    const auto decode = [&](size_t index) -> std::optional<CopyView> {
+        const auto& texture = op.textures[index];
+        const auto& d = texture.description;
+        const auto view = std::span{op.payload}.subspan(16 * index, 16);
+        const u8 flags = op.args[3 + index] ? view[7] : 0;
+        const u32 level = flags & 1 ? view[4] : 0;
+        const u32 layer = flags & 2 ? u32{view[0]} | (u32{view[1]} << 8) : 0;
+        if (level >= d.levels || ((flags & 4) && ViewFormat(view, d.format) != d.format) ||
+            ((flags & 0x20) && view[6] != d.target)) {
+            return std::nullopt;
+        }
+        CopyRegion region{};
+        std::memcpy(&region, op.payload.data() + 32 + index * sizeof(region), sizeof(region));
+        const u32 width = std::max(1U, d.width >> level);
+        const u32 height = std::max(1U, d.height >> level);
+        const bool volume = d.target == 2;
+        const u32 slices = volume ? std::max(1U, d.depth >> level) : texture.layout.layers;
+        if (!region.width || !region.height || !region.depth || region.x > width ||
+            region.width > width - region.x || region.y > height ||
+            region.height > height - region.y || layer >= slices ||
+            region.z >= slices - layer || region.depth > slices - layer - region.z) {
+            return std::nullopt;
+        }
+        return CopyView{level, layer + region.z, volume, region};
+    };
+    const auto source_view = decode(0);
+    const auto dest_view = decode(1);
+    if (!source_view || !dest_view || source_view->volume != dest_view->volume ||
+        source_view->region.depth != dest_view->region.depth) {
+        reject("copy subresource unsupported");
+        return;
+    }
+    const auto& from = source_view->region;
+    const auto& to = dest_view->region;
+    auto* source = FindImage(op.textures[0], true);
+    if (!source || (source->aspects != VK_IMAGE_ASPECT_COLOR_BIT &&
+                    source->aspects != VK_IMAGE_ASPECT_DEPTH_BIT) ||
+        !(source->aspects == VK_IMAGE_ASPECT_COLOR_BIT
+              ? PrepareSampledImage(*source, op.textures[0], submission)
+              : source->initialized)) {
+        reject("copy source unavailable");
         return;
     }
     auto* dest = FindImage(op.textures[1], true);
-    if (!dest || dest == source || dest->aspects != VK_IMAGE_ASPECT_COLOR_BIT) {
+    if (!dest || dest == source ||
+        (dest->aspects != VK_IMAGE_ASPECT_COLOR_BIT && dest->aspects != VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        reject("copy destination unsupported");
         return;
     }
-    CopyRegion from{}, to{};
-    std::memcpy(&from, op.payload.data() + 32, sizeof(from));
-    std::memcpy(&to, op.payload.data() + 32 + sizeof(from), sizeof(to));
-    if (!Fits(from, source->extent) || !Fits(to, dest->extent)) {
+    const bool flip_x = op.args[2] & 4;
+    const bool flip_y = op.args[2] & 8;
+    const bool flip_z = op.args[2] & 16;
+    const auto subresource = [](const CopyView& view, VkImageAspectFlags aspect, u32 slice) {
+        return VkImageSubresourceLayers{aspect, view.level,
+                                         view.volume ? 0U : view.layer + slice, 1};
+    };
+    const auto offset = [](const CopyView& view, u32 slice) {
+        return VkOffset3D{static_cast<s32>(view.region.x), static_cast<s32>(view.region.y),
+                          view.volume ? static_cast<s32>(view.layer + slice) : 0};
+    };
+    const auto prepare_dest = [&] {
+        if (dest->aspects == VK_IMAGE_ASPECT_COLOR_BIT && !dest->gpu_written &&
+            submission.texture_snapshots.contains(op.textures[1].serial)) {
+            if (!PrepareSampledImage(*dest, op.textures[1], submission)) {
+                return false;
+            }
+        }
+        Initialize(*dest);
+        Barrier();
+        return true;
+    };
+    if (source->aspects != dest->aspects) {
+        const bool depth_to_color =
+            (source->format == VK_FORMAT_D32_SFLOAT && dest->format == VK_FORMAT_R32_SFLOAT) ||
+            (source->format == VK_FORMAT_D16_UNORM && dest->format == VK_FORMAT_R16_UNORM);
+        if (!depth_to_color || from.width != to.width || from.height != to.height ||
+            flip_x || flip_y) {
+            reject("copy aspect conversion unsupported");
+            return;
+        }
+        const u64 bytes = u64{from.width} * from.height *
+                          (source->format == VK_FORMAT_D32_SFLOAT ? 4 : 2);
+        if (bytes > (64ULL << 20) || !prepare_dest()) {
+            return;
+        }
+        auto scratch = CreateWrappedBuffer(allocator, bytes, MemoryUsage::DeviceLocal);
+        for (u32 slice = 0; slice < to.depth; ++slice) {
+            const u32 source_slice = flip_z ? from.depth - 1 - slice : slice;
+            const VkBufferImageCopy read{
+                .imageSubresource = subresource(*source_view, VK_IMAGE_ASPECT_DEPTH_BIT, source_slice),
+                .imageOffset = offset(*source_view, source_slice),
+                .imageExtent = {from.width, from.height, 1},
+            };
+            const VkBufferImageCopy write{
+                .imageSubresource = subresource(*dest_view, VK_IMAGE_ASPECT_COLOR_BIT, slice),
+                .imageOffset = offset(*dest_view, slice),
+                .imageExtent = {to.width, to.height, 1},
+            };
+            scheduler.Record([src = *source->image, dst = *dest->image, buffer = *scratch,
+                              read, write](vk::CommandBuffer cmdbuf) {
+                const VkMemoryBarrier transfer{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       0, transfer);
+                cmdbuf.CopyImageToBuffer(src, VK_IMAGE_LAYOUT_GENERAL, buffer, {read});
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       0, transfer);
+                cmdbuf.CopyBufferToImage(buffer, dst, VK_IMAGE_LAYOUT_GENERAL, {write});
+            });
+        }
+        uploads.push_back(std::move(scratch));
+        dest->gpu_written = true;
+        TraceImage("depth copy", op.textures[1], source_address);
+        ++copies;
         return;
     }
+    const bool depth = source->aspects == VK_IMAGE_ASPECT_DEPTH_BIT;
+    const bool linear = (op.args[2] & 1) != 0;
     const bool blit = source->format != dest->format || from.width != to.width ||
-                      from.height != to.height;
-    const auto filter = op.args[2] & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+                      from.height != to.height || flip_x || flip_y;
+    if (depth && (source->format != dest->format || (blit && linear))) {
+        if (trace_images && traced_images.emplace("depth blit filter", source_address, op.args[2]).second) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 depth blit flags {:#x}, source {}x{}, destination {}x{}",
+                     op.args[2], from.width, from.height, to.width, to.height);
+        }
+        reject("depth blit unsupported");
+        return;
+    }
+    const auto filter = linear && !depth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     if (blit) {
         const VkFormatFeatureFlags source_features =
             VK_FORMAT_FEATURE_BLIT_SRC_BIT |
@@ -480,45 +786,152 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op) {
         if (!device.IsFormatSupported(source->format, source_features, FormatType::Optimal) ||
             !device.IsFormatSupported(dest->format, VK_FORMAT_FEATURE_BLIT_DST_BIT,
                                       FormatType::Optimal)) {
+            reject("copy blit format unsupported");
             return;
         }
+    } else {
+        for (size_t index = 0; index < op.textures.size(); ++index) {
+            const auto& texture = op.textures[index];
+            const auto& view = index == 0 ? *source_view : *dest_view;
+            const auto& region = view.region;
+            const u32 width = std::max(1U, texture.description.width >> view.level);
+            const u32 height = std::max(1U, texture.description.height >> view.level);
+            const auto block = Core::BananzaNvn2Hle::GetTextureFormatBlock(texture.description.format);
+            if (block && (region.x % block->width || region.y % block->height ||
+                          (region.width % block->width && region.x + region.width != width) ||
+                          (region.height % block->height && region.y + region.height != height))) {
+                reject("copy block alignment unsupported");
+                return;
+            }
+        }
     }
-    Initialize(*dest);
-    Barrier();
-    TraceImage("copy", op.textures[1], source_address);
-    if (blit) {
-        const VkImageBlit region{
-            .srcSubresource = BaseColorLayer,
-            .srcOffsets = {{static_cast<s32>(from.x), static_cast<s32>(from.y), 0},
-                           {static_cast<s32>(from.x + from.width),
-                            static_cast<s32>(from.y + from.height), 1}},
-            .dstSubresource = BaseColorLayer,
-            .dstOffsets = {{static_cast<s32>(to.x), static_cast<s32>(to.y), 0},
-                           {static_cast<s32>(to.x + to.width),
-                            static_cast<s32>(to.y + to.height), 1}},
-        };
-        scheduler.Record([src = *source->image, dst = *dest->image, region, filter](
-                             vk::CommandBuffer cmdbuf) {
-            cmdbuf.BlitImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL,
-                             {region}, filter);
-        });
-        ++copies;
+    if (!prepare_dest()) {
         return;
     }
-    const VkImageCopy copy{
-        .srcSubresource = BaseColorLayer,
-        .srcOffset = {static_cast<s32>(from.x), static_cast<s32>(from.y), 0},
-        .dstSubresource = BaseColorLayer,
-        .dstOffset = {static_cast<s32>(to.x), static_cast<s32>(to.y), 0},
-        .extent = {from.width, from.height, 1},
-    };
-    scheduler.Record([src = *source->image, dst = *dest->image, copy](vk::CommandBuffer cmdbuf) {
-        cmdbuf.CopyImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, {copy});
-    });
+    dest->gpu_written = true;
+    TraceImage("copy", op.textures[1], source_address);
+    for (u32 slice = 0; slice < to.depth; ++slice) {
+        const u32 source_slice = flip_z ? from.depth - 1 - slice : slice;
+        const auto source_offset = offset(*source_view, source_slice);
+        const auto dest_offset = offset(*dest_view, slice);
+        if (blit) {
+            VkImageBlit region{
+                .srcSubresource = subresource(*source_view, source->aspects, source_slice),
+                .srcOffsets = {source_offset,
+                               {source_offset.x + static_cast<s32>(from.width),
+                                source_offset.y + static_cast<s32>(from.height), source_offset.z + 1}},
+                .dstSubresource = subresource(*dest_view, dest->aspects, slice),
+                .dstOffsets = {dest_offset,
+                               {dest_offset.x + static_cast<s32>(to.width),
+                                dest_offset.y + static_cast<s32>(to.height), dest_offset.z + 1}},
+            };
+            if (flip_x) std::swap(region.srcOffsets[0].x, region.srcOffsets[1].x);
+            if (flip_y) std::swap(region.srcOffsets[0].y, region.srcOffsets[1].y);
+            scheduler.Record([src = *source->image, dst = *dest->image, region, filter](
+                                 vk::CommandBuffer cmdbuf) {
+                cmdbuf.BlitImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL,
+                                 {region}, filter);
+            });
+        } else {
+            const VkImageCopy copy{
+                .srcSubresource = subresource(*source_view, source->aspects, source_slice),
+                .srcOffset = source_offset,
+                .dstSubresource = subresource(*dest_view, dest->aspects, slice),
+                .dstOffset = dest_offset,
+                .extent = {from.width, from.height, 1},
+            };
+            scheduler.Record([src = *source->image, dst = *dest->image, copy](vk::CommandBuffer cmdbuf) {
+                cmdbuf.CopyImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, {copy});
+            });
+        }
+    }
     ++copies;
 }
 
-VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes) {
+void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submission& submission) {
+    if (op.args.size() != 3 || op.args[1] & ~2ULL || op.textures.size() != 1 ||
+        op.payload.size() != 16 + sizeof(CopyRegion)) {
+        return;
+    }
+    const auto& texture = op.textures[0];
+    const auto& desc = texture.description;
+    const auto block = Core::BananzaNvn2Hle::GetTextureFormatBlock(desc.format);
+    const auto view = std::span{op.payload}.first(16);
+    const u8 flags = op.args[2] ? view[7] : 0;
+    const u32 level = flags & 1 ? view[4] : 0;
+    const u32 base_layer = flags & 2 ? u32{view[0]} | (u32{view[1]} << 8) : 0;
+    if (!block || level >= desc.levels || base_layer >= texture.layout.layers ||
+        ((flags & 4) && ViewFormat(view, desc.format) != desc.format)) {
+        return;
+    }
+    CopyRegion region{};
+    std::memcpy(&region, op.payload.data() + 16, sizeof(region));
+    const VkExtent2D extent{std::max(1U, desc.width >> level), std::max(1U, desc.height >> level)};
+    const bool volume = desc.target == 2;
+    const u32 available = volume ? std::max(1U, desc.depth >> level)
+                                 : texture.layout.layers - base_layer;
+    if (!region.width || !region.height || !region.depth || region.x > extent.width ||
+        region.y > extent.height || region.width > extent.width - region.x ||
+        region.height > extent.height - region.y || region.z >= available ||
+        region.depth > available - region.z || region.x % block->width ||
+        region.y % block->height ||
+        (region.width % block->width && region.x + region.width != extent.width) ||
+        (region.height % block->height && region.y + region.height != extent.height)) {
+        return;
+    }
+    const u64 columns = (u64{region.width} + block->width - 1) / block->width;
+    const u64 rows = (u64{region.height} + block->height - 1) / block->height;
+    const u64 row_bytes = columns * block->bytes;
+    const u64 stride = copy_row_stride ? copy_row_stride : row_bytes;
+    if (stride < row_bytes || stride > (8ULL << 20) / (rows * region.depth)) {
+        return;
+    }
+    const auto data = submission.buffer_snapshots.find(
+        {op.args[0], stride * (rows * region.depth - 1) + row_bytes});
+    if (data == submission.buffer_snapshots.end()) {
+        TraceImage("buffer copy source unavailable", texture, op.args[0]);
+        return;
+    }
+    auto* image = FindImage(texture, true);
+    if (!image || image->aspects != VK_IMAGE_ASPECT_COLOR_BIT) {
+        return;
+    }
+    const bool astc = desc.format >= 0x79 && desc.format <= 0x94;
+    const u64 layer_bytes = astc ? u64{region.width} * region.height * 4 : row_bytes * rows;
+    auto upload = CreateWrappedBuffer(allocator, layer_bytes * region.depth, MemoryUsage::Upload);
+    std::vector<u8> compressed(astc ? row_bytes * rows : 0);
+    for (u32 z = 0; z < region.depth; ++z) {
+        auto layer = upload.Mapped().subspan(z * layer_bytes, layer_bytes);
+        auto output = astc ? std::span{compressed} : layer;
+        for (u64 row = 0; row < rows; ++row) {
+            std::memcpy(output.data() + row * row_bytes,
+                        data->second.data() + (z * rows + row) * stride, row_bytes);
+        }
+        if (astc) {
+            Tegra::Texture::ASTC::Decompress(compressed, region.width, region.height, 1,
+                                            block->width, block->height, layer);
+        }
+    }
+    upload.Flush();
+    Initialize(*image);
+    Barrier();
+    const VkBufferImageCopy copy{
+        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level,
+                             volume ? 0U : base_layer + region.z, volume ? 1U : region.depth},
+        .imageOffset = {static_cast<s32>(region.x), static_cast<s32>(region.y),
+                        volume ? static_cast<s32>(region.z) : 0},
+        .imageExtent = {region.width, region.height, volume ? region.depth : 1U},
+    };
+    scheduler.Record([buffer = *upload, target = *image->image, copy](vk::CommandBuffer cmdbuf) {
+        cmdbuf.CopyBufferToImage(buffer, target, VK_IMAGE_LAYOUT_GENERAL, {copy});
+    });
+    uploads.push_back(std::move(upload));
+    image->gpu_written = true;
+    TraceImage("buffer copy", texture, op.args[0]);
+    ++copies;
+}
+
+VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage) {
     if (bytes.empty()) {
         return VK_NULL_HANDLE;
     }
@@ -527,7 +940,8 @@ VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes) {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = bytes.size(),
             .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | extra_usage,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         },
         MemoryUsage::Upload);
@@ -539,6 +953,9 @@ VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes) {
 }
 
 VkBuffer BananzaNvn2Replay::UploadRange(const Submission& submission, Range range) {
+    if (const auto storage = storage_uploads.find(range); storage != storage_uploads.end()) {
+        return *storage->second.buffer;
+    }
     if (const auto cached = uploaded_ranges.find(range); cached != uploaded_ranges.end()) {
         return cached->second;
     }
@@ -564,6 +981,84 @@ VkBuffer BananzaNvn2Replay::UploadRange(const Submission& submission, Range rang
     return buffer;
 }
 
+std::map<BananzaNvn2Replay::Range, BananzaNvn2Replay::StorageUpload>::iterator
+BananzaNvn2Replay::FindStorageRange(Range range) {
+    auto upper = storage_uploads.upper_bound({range.first, std::numeric_limits<u64>::max()});
+    if (upper != storage_uploads.begin()) {
+        const auto entry = std::prev(upper);
+        const auto& [start, size] = entry->first;
+        const u64 offset = range.first - start;
+        if (offset < size && range.second <= size - offset) {
+            return entry;
+        }
+    }
+    return storage_uploads.end();
+}
+
+std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& submission,
+                                                            Range range) {
+    if (const auto storage = FindStorageRange(range); storage != storage_uploads.end()) {
+        return {*storage->second.buffer, range.first - storage->first.first};
+    }
+    return {UploadRange(submission, range), 0};
+}
+
+std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::WritableStorage(
+    const Submission& submission, Range range) {
+    if (const auto found = FindStorageRange(range); found != storage_uploads.end()) {
+        const u64 offset = range.first - found->first.first;
+        const auto align = device.GetPhysical().GetProperties().limits.minStorageBufferOffsetAlignment;
+        return offset % align == 0 ? std::pair{&found->second, offset}
+                                   : std::pair<StorageUpload*, u64>{};
+    }
+    const auto data = submission.buffer_snapshots.find(range);
+    const auto guest = submission.storage_addresses.find(range);
+    if (data == submission.buffer_snapshots.end() || guest == submission.storage_addresses.end()) {
+        return {};
+    }
+    const u64 end = guest->second + range.second;
+    for (const auto& [other_range, upload] : storage_uploads) {
+        if (upload.guest_address < end && guest->second < upload.guest_address + other_range.second) {
+            return {};
+        }
+    }
+    auto buffer = allocator.CreateBuffer({
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = range.second,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    }, MemoryUsage::Download);
+    auto mapped = buffer.Mapped();
+    std::ranges::copy(data->second, mapped.begin());
+    for (const auto& write : buffer_updates) {
+        const auto begin = std::max(range.first, write.address);
+        const auto limit = std::min(range.first + range.second, write.address + write.bytes.size());
+        if (begin < limit) {
+            std::memcpy(mapped.data() + begin - range.first, write.bytes.data() + begin - write.address,
+                        limit - begin);
+        }
+    }
+    buffer.Flush();
+    const auto entry = storage_uploads.emplace(range, StorageUpload{std::move(buffer), guest->second});
+    return {&entry.first->second, 0};
+}
+
+void BananzaNvn2Replay::WriteBackStorage(const Submission& submission) {
+    if (!submission.guest_memory) {
+        return;
+    }
+    for (auto& [range, upload] : storage_uploads) {
+        if (upload.written_bytes) {
+            upload.buffer.Invalidate();
+            submission.guest_memory->WriteBlockUnsafe(upload.guest_address,
+                                                       upload.buffer.Mapped().data(),
+                                                       upload.written_bytes);
+        }
+    }
+}
+
 bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
                                      std::span<const u8> data) {
     const auto& d = texture.description;
@@ -578,6 +1073,7 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
         u32 width;
         u32 height;
         u32 tile_height;
+        u32 tile_depth;
     };
     std::vector<Level> levels;
     std::vector<VkBufferImageCopy> copies;
@@ -587,16 +1083,21 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
         const auto offset = Core::BananzaNvn2Hle::TextureLevelOffset(d, level);
         const u32 width = std::max(d.width >> level, 1U);
         const u32 height = std::max(d.height >> level, 1U);
+        const u32 depth = std::max(image.depth >> level, 1U);
         const u32 columns = (width + block->width - 1) / block->width;
         const u32 rows = (height + block->height - 1) / block->height;
         u32 tile = texture.layout.tile_height;
         while (tile && (8U << (tile - 1)) >= rows) {
             --tile;
         }
+        u32 tile_depth = texture.layout.tile_depth;
+        while (tile_depth && (1U << (tile_depth - 1)) >= depth) {
+            --tile_depth;
+        }
         const size_t bytes = texture.layout.stride
                                  ? texture.layout.stride * (rows - 1) + columns * block->bytes
                                  : Tegra::Texture::CalculateSize(true, block->bytes, columns,
-                                                                  rows, 1, tile, 0);
+                                                                  rows, depth, tile, tile_depth);
         const auto last_layer = (image.layers - 1) * texture.layout.layer_size;
         if (!offset || last_layer > data.size() || *offset > data.size() - last_layer ||
             bytes > data.size() - last_layer - *offset) {
@@ -607,11 +1108,12 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
         copies.push_back({
             .bufferOffset = upload_size,
             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, image.layers},
-            .imageExtent = {width, height, 1},
+            .imageExtent = {width, height, depth},
         });
-        const auto upload_stride = decode_astc ? size_t{width} * height * 4
-                                               : size_t{columns} * rows * block->bytes;
-        levels.push_back({*offset, texture.layout.layer_size, upload_stride, columns, rows, tile});
+        const auto upload_stride = decode_astc ? size_t{width} * height * depth * 4
+                                               : size_t{columns} * rows * depth * block->bytes;
+        levels.push_back({*offset, texture.layout.layer_size, upload_stride, columns, rows, tile,
+                          tile_depth});
         upload_size += upload_stride * image.layers;
     }
     auto upload = CreateWrappedBuffer(allocator, upload_size, MemoryUsage::Upload);
@@ -619,7 +1121,7 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
         const auto& src = levels[level];
         const size_t row = size_t{src.width} * block->bytes;
         const auto extent = copies[level].imageExtent;
-        std::vector<u8> astc(decode_astc ? row * src.height : 0);
+        std::vector<u8> astc(decode_astc ? row * src.height * extent.depth : 0);
         for (u32 layer = 0; layer < image.layers; ++layer) {
             const size_t offset = src.guest_offset + layer * src.bytes_per_layer;
             auto linear = upload.Mapped().subspan(copies[level].bufferOffset +
@@ -633,10 +1135,11 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
                 }
             } else {
                 Tegra::Texture::UnswizzleTexture(dest, data.subspan(offset), block->bytes,
-                                                src.width, src.height, 1, src.tile_height, 0, 0, true);
+                                                src.width, src.height, extent.depth,
+                                                src.tile_height, src.tile_depth, 0, true);
             }
             if (decode_astc) {
-                Tegra::Texture::ASTC::Decompress(astc, extent.width, extent.height, 1, block->width,
+                Tegra::Texture::ASTC::Decompress(astc, extent.width, extent.height, extent.depth, block->width,
                                                 block->height, linear);
             }
         }
@@ -654,9 +1157,13 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
 
 std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     const Submission& submission, u32 stage, const Shader::TextureDescriptor& binding,
-    std::span<Image* const> destinations) {
-    const auto& program = graphics_program->shaders;
-    const auto staged = std::ranges::find(program, stage == 0 ? 0U : 4U,
+    std::span<Image* const> destinations, std::optional<u64> compute_handle) {
+    const auto& bound_program = stage == 5 ? compute_program
+                              : stage == 1 ? fragment_program
+                              : stage == 2 ? geometry_program
+                                           : graphics_program;
+    const auto& program = bound_program->shaders;
+    const auto staged = std::ranges::find(program, stage == 1 ? 4U : stage == 2 ? 3U : stage,
                                            &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
     if (staged == program.end()) {
         NoteSkip("missing texture shader stage");
@@ -667,7 +1174,10 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     // The SDK's direct handle table begins at 0x20 and uses eight bytes per slot.
     constexpr u32 HandleBase = 0x20;
     constexpr u32 HandleStride = 8;
-    if (binding.cbuf_index == (stage == 0 ? 0U : 2U) && offset >= HandleBase &&
+    if (compute_handle) {
+        handle = *compute_handle;
+    } else if ((binding.cbuf_index == 2 || (stage == 0 && binding.cbuf_index == 0)) &&
+        offset >= HandleBase &&
         (offset - HandleBase) % HandleStride == 0 &&
         (offset - HandleBase) / HandleStride < texture_handles[stage].size()) {
         handle = texture_handles[stage][(offset - HandleBase) / HandleStride];
@@ -687,6 +1197,11 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         std::memcpy(&word, found->second.data() + offset, 4);
         handle = word;
     } else {
+        if (trace_images && draw_diagnostics.emplace(bound_program->serial,
+                                                      "texture handle location").second) {
+            LOG_INFO(Render_Vulkan, "NVN 2 program {} stage {} texture at bank {} offset {:#x}",
+                     bound_program->serial, stage, binding.cbuf_index, offset);
+        }
         NoteSkip("unsupported texture handle bank or offset");
         return std::nullopt;
     }
@@ -697,20 +1212,27 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     const u32 texture_id = static_cast<u32>(handle) & 0xfffff;
     const u32 sampler_id = static_cast<u32>(handle >> 20) & 0xfff;
     const auto textures = submission.texture_descriptors.find(texture_pool);
-    const auto sampler_table = submission.sampler_descriptors.find(sampler_pool);
-    if (textures == submission.texture_descriptors.end() ||
-        sampler_table == submission.sampler_descriptors.end()) {
-        NoteSkip("missing texture or sampler pool snapshot");
+    if (textures == submission.texture_descriptors.end()) {
+        NoteSkip("missing texture pool snapshot");
         return std::nullopt;
     }
     const auto texture = textures->second.find(texture_id);
-    const auto sampler = sampler_table->second.find(sampler_id);
-    if (texture == textures->second.end() || sampler == sampler_table->second.end()) {
+    Core::BananzaNvn2Hle::ResourceSamplerInfo fetch_sampler{.min_filter = 0, .mag_filter = 0,
+                                                          .wrap = {0, 0, 0}};
+    const auto sampler_table = submission.sampler_descriptors.find(sampler_pool);
+    const auto* desc_ptr = sampler_id == 0 ? &fetch_sampler : nullptr;
+    if (sampler_table != submission.sampler_descriptors.end()) {
+        const auto found = sampler_table->second.find(sampler_id);
+        if (found != sampler_table->second.end()) {
+            desc_ptr = &found->second;
+        }
+    }
+    if (texture == textures->second.end() || !desc_ptr) {
         NoteSkip("missing texture or sampler descriptor");
         return std::nullopt;
     }
     const auto& tex = texture->second.texture;
-    const auto& desc = sampler->second;
+    const auto& desc = *desc_ptr;
     const auto& d = tex.description;
     u32 format = d.format;
     u32 first_level{};
@@ -718,22 +1240,42 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     u32 first_layer{};
     u32 layers = tex.layout.layers;
     u32 target = d.target;
+    u32 depth_mode = d.depth_mode;
     auto swizzle = d.swizzle;
+    const auto invalid_view = [&] {
+        if (trace_images && draw_diagnostics.emplace(bound_program->serial,
+                                                      "sampled texture view detail").second) {
+            LOG_WARNING(Render_Vulkan,
+                        "NVN 2 program {} stage {} sampled bank {} offset {:#x} handle {:#x}, type {}, target {} from {}, format {:#x} from {:#x}, mip {}+{}/{}, layer {}+{}/{}, view {:02x}",
+                        bound_program->serial, stage, binding.cbuf_index, offset, handle,
+                        static_cast<u32>(binding.type), target,
+                        d.target, format, d.format, first_level, levels, d.levels,
+                        first_layer, layers, tex.layout.layers,
+                        texture->second.view ? (*texture->second.view)[7] : 0);
+        }
+        NoteSkip("unsupported sampled texture view");
+    };
     if (const auto& v = texture->second.view) {
         const u8 flags = (*v)[7];
         format = ViewFormat(*v, d.format);
-        if ((flags & 0x10 && (flags >> 6) != d.depth_mode) ||
-            !HasCompatibleFormat(format, d.format)) {
-            NoteSkip("unsupported sampled texture view");
+        if (!HasCompatibleFormat(format, d.format)) {
+            invalid_view();
             return std::nullopt;
         }
         if (flags & 1) {
             first_level = (*v)[4];
             levels = (*v)[5];
+            if (first_level < d.levels) {
+                const u32 remaining = d.levels - first_level;
+                levels = levels ? std::min(levels, remaining) : remaining;
+            }
         }
         if (flags & 2) {
             first_layer = u32{(*v)[0]} | (u32{(*v)[1]} << 8);
             layers = u32{(*v)[2]} | (u32{(*v)[3]} << 8);
+            if (!layers && first_layer < tex.layout.layers) {
+                layers = tex.layout.layers - first_layer;
+            }
         }
         if (flags & 0x20) {
             target = (*v)[6];
@@ -741,71 +1283,232 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         if (flags & 8) {
             std::ranges::copy(std::span{*v}.subspan(12, 4), swizzle.begin());
         }
+        if (flags & 0x10) {
+            depth_mode = flags >> 6;
+        }
     }
     constexpr std::array components{VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
                                     VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
                                     VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
-    const bool array = binding.type == Shader::TextureType::ColorArray2D;
-    if ((target != 1 && target != 4) || (array ? target != 4 : layers != 1) ||
+    VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    if (binding.type == Shader::TextureType::Color2D &&
+        (target == 1 || target == 4 || target == 8 || target == 9)) {
+        // A non-array 2D instruction addresses the first layer of an array or cube view.
+        layers = 1;
+        view_type = VK_IMAGE_VIEW_TYPE_2D;
+    } else if (binding.type == Shader::TextureType::ColorArray2D &&
+               (target == 1 || target == 4 || target == 8 || target == 9)) {
+        view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    } else if (binding.type == Shader::TextureType::Color3D && target == 2) {
+        view_type = VK_IMAGE_VIEW_TYPE_3D;
+    } else if (binding.type == Shader::TextureType::ColorCube && (target == 8 || target == 9) &&
+               layers == 6) {
+        view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+    } else if (binding.type == Shader::TextureType::ColorArrayCube && target == 9 && layers % 6 == 0) {
+        view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    }
+    if (binding.type == Shader::TextureType::Color3D && target != 2 && !binding.is_depth) {
+        // A non-volume descriptor has no texels addressable by a 3D instruction.
+        const auto& logical = device.GetLogical();
+        if (!unbound_volume) {
+            auto image = allocator.CreateImage({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_3D,
+                .format = VK_FORMAT_R8G8B8A8_UNORM,
+                .extent = {1, 1, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            });
+            constexpr VkImageSubresourceRange subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            auto view = logical.CreateImageView({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = *image,
+                .viewType = VK_IMAGE_VIEW_TYPE_3D,
+                .format = VK_FORMAT_R8G8B8A8_UNORM,
+                .subresourceRange = subresource,
+            });
+            auto sampler = logical.CreateSampler({
+                .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            });
+            scheduler.RequestOutsideRenderPassOperationContext();
+            scheduler.Record([handle = *image, subresource](vk::CommandBuffer cmdbuf) {
+                const VkImageMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = handle,
+                    .subresourceRange = subresource,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       0, barrier);
+                constexpr VkClearColorValue zero{};
+                cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, zero, {subresource});
+            });
+            unbound_volume = std::move(image);
+            unbound_volume_view = std::move(view);
+            unbound_volume_sampler = std::move(sampler);
+            ++clears;
+        }
+        return VkDescriptorImageInfo{*unbound_volume_sampler, *unbound_volume_view,
+                                     VK_IMAGE_LAYOUT_GENERAL};
+    }
+    if (view_type == VK_IMAGE_VIEW_TYPE_MAX_ENUM ||
         first_layer >= tex.layout.layers || !layers || layers > tex.layout.layers - first_layer ||
         first_level >= d.levels || !levels || levels > d.levels - first_level ||
         std::ranges::any_of(swizzle, [&](u32 s) { return s >= components.size(); })) {
-        NoteSkip("unsupported sampled texture view");
+        invalid_view();
         return std::nullopt;
     }
-    if (desc.compare_mode || desc.reduction) {
+    if ((binding.is_depth && (desc.compare_mode != 1 || desc.compare_func < 1 ||
+                              desc.compare_func > 8)) ||
+        desc.reduction > VK_SAMPLER_REDUCTION_MODE_MAX) {
+        if (trace_images && draw_diagnostics.emplace(bound_program->serial, "sampler state").second) {
+            LOG_WARNING(Render_Vulkan,
+                        "NVN 2 program {} sampler {} compare instruction={}, mode={}, func={}, reduction={}",
+                        bound_program->serial, sampler_id, binding.is_depth, desc.compare_mode,
+                        desc.compare_func, desc.reduction);
+        }
         NoteSkip("unsupported sampler comparison or reduction");
         return std::nullopt;
     }
     auto* image = FindImage(tex, true);
-    if (!image || image->aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
-        std::ranges::find(destinations, image) != destinations.end()) {
-        NoteSkip(image ? "sampled texture aliases destination" : "unsupported sampled texture format");
+    const VkImageAspectFlags aspect = !image ? 0 : image->aspects == VK_IMAGE_ASPECT_COLOR_BIT
+        ? VK_IMAGE_ASPECT_COLOR_BIT
+        : depth_mode ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (!image || !(image->aspects & aspect) || (binding.is_depth && aspect != VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        if (trace_images && draw_diagnostics.emplace(bound_program->serial,
+                                                      "sampled texture format detail").second) {
+            LOG_WARNING(Render_Vulkan, "NVN 2 program {} texture format {:#x}, target {}, depth mode {}, compare {}, image {}",
+                        bound_program->serial, format, target, depth_mode, binding.is_depth,
+                        image != nullptr);
+        }
+        NoteSkip("unsupported sampled texture format");
         return std::nullopt;
     }
-    if (!image->initialized) {
-        const auto data = submission.texture_snapshots.find(tex.serial);
-        if (data == submission.texture_snapshots.end()) {
-            TraceImage("missing sampled snapshot", tex, graphics_program->serial);
-            if (trace_images && draw_diagnostics.emplace(graphics_program->serial,
-                                                          "sample snapshot detail").second) {
-                LOG_INFO(Render_Vulkan,
-                         "NVN 2 sample program {}, bank {}, offset {:#x}, handle {:#x}, format {:#x}, flags {:#x}, address {:#x}, {}x{}, {} bytes, {} levels",
-                         graphics_program->serial, binding.cbuf_index, offset, handle, d.format,
-                         d.flags, tex.storage.gpu_address + tex.offset, d.width, d.height,
-                         tex.layout.size, d.levels);
-            }
-            NoteSkip("sampled texture has no replayed write or CPU snapshot");
-            return std::nullopt;
+    const bool color = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    if (!(color ? PrepareSampledImage(*image, tex, submission) : image->initialized)) {
+        TraceImage("missing sampled snapshot", tex, bound_program->serial);
+        if (trace_images && draw_diagnostics.emplace(bound_program->serial,
+                                                      "sample snapshot detail").second) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 sample program {}, bank {}, offset {:#x}, handle {:#x}, format {:#x}, flags {:#x}, address {:#x}, {}x{}, {} bytes, {} levels",
+                     bound_program->serial, binding.cbuf_index, offset, handle, d.format,
+                     d.flags, tex.storage.gpu_address + tex.offset, d.width, d.height,
+                     tex.layout.size, d.levels);
         }
-        if (!UploadTexture(*image, tex, data->second)) {
-            NoteSkip("sampled texture snapshot does not cover its mip levels");
-            return std::nullopt;
-        }
-        ++texture_uploads;
+        NoteSkip("sampled texture has no replayed write or CPU snapshot");
+        return std::nullopt;
     }
-    TraceImage("sampled", tex, graphics_program->serial);
+    TraceImage("sampled", tex, bound_program->serial);
     const auto address = tex.storage.gpu_address + tex.offset;
-    if (frame_dump.CapturingSampled() && d.width >= 900 && first_level == 0 &&
-        captured_inputs.insert(address).second) {
-        frame_dump.CaptureNvn2Input(*image->image, image->surface_format, d.width, d.height,
-                                    address);
+    if (frame_dump.CapturingSampled() && (d.width >= 900 || aspect == VK_IMAGE_ASPECT_DEPTH_BIT) &&
+        !image->volume &&
+        (color || aspect == VK_IMAGE_ASPECT_DEPTH_BIT) &&
+        captured_inputs.emplace(address, first_level, first_layer).second) {
+        frame_dump.CaptureNvn2Input(*image->image, image->surface_format,
+                                    std::max(1U, d.width >> first_level),
+                                    std::max(1U, d.height >> first_level), address,
+                                    color ? VK_FORMAT_UNDEFINED : image->format, first_level,
+                                    first_layer, bound_program->serial);
     }
     const auto vk_format = FindColorFormat(format)->vk;
-    const auto key = std::tuple{vk_format, first_level, levels, first_layer,
-                                array ? layers : 0U, swizzle};
-    auto sampled_view = image->sampled_views.find(key);
-    if (sampled_view == image->sampled_views.end()) {
+    const auto key = std::tuple{vk_format, first_level, levels, first_layer, layers, view_type,
+                                aspect, swizzle};
+    const auto overlaps = [&](size_t slot) {
+        const auto& attachment = color_views[slot];
+        return destinations[slot] == image && attachment.level >= first_level &&
+               attachment.level < first_level + levels &&
+               (image->volume || (attachment.layer < first_layer + layers &&
+                                  first_layer < attachment.layer + attachment.layers));
+    };
+    bool feedback{};
+    for (size_t i = 0; i < destinations.size(); ++i) {
+        feedback |= overlaps(i);
+    }
+    auto* views = &image->sampled_views;
+    VkImage sampled_image = *image->image;
+    if (feedback) {
+        const auto [found, inserted] = feedback_images.try_emplace(image);
+        auto& copy = found->second;
+        if (inserted) {
+            copy.image = allocator.CreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                         (d.target == 8 || d.target == 9 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U),
+                .imageType = image->volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+                .format = image->format,
+                .extent = {image->extent.width, image->extent.height, image->depth},
+                .mipLevels = image->levels,
+                .arrayLayers = image->layers,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+        }
+        sampled_image = *copy.image;
+        views = &copy.views;
+        Barrier();
+        scheduler.Record([source = *image->image, sampled_image, inserted, first_level,
+                          levels, first_layer, layers, image_levels = image->levels,
+                          image_layers = image->layers, extent = image->extent,
+                          depth = image->depth](vk::CommandBuffer cmdbuf) {
+            if (inserted) {
+                const VkImageMemoryBarrier transition{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = sampled_image,
+                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, image_levels, 0, image_layers},
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, transition);
+            }
+            for (u32 level = first_level; level < first_level + levels; ++level) {
+                const VkImageSubresourceLayers subresource{VK_IMAGE_ASPECT_COLOR_BIT, level,
+                                                           first_layer, layers};
+                const VkImageCopy region{
+                    .srcSubresource = subresource,
+                    .dstSubresource = subresource,
+                    .extent = {std::max(1U, extent.width >> level),
+                               std::max(1U, extent.height >> level), std::max(1U, depth >> level)},
+                };
+                cmdbuf.CopyImage(source, VK_IMAGE_LAYOUT_GENERAL, sampled_image,
+                                 VK_IMAGE_LAYOUT_GENERAL, {region});
+            }
+        });
+        ++copies;
+    }
+    auto sampled_view = views->find(key);
+    if (sampled_view == views->end()) {
+        const VkImageViewUsageCreateInfo usage{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+        };
         auto view = device.GetLogical().CreateImageView({
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = *image->image,
-            .viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+            .pNext = &usage,
+            .image = sampled_image,
+            .viewType = view_type,
             .format = vk_format,
             .components = {components[swizzle[0]], components[swizzle[1]],
                            components[swizzle[2]], components[swizzle[3]]},
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, first_level, levels, first_layer, layers},
+            .subresourceRange = {aspect, first_level, levels, first_layer, layers},
         });
-        sampled_view = image->sampled_views.emplace(key, std::move(view)).first;
+        sampled_view = views->emplace(key, std::move(view)).first;
     }
     constexpr std::array modes{
         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT,
@@ -819,17 +1522,31 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         NoteSkip("unsupported sampler wrap mode");
         return std::nullopt;
     }
+    const VkSamplerReductionModeCreateInfo reduction{
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
+        .reductionMode = static_cast<VkSamplerReductionMode>(desc.reduction),
+    };
+    const auto physical = device.GetPhysical();
+    const bool point_depth = aspect == VK_IMAGE_ASPECT_DEPTH_BIT && !binding.is_depth;
+    const bool use_reduction = desc.reduction && !binding.is_depth &&
+        device.IsExtSamplerFilterMinmaxSupported() &&
+        (physical.GetFormatProperties(vk_format).optimalTilingFeatures &
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT);
     auto host_sampler = device.GetLogical().CreateSampler({
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = desc.mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-        .minFilter = desc.min_filter & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-        .mipmapMode = desc.min_filter >= 4 ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-                                          : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .pNext = use_reduction ? &reduction : nullptr,
+        .magFilter = !point_depth && desc.mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .minFilter = !point_depth && (desc.min_filter & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .mipmapMode = !point_depth && desc.min_filter >= 4 ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                                                          : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = modes[desc.wrap[0]],
         .addressModeV = modes[desc.wrap[1]],
         .addressModeW = modes[desc.wrap[2]],
         .mipLodBias = std::clamp(desc.lod_bias, -device.GetPhysical().GetProperties().limits.maxSamplerLodBias,
                                 device.GetPhysical().GetProperties().limits.maxSamplerLodBias),
+        .compareEnable = binding.is_depth,
+        .compareOp = binding.is_depth ? static_cast<VkCompareOp>(desc.compare_func - 1)
+                                      : VK_COMPARE_OP_ALWAYS,
         .minLod = desc.min_filter < 2 ? 0.0f : std::clamp(desc.min_lod, 0.0f, float(levels - 1)),
         .maxLod = desc.min_filter < 2 ? 0.0f : std::clamp(desc.max_lod, 0.0f, float(levels - 1)),
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
@@ -837,6 +1554,28 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     const VkSampler handle_sampler = *host_sampler;
     samplers.push_back(std::move(host_sampler));
     return VkDescriptorImageInfo{handle_sampler, *sampled_view->second, VK_IMAGE_LAYOUT_GENERAL};
+}
+
+bool BananzaNvn2Replay::PrepareSampledImage(Image& image, const Texture& texture,
+                                           const Submission& submission) {
+    if (!image.gpu_written && image.checked_submission != submission.sequence) {
+        const auto data = submission.texture_snapshots.find(texture.serial);
+        if (data != submission.texture_snapshots.end()) {
+            const auto& bytes = data->second;
+            const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()),
+                                                bytes.size());
+            if (!image.initialized || image.cpu_serial != texture.serial || image.cpu_hash != hash) {
+                if (!UploadTexture(image, texture, bytes)) {
+                    return false;
+                }
+                image.cpu_hash = hash;
+                image.cpu_serial = texture.serial;
+                ++texture_uploads;
+            }
+        }
+        image.checked_submission = submission.sequence;
+    }
+    return image.initialized && (image.gpu_written || image.cpu_serial == texture.serial);
 }
 
 std::optional<BananzaNvn2Replay::DrawState> BananzaNvn2Replay::DecodeDraw(
@@ -888,14 +1627,64 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     const auto& shaders = graphics_program->shaders;
     const auto vertex = std::ranges::find(shaders, 0U,
                                           &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
-    const auto fragment = std::ranges::find(shaders, 4U,
-                                            &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
-    if (shaders.size() != 2 || vertex == shaders.end() || fragment == shaders.end() ||
+    const auto find_shader = [](const auto& program, u32 stage)
+        -> const Core::BananzaNvn2Hle::ResourceShaderInfo* {
+        if (!program) {
+            return nullptr;
+        }
+        const auto& shaders = program->shaders;
+        const auto shader = std::ranges::find(shaders, stage,
+                                              &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
+        return shader == shaders.end() ? nullptr : &*shader;
+    };
+    const auto* fragment = find_shader(fragment_program, 4);
+    const auto* geometry = find_shader(geometry_program, 3);
+    if (vertex == shaders.end() || (fragment_program && !fragment) ||
+        (geometry_program && (!geometry || !device.GetPhysical().GetFeatures().geometryShader)) ||
         !device.IsDynamicRenderingSupported()) {
         return std::nullopt;
     }
     Shader::RuntimeInfo runtime;
     runtime.generic_input_types.fill(Shader::AttributeType::Float);
+    const auto attribute_type = [](u32 format) {
+        const auto color = FindColorFormat(format);
+        if (color && VideoCore::Surface::IsPixelFormatInteger(color->surface)) {
+            return VideoCore::Surface::IsPixelFormatSignedInteger(color->surface)
+                       ? Shader::AttributeType::SignedInt : Shader::AttributeType::UnsignedInt;
+        }
+        return Shader::AttributeType::Float;
+    };
+    for (u32 i = 0; i < vertex_attributes.size(); ++i) {
+        if (!(vertex_attributes[i] & 0x40)) {
+            runtime.generic_input_types[i] = Shader::AttributeType::Disabled;
+            continue;
+        }
+        const u32 format = (vertex_attributes[i] >> 21) & 0x3ff;
+        switch (format) {
+        case 0x1b:
+        case 0x20:
+        case 0x23:
+            runtime.generic_input_types[i] = Shader::AttributeType::UnsignedInt;
+            break;
+        case 0x1c:
+        case 0x21:
+        case 0x24:
+        case 0x6a:
+            runtime.generic_input_types[i] = Shader::AttributeType::SignedInt;
+            break;
+        default:
+            runtime.generic_input_types[i] = attribute_type(format);
+            break;
+        }
+    }
+    for (u32 i = 0; i < formats.size(); ++i) {
+        if (colors[i]) {
+            const auto format = FindColorFormat(colors[i]->description.format);
+            if (format && VideoCore::Surface::IsPixelFormatInteger(format->surface)) {
+                runtime.color_output_types[i] = attribute_type(colors[i]->description.format);
+            }
+        }
+    }
     runtime.previous_stage_stores.mask.set();
     runtime.convert_depth_mode = raster.negative_one_to_one;
     const auto alpha_func = (color_state.control >> 24) & 15;
@@ -912,13 +1701,54 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
                     vertex->data_address, vs.error);
         return std::nullopt;
     }
-    const u32 fragment_binding = bindings.unified;
+    const u32 geometry_binding = bindings.unified;
     runtime.previous_stage_stores = vs.info->stores;
-    const auto fs = TranslateBananzaNvn2Shader(*fragment, profile, host_info, runtime, bindings);
-    if (fs.status != BananzaNvn2ShaderStatus::Success) {
-        LOG_WARNING(Render_Vulkan, "Bananza NVN 2 fragment shader at {:#x}: {}",
-                    fragment->data_address, fs.error);
-        return std::nullopt;
+    runtime.generic_input_types.fill(Shader::AttributeType::Float);
+    BananzaNvn2ShaderResult gs;
+    if (geometry) {
+        if (topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST) {
+            runtime.input_topology = Shader::InputTopology::Points;
+        } else if (topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+                   topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) {
+            runtime.input_topology = Shader::InputTopology::Lines;
+        } else {
+            runtime.input_topology = Shader::InputTopology::Triangles;
+        }
+        std::array<u32, 8> mask;
+        mask.fill(~0U);
+        const auto enable = [&](Shader::IR::Attribute attribute) {
+            const u32 index = static_cast<u32>(attribute);
+            mask[index / 32] &= ~(1U << (index % 32));
+        };
+        for (u32 i = 0; i < 4; ++i) {
+            enable(static_cast<Shader::IR::Attribute>(static_cast<u32>(Shader::IR::Attribute::PositionX) + i));
+        }
+        for (u32 i = 0; i < 32; ++i) {
+            if (vs.info->stores.Generic(i)) {
+                for (u32 component = 0; component < 4; ++component) {
+                    enable(static_cast<Shader::IR::Attribute>(
+                        static_cast<u32>(Shader::IR::Attribute::Generic0X) + 4 * i + component));
+                }
+            }
+        }
+        gs = TranslateBananzaNvn2Shader(*geometry, profile, host_info, runtime, bindings, nullptr, &mask);
+        if (gs.status != BananzaNvn2ShaderStatus::Success) {
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 geometry shader at {:#x}: {}",
+                        geometry->data_address, gs.error);
+            return std::nullopt;
+        }
+        runtime.previous_stage_stores = gs.info->stores;
+        runtime.previous_stage_stores.mask |= gs.info->passthrough.mask;
+    }
+    const u32 fragment_binding = bindings.unified;
+    BananzaNvn2ShaderResult fs;
+    if (fragment) {
+        fs = TranslateBananzaNvn2Shader(*fragment, profile, host_info, runtime, bindings);
+        if (fs.status != BananzaNvn2ShaderStatus::Success) {
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 fragment shader at {:#x}: {}",
+                        fragment->data_address, fs.error);
+            return std::nullopt;
+        }
     }
     if (const char* dir = std::getenv("EDEN_NX2_NVN_SPIRV_DUMP")) {
         const auto serial = graphics_program->serial;
@@ -935,21 +1765,55 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
             }
         };
         save("vs", vs, *vertex);
-        save("fs", fs, *fragment);
+        if (geometry) {
+            save("gs", gs, *geometry);
+        }
+        if (fragment) {
+            save("fs", fs, *fragment);
+        }
     }
-    const auto can_bind = [](const BananzaNvn2ShaderResult& shader,
-                             const Core::BananzaNvn2Hle::ResourceShaderInfo& staged) {
+    const auto can_bind = [&](const BananzaNvn2ShaderResult& shader,
+                             const Core::BananzaNvn2Hle::ResourceShaderInfo& staged, u32 stage) {
         const auto& info = *shader.info;
         const auto& queries = shader.queries;
-        return info.storage_buffers_descriptors.empty() &&
-               info.image_descriptors.empty() && info.texture_buffer_descriptors.empty() &&
+        const u32 storage_base = GraphicsStorageBase[stage];
+        const auto direct_storage = [&](u32 bank, u32 offset) {
+            return bank == 0 && offset >= storage_base && offset < storage_base + 0x100 &&
+                   (offset - storage_base) % 16 == 0;
+        };
+        for (const auto& storage : info.storage_buffers_descriptors) {
+            const auto features = device.GetPhysical().GetFeatures();
+            const bool supports_write = stage == 1 ? features.fragmentStoresAndAtomics
+                                                    : features.vertexPipelineStoresAndAtomics;
+            if ((storage.is_written && !supports_write) ||
+                storage.count != 1 || storage.indirect_offset != ~0U ||
+                !direct_storage(storage.cbuf_index, storage.cbuf_offset)) {
+                if (draw_diagnostics.emplace(graphics_program->serial, "graphics storage detail").second) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NVN 2 graphics storage: stage {}, bank {}, offset {:#x}, count {}, write {}, indirect {:#x}",
+                                staged.stage, storage.cbuf_index, storage.cbuf_offset, storage.count,
+                                storage.is_written, storage.indirect_offset);
+                }
+                NoteSkip("unsupported graphics storage write or pointer");
+                return false;
+            }
+        }
+        for (const auto& [key, mapped] : queries.storage_pointer_types) {
+            if (!mapped || !direct_storage(static_cast<u32>(key >> 32), static_cast<u32>(key))) {
+                NoteSkip("unsupported graphics storage pointer classification");
+                return false;
+            }
+        }
+        return info.image_descriptors.empty() && info.texture_buffer_descriptors.empty() &&
                info.image_buffer_descriptors.empty() && info.handle_programs.empty() &&
                !info.uses_global_memory && !info.stores_global_memory &&
-               queries.storage_pointer_types.empty() && queries.cbuf_replacements.empty() &&
+               queries.cbuf_replacements.empty() &&
                std::ranges::all_of(info.texture_descriptors, [](const auto& descriptor) {
                    return (descriptor.type == Shader::TextureType::Color2D ||
-                           descriptor.type == Shader::TextureType::ColorArray2D) &&
-                          !descriptor.is_depth &&
+                           descriptor.type == Shader::TextureType::ColorArray2D ||
+                           descriptor.type == Shader::TextureType::Color3D ||
+                           descriptor.type == Shader::TextureType::ColorCube ||
+                           descriptor.type == Shader::TextureType::ColorArrayCube) &&
                           !descriptor.is_integer && !descriptor.is_multisample &&
                           !descriptor.has_secondary && descriptor.count == 1 &&
                           descriptor.handle_program == ~0U;
@@ -967,24 +1831,35 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
                    return word == entry.second;
                });
     };
-    if (!can_bind(vs, *vertex) || !can_bind(fs, *fragment)) {
+    if (!can_bind(vs, *vertex, 0) || (fragment && !can_bind(fs, *fragment, 1)) ||
+        (geometry && !can_bind(gs, *geometry, 2))) {
         NoteSkip("translation needs unsupported descriptors or constant values");
         return std::nullopt;
     }
     std::vector<VkVertexInputAttributeDescription> attributes;
     std::vector<VkVertexInputBindingDescription> streams;
     Pipeline result;
-    result.uses_render_area = vs.info->uses_render_area || fs.info->uses_render_area;
+    result.uses_render_area = vs.info->uses_render_area || (fragment && fs.info->uses_render_area) ||
+                              (geometry && gs.info->uses_render_area);
+    result.stages = VK_SHADER_STAGE_VERTEX_BIT |
+                    (geometry ? VK_SHADER_STAGE_GEOMETRY_BIT : 0U) |
+                    (fragment ? VK_SHADER_STAGE_FRAGMENT_BIT : 0U);
     for (u32 i = 0; i < vertex_attributes.size(); ++i) {
-        if (!vs.info->loads.Generic(i)) {
+        if (!vs.info->loads.Generic(i) || !(vertex_attributes[i] & 0x40)) {
             continue;
         }
         const u32 attribute = vertex_attributes[i];
         const u32 stream = attribute & 31;
         const auto vf = VertexFormat((attribute >> 21) & 0x3ff);
-        if (!(attribute & 0x40) || !vertex_strides[stream] || vertex_divisors[stream] > 1 ||
+        if (!vertex_strides[stream] || vertex_divisors[stream] > 1 ||
             vf == VK_FORMAT_UNDEFINED ||
             !device.IsFormatSupported(vf, VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT, FormatType::Buffer)) {
+            if (trace_images && draw_diagnostics.emplace(graphics_program->serial,
+                                                          "vertex attribute detail").second) {
+                LOG_WARNING(Render_Vulkan, "NVN 2 program {} attribute {}: word {:#x}, format {:#x}, stream {}, stride {}, divisor {}",
+                            graphics_program->serial, i, attribute, (attribute >> 21) & 0x3ff,
+                            stream, vertex_strides[stream], vertex_divisors[stream]);
+            }
             NoteSkip("unsupported vertex attribute format or stream");
             return std::nullopt;
         }
@@ -1017,6 +1892,12 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
             result.uniforms.push_back(std::move(item));
             ++binding;
         }
+        for (const auto& storage : info.storage_buffers_descriptors) {
+            const u32 base = GraphicsStorageBase[stage];
+            layout_bindings.push_back({binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags});
+            result.storage.push_back({stage, binding++, (storage.cbuf_offset - base) / 16,
+                                      storage.is_written});
+        }
         for (const auto& descriptor : info.texture_descriptors) {
             layout_bindings.push_back({binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, flags});
             result.textures.emplace_back(stage, binding++, descriptor);
@@ -1024,7 +1905,8 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         return true;
     };
     if (!describe(*vs.info, *vertex, 0, 0, VK_SHADER_STAGE_VERTEX_BIT) ||
-        !describe(*fs.info, *fragment, 1, fragment_binding, VK_SHADER_STAGE_FRAGMENT_BIT) ||
+        (geometry && !describe(*gs.info, *geometry, 2, geometry_binding, VK_SHADER_STAGE_GEOMETRY_BIT)) ||
+        (fragment && !describe(*fs.info, *fragment, 1, fragment_binding, VK_SHADER_STAGE_FRAGMENT_BIT)) ||
         layout_bindings.size() != bindings.unified) {
         NoteSkip("shader descriptor layout could not be matched");
         return std::nullopt;
@@ -1038,7 +1920,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         });
     }
     const VkPushConstantRange push{
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .stageFlags = result.stages,
         .size = sizeof(Shader::Backend::SPIRV::RescalingLayout) +
                 sizeof(Shader::Backend::SPIRV::RenderAreaLayout),
     };
@@ -1058,15 +1940,33 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         });
     };
     const auto vertex_module = make_shader(vs.spirv);
-    const auto fragment_module = make_shader(fs.spirv);
-    const std::array stages{
-        VkPipelineShaderStageCreateInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                                        .module = *vertex_module, .pName = "main"},
-        VkPipelineShaderStageCreateInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                                        .module = *fragment_module, .pName = "main"},
+    const auto fragment_module = fragment ? make_shader(fs.spirv) : vk::ShaderModule{};
+    const auto geometry_module = geometry ? make_shader(gs.spirv) : vk::ShaderModule{};
+    if (trace_images) {
+        vertex_module.SetObjectNameEXT(fmt::format("NVN 2 {} VS {:016x}",
+                                                  graphics_program->serial, vs.native_hash).c_str());
+        if (fragment) {
+            fragment_module.SetObjectNameEXT(fmt::format("NVN 2 {} FS {:016x}",
+                                                        fragment_program->serial, fs.native_hash).c_str());
+        }
+        if (geometry) {
+            geometry_module.SetObjectNameEXT(fmt::format("NVN 2 {} GS {:016x}",
+                                                        geometry_program->serial, gs.native_hash).c_str());
+        }
+    }
+    std::array<VkPipelineShaderStageCreateInfo, 3> stages{};
+    u32 stage_count{};
+    const auto append_stage = [&](VkShaderStageFlagBits stage, VkShaderModule module) {
+        stages[stage_count++] = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                .stage = stage, .module = module, .pName = "main"};
     };
+    append_stage(VK_SHADER_STAGE_VERTEX_BIT, *vertex_module);
+    if (geometry) {
+        append_stage(VK_SHADER_STAGE_GEOMETRY_BIT, *geometry_module);
+    }
+    if (fragment) {
+        append_stage(VK_SHADER_STAGE_FRAGMENT_BIT, *fragment_module);
+    }
     const VkPipelineVertexInputStateCreateInfo vertex_input{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = static_cast<u32>(streams.size()),
@@ -1095,11 +1995,15 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     }
     // Vulkan's framebuffer-space winding is opposite NVN's clip-space winding.
     const bool clockwise = (raster.polygon & 4) != 0;
+    const auto features = device.GetPhysical().GetFeatures();
     const VkPipelineRasterizationStateCreateInfo rasterization{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = raster.depth_clamp && features.depthClamp,
+        .rasterizerDiscardEnable = raster.discard,
         .polygonMode = static_cast<VkPolygonMode>(2 - polygon),
         .cullMode = raster.polygon & 3,
         .frontFace = clockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .depthBiasEnable = raster.depth_bias,
         .lineWidth = 1.0f,
     };
     const VkPipelineMultisampleStateCreateInfo samples{
@@ -1177,6 +2081,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     };
     constexpr std::array dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                        VK_DYNAMIC_STATE_DEPTH_BIAS,
                                         VK_DYNAMIC_STATE_STENCIL_REFERENCE,
                                         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                                         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
@@ -1195,7 +2100,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     result.pipeline = logical.CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &rendering,
-        .stageCount = static_cast<u32>(stages.size()),
+        .stageCount = stage_count,
         .pStages = stages.data(),
         .pVertexInputState = &vertex_input,
         .pInputAssemblyState = &input,
@@ -1212,6 +2117,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
 }
 
 void BananzaNvn2Replay::NoteSkip(std::string_view reason) {
+    ++draw_skips[reason];
     const u64 serial = graphics_program ? graphics_program->serial : 0;
     const bool full_size = trace_images && colors[0] && colors[0]->description.width >= 1900;
     if ((draw_diagnostics.size() < 40 || (full_size && draw_diagnostics.size() < 150)) &&
@@ -1223,7 +2129,8 @@ void BananzaNvn2Replay::NoteSkip(std::string_view reason) {
 void BananzaNvn2Replay::TraceImage(std::string_view operation, const Texture& texture, u64 detail) {
     const auto& d = texture.description;
     const auto address = texture.storage.gpu_address + texture.offset;
-    if (!trace_images || d.width < 900 || traced_images.size() >= 300 ||
+    const bool small_depth = d.format == 0x32 || d.format == 0x34;
+    if (!trace_images || (!small_depth && d.width < 900) || traced_images.size() >= 600 ||
         !traced_images.emplace(operation, address, detail).second) {
         return;
     }
@@ -1231,15 +2138,161 @@ void BananzaNvn2Replay::TraceImage(std::string_view operation, const Texture& te
              operation, address, d.width, d.height, d.format, detail);
 }
 
+bool BananzaNvn2Replay::ResetIndirectDraws(const DrawState& draw, const Submission& submission) {
+    namespace Reset = VideoCommon::NativeIndirectReset;
+    const auto& [address, size] = storage_buffers[0][0];
+    const auto list = Reset::GetListRange(address, static_cast<u32>(size), draw.first, draw.count);
+    if (!list || !submission.guest_memory) {
+        return false;
+    }
+    const auto snapshot = submission.buffer_snapshots.find({list->address, list->bytes});
+    if (snapshot == submission.buffer_snapshots.end()) {
+        return false;
+    }
+    std::vector<u64> records;
+    records.reserve(draw.count);
+    for (size_t offset = 0; offset < list->bytes; offset += sizeof(u64)) {
+        u64_le record;
+        std::memcpy(&record, snapshot->second.data() + offset, sizeof(record));
+        if (!record) {
+            continue;
+        }
+        if (record % alignof(u32) || !submission.indirect_reset_addresses.contains(record) ||
+            (record < list->address + list->bytes && list->address < record + sizeof(Reset::Record))) {
+            return false;
+        }
+        records.push_back(record);
+    }
+    static constexpr std::array<u32_le, 5> reset_words{0, 1, 0, 0, 0};
+    const std::span<const u8> reset_bytes{reinterpret_cast<const u8*>(reset_words.data()),
+                                         sizeof(reset_words)};
+    const std::set<u64> changed(records.begin(), records.end());
+    std::vector<std::pair<VkBuffer, VkBufferCopy>> copies_to_storage;
+    for (const u64 record : records) {
+        submission.guest_memory->WriteBlockUnsafe(submission.indirect_reset_addresses.at(record),
+                                                   reset_bytes.data(), reset_bytes.size());
+        buffer_updates.push_back({record, reset_bytes});
+        if (const auto storage = FindStorageRange({record, reset_bytes.size()});
+            storage != storage_uploads.end()) {
+            copies_to_storage.emplace_back(*storage->second.buffer,
+                                           VkBufferCopy{0, record - storage->first.first,
+                                                        reset_bytes.size()});
+        }
+        reset_indirect_draws.insert(record);
+    }
+    std::erase_if(uploaded_ranges, [&](const auto& entry) {
+        const auto [start, size] = entry.first;
+        const auto next = changed.lower_bound(start);
+        return (next != changed.end() && *next < start + size) ||
+               (next != changed.begin() && *std::prev(next) + reset_bytes.size() > start);
+    });
+    if (!copies_to_storage.empty()) {
+        const auto source = Upload(reset_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        Barrier();
+        bool overlaps = changed.size() != records.size();
+        if (!changed.empty()) {
+            auto last = changed.begin();
+            for (auto next = std::next(last); next != changed.end(); last = next++) {
+                overlaps |= *next - *last < reset_bytes.size();
+            }
+        }
+        scheduler.Record([source, destinations = std::move(copies_to_storage), overlaps](vk::CommandBuffer cmdbuf) {
+            const VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            for (const auto& [buffer, region] : destinations) {
+                if (overlaps) {
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+                }
+                cmdbuf.CopyBuffer(source, buffer, region);
+            }
+        });
+    }
+    if (trace_images && draw_diagnostics.emplace(graphics_program->serial, "indirect draw reset").second) {
+        LOG_INFO(Render_Vulkan, "NVN 2 program {} reset {} indirect draw records", graphics_program->serial,
+                 draw.count);
+    }
+    return true;
+}
+
 void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) {
+    if (!render_enabled) {
+        return;
+    }
     if (graphics_program && colors[0]) {
         TraceImage("draw request", *colors[0], graphics_program->serial);
     }
-    if (op.args.empty() || !graphics_program || !colors[0]) {
+    if (op.args.empty()) {
+        return;
+    }
+    if (!graphics_program) {
+        NoteSkip("no vertex program bound");
         return;
     }
     const auto topology = Topology(op.args[0]);
-    auto draw = DecodeDraw(op);
+    std::optional<DrawState> draw;
+    if (op.replay == ReplayOp::DrawIndirect && op.args.size() == 2) {
+        draw = DrawState{.indirect_range = {op.args[1], sizeof(VkDrawIndirectCommand)}};
+    } else if (op.replay == ReplayOp::DrawIndexedIndirect && op.args.size() == 4 &&
+               op.args[1] <= 2) {
+        if (op.args[1] == 0 && !device.IsExtIndexTypeUint8Supported()) {
+            NoteSkip("indirect uint8 indices unsupported by host");
+            return;
+        }
+        constexpr std::array types{VK_INDEX_TYPE_UINT8_EXT, VK_INDEX_TYPE_UINT16,
+                                   VK_INDEX_TYPE_UINT32};
+        const Range arguments{op.args[3], sizeof(VkDrawIndexedIndirectCommand)};
+        const auto argument_storage = FindStorageRange(arguments);
+        const bool gpu_written = argument_storage != storage_uploads.end() &&
+                                 arguments.first - argument_storage->first.first <
+                                     argument_storage->second.written_bytes;
+        const auto slice = submission.indirect_index_slices.find({op.args[3], op.args[2], op.args[1]});
+        const auto snapshot = submission.buffer_snapshots.find(arguments);
+        if (!gpu_written && reset_indirect_draws.contains(arguments.first)) {
+            return;
+        }
+        if (!gpu_written && snapshot != submission.buffer_snapshots.end()) {
+            VkDrawIndexedIndirectCommand command{};
+            std::memcpy(&command, snapshot->second.data(), sizeof(command));
+            if (!command.indexCount || !command.instanceCount) {
+                return;
+            }
+            if (slice != submission.indirect_index_slices.end()) {
+                draw = DrawState{.count = command.indexCount, .instances = command.instanceCount,
+                                 .base_instance = command.firstInstance,
+                                 .base_vertex = command.vertexOffset,
+                                 .index_type = types[op.args[1]], .index_range = slice->second};
+            }
+        }
+        if (!draw) {
+            const auto index_storage = FindStorageRange({op.args[2], u64{1} << op.args[1]});
+            const auto saved_size = submission.indirect_index_sizes.find(op.args[2]);
+            const u64 size = index_storage != storage_uploads.end()
+                                 ? index_storage->first.second -
+                                       (op.args[2] - index_storage->first.first)
+                             : saved_size != submission.indirect_index_sizes.end() ? saved_size->second
+                                                                                  : 0;
+            if (!size) {
+                if (trace_images && draw_diagnostics.emplace(graphics_program->serial,
+                                                              "indirect index detail").second) {
+                    LOG_INFO(Render_Vulkan,
+                             "NVN 2 program {} indirect indices {:#x} type {}, args {:#x}, GPU written {}, args snapshot {}, index slice {}",
+                             graphics_program->serial, op.args[2], op.args[1], arguments.first,
+                             gpu_written, snapshot != submission.buffer_snapshots.end(),
+                             slice != submission.indirect_index_slices.end());
+                }
+                NoteSkip("indirect index buffer range missing at submit");
+                return;
+            }
+            draw = DrawState{.index_type = types[op.args[1]], .index_range = {op.args[2], size},
+                             .indirect_range = arguments, .indexed_indirect = true};
+        }
+    } else {
+        draw = DecodeDraw(op);
+    }
     if (!draw || topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM) {
         NoteSkip("unsupported draw arguments or topology");
         if (trace_images && draw_diagnostics.emplace(graphics_program->serial,
@@ -1251,18 +2304,58 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         }
         return;
     }
-    if (!draw->count || !draw->instances) {
+    if (!draw->indirect_range.second && (!draw->count || !draw->instances)) {
         return;
+    }
+    if (graphics_program->resets_indirect_draws && op.replay == ReplayOp::Draw && op.args[0] == 0 &&
+        ResetIndirectDraws(*draw, submission)) {
+        return;
+    }
+    VkBuffer indirect_buffer{};
+    u64 indirect_offset{};
+    if (draw->indirect_range.second) {
+        if (op.args[0] == 7 || op.args[0] == 8) {
+            NoteSkip("indirect quad topology");
+            return;
+        }
+        std::tie(indirect_buffer, indirect_offset) = UploadBufferRange(submission, draw->indirect_range);
+        if (!indirect_buffer || indirect_offset % 4) {
+            NoteSkip("draw indirect argument buffer unavailable");
+            return;
+        }
+        if (draw->indexed_indirect &&
+            FindStorageRange(draw->indirect_range) == storage_uploads.end()) {
+            const auto args = submission.buffer_snapshots.find(draw->indirect_range);
+            if (args == submission.buffer_snapshots.end()) {
+                return;
+            }
+            VkDrawIndexedIndirectCommand command{};
+            std::memcpy(&command, args->second.data(), sizeof(command));
+            const u64 element_size = u64{1} << op.args[1];
+            const u64 end = (u64{command.firstIndex} + command.indexCount) * element_size;
+            if (end > draw->index_range.second) {
+                NoteSkip("indirect index range exceeds snapshot");
+                return;
+            }
+        }
     }
     ColorFormats formats{};
     std::array<Image*, 8> targets{};
     std::array<VkImageView, 8> views{};
+    VkExtent2D extent{std::numeric_limits<u32>::max(), std::numeric_limits<u32>::max()};
+    u32 layers = std::numeric_limits<u32>::max();
+    const auto include = [&](const Image& target, const AttachmentView& view) {
+        extent.width = std::min(extent.width, std::max(1U, target.extent.width >> view.level));
+        extent.height = std::min(extent.height, std::max(1U, target.extent.height >> view.level));
+        layers = std::min(layers, view.layers);
+    };
     u32 color_count{};
     for (u32 slot = 0; slot < colors.size(); ++slot) {
         if (!colors[slot] || !colors[slot]->serial) {
             continue;
         }
-        if (!base_color_views[slot]) {
+        const auto& view = color_views[slot];
+        if (!view.format) {
             NoteSkip("unsupported color attachment view");
             return;
         }
@@ -1277,47 +2370,53 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             NoteSkip("unsupported color attachment");
             return;
         }
-        const VkFormat format = color_view_formats[slot];
-        if (format == target->format) {
-            views[slot] = *target->view;
-        } else {
-            auto view = target->attachment_views.find(format);
-            if (view == target->attachment_views.end()) {
-                if (!device.IsFormatSupported(format, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
-                                              FormatType::Optimal)) {
-                    NoteSkip("unsupported color attachment view format");
-                    return;
-                }
-                view = target->attachment_views
-                           .emplace(format, CreateWrappedImageView(device, target->image, format))
-                           .first;
-            }
-            views[slot] = *view->second;
+        views[slot] = GetAttachmentView(*target, view);
+        if (!views[slot]) {
+            NoteSkip("unsupported color attachment subresource");
+            return;
         }
-        formats[slot] = format;
+        include(*target, view);
+        formats[slot] = view.format;
         targets[slot] = target;
         color_count = slot + 1;
     }
-    const auto* image = targets[0];
-    if (!image || !std::ranges::all_of(targets, [image](const auto* target) {
-            return !target || (target->extent.width >= image->extent.width &&
-                               target->extent.height >= image->extent.height);
-        })) {
-        NoteSkip("incompatible color attachment sizes");
+    auto* depth = depth_texture ? FindImage(*depth_texture, true) : nullptr;
+    const auto depth_attachment_view =
+        depth && depth->aspects != VK_IMAGE_ASPECT_COLOR_BIT
+            ? GetAttachmentView(*depth, depth_view)
+            : VK_NULL_HANDLE;
+    if (depth_texture && !depth_attachment_view) {
+        NoteSkip("unsupported depth attachment");
         return;
     }
-    auto* depth = depth_texture ? FindImage(*depth_texture, true) : nullptr;
-    if (depth && (depth->aspects == VK_IMAGE_ASPECT_COLOR_BIT ||
-                  depth->extent.width < image->extent.width ||
-                  depth->extent.height < image->extent.height)) {
-        depth = nullptr;
+    if (!color_count && !depth) {
+        const auto limits = device.GetPhysical().GetProperties().limits;
+        const auto dimension = [](float viewport_end, s64 scissor_end, u32 limit) {
+            const double end = std::isfinite(viewport_end) && viewport_end >= 1.0f
+                                   ? std::ceil(viewport_end)
+                                   : static_cast<double>(scissor_end);
+            return static_cast<u32>(std::clamp(end, 1.0, static_cast<double>(limit)));
+        };
+        extent = {dimension(viewport.x + viewport.width,
+                            s64{scissor.offset.x} + scissor.extent.width, limits.maxFramebufferWidth),
+                  dimension(viewport.y + viewport.height,
+                            s64{scissor.offset.y} + scissor.extent.height, limits.maxFramebufferHeight)};
+        layers = 1;
+    }
+    if (depth) {
+        include(*depth, depth_view);
     }
     auto raster = raster_state;
     raster.depth_format = depth ? depth->format : VK_FORMAT_UNDEFINED;
     raster.depth_aspects = depth ? depth->aspects : 0;
     raster.negative_one_to_one = submission.depth_minus_one_to_one;
     raster.origin_lower_left = submission.origin_lower_left;
-    const PipelineKey key{graphics_program->serial, formats, topology, vertex_attributes,
+    const bool biased = raster.depth_bias;
+    const auto bias = depth_bias;
+    const float bias_clamp = device.GetPhysical().GetFeatures().depthBiasClamp ? bias[2] : 0.0f;
+    const PipelineKey key{graphics_program->serial, fragment_program ? fragment_program->serial : 0,
+                          geometry_program ? geometry_program->serial : 0,
+                          formats, topology, vertex_attributes,
                           vertex_strides, vertex_divisors, color_state, raster};
     const auto [entry, inserted] = pipelines.try_emplace(key);
     if (inserted) {
@@ -1346,6 +2445,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         vertices.emplace_back(stream, buffer);
     }
     VkBuffer index_buffer{};
+    u64 index_offset{};
     if (op.args[0] == 7 || op.args[0] == 8) {
         const bool strip = op.args[0] == 8;
         const u32 quads = draw->count < 4 ? 0 : strip ? (draw->count - 2) / 2 : draw->count / 4;
@@ -1391,25 +2491,44 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         draw->index_type = VK_INDEX_TYPE_UINT32;
         draw->count = static_cast<u32>(triangles.size());
     } else if (draw->index_type != VK_INDEX_TYPE_MAX_ENUM) {
-        index_buffer = UploadRange(submission, draw->index_range);
+        std::tie(index_buffer, index_offset) = UploadBufferRange(submission, draw->index_range);
         if (!index_buffer) {
             NoteSkip("index buffer range missing at submit");
             return;
         }
     }
     VkDescriptorSet set{};
-    if (!pipeline.uniforms.empty() || !pipeline.textures.empty()) {
+    std::vector<std::pair<StorageUpload*, u64>> written_storage;
+    if (!pipeline.uniforms.empty() || !pipeline.storage.empty() || !pipeline.textures.empty()) {
+        std::array<u8, 0x1000> driver{};
+        constexpr float max_point_size = 2047.0f;
+        const u32_le base_instance = draw->base_instance;
+        std::memcpy(driver.data() + 0x610, &max_point_size, sizeof(max_point_size));
+        std::memcpy(driver.data() + 0x644, &base_instance, sizeof(base_instance));
+        for (u32 stage = 0; stage < GraphicsStorageBase.size(); ++stage) {
+            const u32 base = GraphicsStorageBase[stage];
+            for (u32 slot = 0; slot < 16; ++slot) {
+                const auto& range = storage_buffers[stage][slot];
+                const u64_le address = range.first;
+                const u32_le size = static_cast<u32>(range.second);
+                std::memcpy(driver.data() + base + slot * 16, &address, sizeof(address));
+                std::memcpy(driver.data() + base + slot * 16 + 8, &size, sizeof(size));
+            }
+        }
         std::vector<VkDescriptorBufferInfo> infos;
         infos.reserve(pipeline.uniforms.size());
         for (const auto& binding : pipeline.uniforms) {
             const auto& bound = uniform_buffers[binding.stage];
             // NVN user uniform slots follow the driver's three internal banks.
             const auto range = binding.bank >= 3 ? bound[binding.bank - 3] : Range{};
-            const auto literal = binding.bank == 17
-                                     ? std::span<const u8>{graphics_constants[0]}
-                                     : binding.bank >= 24
-                                           ? std::span<const u8>{graphics_constants[binding.bank - 24]}
-                                           : std::span<const u8>{binding.literal};
+            std::span<const u8> literal{binding.literal};
+            if (binding.bank == 0) {
+                literal = driver;
+            } else if (binding.bank == 17) {
+                literal = graphics_constants[0];
+            } else if (binding.bank >= 24) {
+                literal = graphics_constants[binding.bank - 24];
+            }
             const u64 size = literal.empty() ? range.second : literal.size();
             if (!size || size > 65536) {
                 if (draw_diagnostics.size() < 40 &&
@@ -1428,6 +2547,41 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             }
             infos.push_back({buffer, 0, size});
         }
+        std::vector<VkDescriptorBufferInfo> storage_infos;
+        storage_infos.reserve(pipeline.storage.size());
+        const auto storage_limits = device.GetPhysical().GetProperties().limits;
+        for (const auto& [stage, binding, slot, writable] : pipeline.storage) {
+            const auto range = storage_buffers[stage][slot];
+            if (trace_images && stage == 2 &&
+                draw_diagnostics.emplace(geometry_program->serial,
+                                         slot == 0 ? "geometry storage 0" : "geometry storage 1").second) {
+                LOG_INFO(Render_Vulkan,
+                         "NVN 2 geometry program {} storage slot {} at {:#x}, {} bytes, write {}, snapshot {}, mapping {}",
+                         geometry_program->serial, slot, range.first, range.second, writable,
+                         submission.buffer_snapshots.contains(range),
+                         submission.storage_addresses.contains(range));
+            }
+            if (!range.first || !range.second || range.second > storage_limits.maxStorageBufferRange) {
+                NoteSkip("graphics storage range missing or exceeds host limit");
+                return;
+            }
+            VkBuffer buffer{};
+            u64 offset{};
+            if (writable) {
+                if (const auto [upload, start] = WritableStorage(submission, range); upload) {
+                    buffer = *upload->buffer;
+                    offset = start;
+                    written_storage.emplace_back(upload, offset + range.second);
+                }
+            } else {
+                std::tie(buffer, offset) = UploadBufferRange(submission, range);
+            }
+            if (!buffer || offset % storage_limits.minStorageBufferOffsetAlignment) {
+                NoteSkip("graphics storage range missing at submit");
+                return;
+            }
+            storage_infos.push_back({buffer, offset, range.second});
+        }
         std::vector<VkDescriptorImageInfo> image_infos;
         image_infos.reserve(pipeline.textures.size());
         for (const auto& [stage, binding, descriptor] : pipeline.textures) {
@@ -1441,6 +2595,10 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         std::vector<VkDescriptorPoolSize> pool_sizes;
         if (!infos.empty()) {
             pool_sizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<u32>(infos.size())});
+        }
+        if (!storage_infos.empty()) {
+            pool_sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  static_cast<u32>(storage_infos.size())});
         }
         if (!image_infos.empty()) {
             pool_sizes.push_back({VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1471,6 +2629,16 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                 .pBufferInfo = &infos[i],
             });
         }
+        for (size_t i = 0; i < storage_infos.size(); ++i) {
+            writes.push_back({
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set,
+                .dstBinding = pipeline.storage[i].binding,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &storage_infos[i],
+            });
+        }
         for (size_t i = 0; i < image_infos.size(); ++i) {
             writes.push_back({
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1486,7 +2654,6 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     }
 
     VkViewport draw_viewport = viewport;
-    const VkExtent2D extent = image->extent;
     if (!(draw_viewport.width > 0.0f && draw_viewport.height > 0.0f)) {
         draw_viewport = {0, 0, static_cast<float>(extent.width), static_cast<float>(extent.height),
                          0.0f, 1.0f};
@@ -1502,22 +2669,10 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         draw_viewport.height > limits.maxViewportDimensions[1]) {
         return;
     }
-    VkRect2D draw_scissor{{}, extent};
-    if (has_scissor) {
-        const s64 left = std::clamp<s64>(scissor.offset.x, 0, extent.width);
-        const s64 top = std::clamp<s64>(scissor.offset.y, 0, extent.height);
-        const s64 right = std::clamp<s64>(s64{scissor.offset.x} + scissor.extent.width,
-                                          left, extent.width);
-        const s64 bottom = std::clamp<s64>(s64{scissor.offset.y} + scissor.extent.height,
-                                           top, extent.height);
-        draw_scissor = {{static_cast<s32>(left), static_cast<s32>(top)},
-                        {static_cast<u32>(right - left), static_cast<u32>(bottom - top)}};
-    }
+    const VkRect2D draw_scissor = ScissorFor(extent);
     if (submission.origin_lower_left) {
         draw_viewport.y = static_cast<float>(extent.height) - draw_viewport.y;
         draw_viewport.height = -draw_viewport.height;
-        draw_scissor.offset.y = static_cast<s32>(extent.height) - draw_scissor.offset.y -
-                                static_cast<s32>(draw_scissor.extent.height);
     }
     std::array<VkRenderingAttachmentInfo, 8> attachments{};
     for (u32 i = 0; i < color_count; ++i) {
@@ -1532,11 +2687,12 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         };
         if (target) {
             Initialize(*target);
+            target->gpu_written = true;
         }
     }
     VkRenderingAttachmentInfo depth_attachment{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = depth ? *depth->view : VK_NULL_HANDLE,
+        .imageView = depth_attachment_view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         .loadOp = depth && depth->initialized ? VK_ATTACHMENT_LOAD_OP_LOAD
                                               : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -1544,13 +2700,19 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     };
     if (depth) {
         Initialize(*depth);
+        depth->gpu_written = true;
+    }
+    for (const auto& [upload, size] : written_storage) {
+        upload->written_bytes = std::max(upload->written_bytes, size);
     }
     Barrier();
     std::optional<u32> probe;
-    if (frame_dump.CapturingSampled() && extent.width >= 1900) {
+    if (frame_dump.CapturingSampled() && colors[0] && extent.width >= 1900) {
         const std::array shaders{graphics_program->serial};
         frame_dump.NoteDraw(shaders);
-        probe = frame_dump.BeginProbe();
+        if (!count_samples) {
+            probe = frame_dump.BeginProbe();
+        }
         if (probe) {
             LOG_INFO(Render_Vulkan,
                      "NVN 2 probe {} program {} target {:#x}, {} elements, viewport {} {} {} {}, scissor {} {} {} {}, polygon {:#x}, depth {:#x}/{}, range {} {}",
@@ -1563,27 +2725,46 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                      draw_viewport.maxDepth);
         }
     }
+    if (occlusion_queries == OcclusionQueryCount) {
+        CollectOcclusion();
+    }
+    const VkQueryPool query_pool = count_samples ? *occlusion_pool : VK_NULL_HANDLE;
+    const u32 query = count_samples ? occlusion_queries++ : 0;
+    const VkQueryControlFlags query_flags = precise_queries ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
     scheduler.Record([attachments, color_count, depth_attachment, depth_aspects = raster.depth_aspects,
                       graphics = *pipeline.pipeline, layout = *pipeline.layout,
-                      extent, draw_viewport, draw_scissor, command = *draw, set, index_buffer,
+                      extent, layers, draw_viewport, draw_scissor, command = *draw, set, index_buffer,
+                      index_offset,
+                      indirect_buffer, indirect_offset, biased, bias, bias_clamp,
+                      query_pool, query, query_flags,
                       blend_color = blend_constants, uses_render_area = pipeline.uses_render_area,
+                      stages = pipeline.stages,
                       refs = stencil_ref, compare_masks = stencil_compare_mask,
                       write_masks = stencil_write_mask,
                       vertices = std::move(vertices)](
                          vk::CommandBuffer cmdbuf) {
+        if (query_pool) {
+            cmdbuf.ResetQueryPool(query_pool, query, 1);
+        }
         cmdbuf.BeginRendering(VkRenderingInfo{
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
             .renderArea = {{}, extent},
-            .layerCount = 1,
+            .layerCount = layers,
             .colorAttachmentCount = color_count,
             .pColorAttachments = attachments.data(),
             .pDepthAttachment = depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? &depth_attachment : nullptr,
             .pStencilAttachment = depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT ? &depth_attachment : nullptr,
         });
+        if (query_pool) {
+            cmdbuf.BeginQuery(query_pool, query, query_flags);
+        }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics);
         cmdbuf.SetViewport(0, {draw_viewport});
         cmdbuf.SetScissor(0, {draw_scissor});
         cmdbuf.SetBlendConstants(blend_color.data());
+        if (biased) {
+            cmdbuf.SetDepthBias(bias[1], bias_clamp, bias[0]);
+        }
         for (u32 i = 0; i < 2; ++i) {
             const VkStencilFaceFlags face = i == 0 ? VK_STENCIL_FACE_FRONT_BIT : VK_STENCIL_FACE_BACK_BIT;
             cmdbuf.SetStencilReference(face, refs[i]);
@@ -1591,7 +2772,6 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             cmdbuf.SetStencilWriteMask(face, write_masks[i]);
         }
         using namespace Shader::Backend::SPIRV;
-        constexpr auto stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         constexpr RescalingLayout rescale{.down_factor = std::bit_cast<u32>(1.0f)};
         cmdbuf.PushConstants(layout, stages, rescale);
         if (uses_render_area) {
@@ -1605,12 +2785,20 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         for (const auto& [stream, buffer] : vertices) {
             cmdbuf.BindVertexBuffer(stream, buffer, 0);
         }
-        if (index_buffer) {
-            cmdbuf.BindIndexBuffer(index_buffer, 0, command.index_type);
+        if (command.indexed_indirect) {
+            cmdbuf.BindIndexBuffer(index_buffer, index_offset, command.index_type);
+            cmdbuf.DrawIndexedIndirect(indirect_buffer, indirect_offset, 1, sizeof(VkDrawIndexedIndirectCommand));
+        } else if (indirect_buffer) {
+            cmdbuf.DrawIndirect(indirect_buffer, indirect_offset, 1, sizeof(VkDrawIndirectCommand));
+        } else if (index_buffer) {
+            cmdbuf.BindIndexBuffer(index_buffer, index_offset, command.index_type);
             cmdbuf.DrawIndexed(command.count, command.instances, 0, command.base_vertex,
                                command.base_instance);
         } else {
             cmdbuf.Draw(command.count, command.instances, command.first, command.base_instance);
+        }
+        if (query_pool) {
+            cmdbuf.EndQuery(query_pool, query);
         }
         cmdbuf.EndRendering();
     });
@@ -1619,7 +2807,9 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                                      .instances = draw->instances,
                                      .color0 = (color_state.channel_mask & 15) != 0});
     }
-    TraceImage("draw", *colors[0], graphics_program->serial);
+    if (colors[0]) {
+        TraceImage("draw", *colors[0], graphics_program->serial);
+    }
     if (++draws == 1) {
         LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay recorded its first guest draw");
     }
@@ -1634,8 +2824,9 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
         switch (op.replay) {
         case ReplayOp::SetRenderTargets: {
             colors.fill(std::nullopt);
-            base_color_views.fill(false);
+            color_views.fill({});
             depth_texture.reset();
+            depth_view = {};
             if (op.args.empty() || op.args[0] > colors.size()) {
                 break;
             }
@@ -1644,21 +2835,43 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 op.payload.size() != 16 * (count + 1)) {
                 break;
             }
+            const auto attachment = [&](const Texture& texture, std::span<const u8> view,
+                                        bool has_view) -> AttachmentView {
+                const auto& desc = texture.description;
+                const u32 format = has_view ? ViewFormat(view, desc.format) : desc.format;
+                const auto host = FindColorFormat(format);
+                if (!host || !HasCompatibleFormat(format, desc.format)) {
+                    return {};
+                }
+                const u8 flags = has_view ? view[7] : 0;
+                const u32 level = flags & 1 ? u32{view[4]} : 0;
+                if (level >= desc.levels) {
+                    return {};
+                }
+                const u32 available = desc.target == 2 ? std::max(1U, desc.depth >> level)
+                                                       : texture.layout.layers;
+                const u32 first = flags & 2 ? u32{view[0]} | (u32{view[1]} << 8) : 0;
+                const u32 count = flags & 2 ? u32{view[2]} | (u32{view[3]} << 8) : 0;
+                if (first >= available) {
+                    return {};
+                }
+                return {
+                    .format = host->vk,
+                    .level = level,
+                    .layer = first,
+                    .layers = count ? count : available - first,
+                };
+            };
             for (size_t i = 0; i < count; ++i) {
-                colors[i] = op.textures[i];
-                const auto& description = op.textures[i].description;
-                const auto view = std::span{op.payload}.subspan(16 * i, 16);
-                const bool has_view = op.args[2 + count + i] != 0;
-                const auto format = FindColorFormat(has_view ? ViewFormat(view, description.format)
-                                                              : description.format);
-                base_color_views[i] = format && (!has_view || IsBaseView(view, description, true));
-                color_view_formats[i] = format ? format->vk : VK_FORMAT_UNDEFINED;
+                if (op.textures[i].serial) {
+                    colors[i] = op.textures[i];
+                    color_views[i] = attachment(*colors[i], std::span{op.payload}.subspan(16 * i, 16),
+                                                op.args[2 + count + i] != 0);
+                }
             }
             if (const auto& texture = op.textures.back(); texture.serial) {
-                const auto view = std::span{op.payload}.last(16);
-                if (!op.args.back() || IsBaseView(view, texture.description)) {
-                    depth_texture = texture;
-                }
+                depth_texture = texture;
+                depth_view = attachment(texture, std::span{op.payload}.last(16), op.args.back() != 0);
             }
             break;
         }
@@ -1682,6 +2895,22 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 u32_le value;
                 std::memcpy(&value, op.payload.data(), sizeof(value));
                 raster_state.polygon = value & 31;
+                const u32 offset_enables = (value >> 5) & 7;
+                const u32 mode = (value >> 3) & 3;
+                raster_state.depth_bias = mode < 3 && (offset_enables & (1U << mode)) != 0;
+            }
+            break;
+        case ReplayOp::SetDepthClamp:
+        case ReplayOp::SetRasterizerDiscard:
+            if (op.args.size() == 1) {
+                bool& enabled = op.replay == ReplayOp::SetDepthClamp ? raster_state.depth_clamp
+                                                                     : raster_state.discard;
+                enabled = (op.args[0] & 255) != 0;
+            }
+            break;
+        case ReplayOp::SetPolygonOffsetClamp:
+            if (op.payload.size() == sizeof(depth_bias)) {
+                std::memcpy(depth_bias.data(), op.payload.data(), sizeof(depth_bias));
             }
             break;
         case ReplayOp::SetDepthRange:
@@ -1704,14 +2933,37 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::CopyTexture:
-            CopyTexture(op);
+            CopyTexture(op, submission);
+            break;
+        case ReplayOp::CopyBufferToTexture:
+            CopyBufferToTexture(op, submission);
+            break;
+        case ReplayOp::SetCopyRowStride:
+            if (op.args.size() == 1) {
+                copy_row_stride = op.args[0];
+            }
             break;
         case ReplayOp::Barrier:
             Barrier();
             break;
         case ReplayOp::BindProgram:
-            if (op.args.size() == 2 && (op.args[1] & 3)) {
-                graphics_program = (op.args[1] & 3) == 3 ? op.program : nullptr;
+            if (op.args.size() == 2) {
+                const auto bind = [&](std::shared_ptr<const Program>& destination, u32 bit, u32 stage) {
+                    if (!(op.args[1] & bit)) {
+                        return;
+                    }
+                    if (op.program && std::ranges::any_of(op.program->shaders, [stage](const auto& shader) {
+                            return shader.stage == stage;
+                        })) {
+                        destination = op.program;
+                    } else {
+                        destination.reset();
+                    }
+                };
+                bind(graphics_program, 1, 0);
+                bind(fragment_program, 2, 4);
+                bind(geometry_program, 4, 3);
+                bind(compute_program, 0x20, 5);
             }
             break;
         case ReplayOp::BindVertexBuffer:
@@ -1720,18 +2972,31 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::BindUniformBuffer:
-            if (op.args.size() == 4 && op.args[0] < uniform_buffers.size() && op.args[1] < 32) {
-                uniform_buffers[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
+        case ReplayOp::BindStorageBuffer: {
+            auto& ranges = op.replay == ReplayOp::BindUniformBuffer ? uniform_buffers
+                                                                   : storage_buffers;
+            if (op.args.size() == 4 && op.args[0] < ranges.size() && op.args[1] < 32) {
+                ranges[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
             }
             break;
+        }
         case ReplayOp::BindUniformBuffers:
-            if (op.args.size() == 3 && op.args[0] < uniform_buffers.size() && op.args[1] < 32 &&
+        case ReplayOp::BindStorageBuffers: {
+            auto& ranges = op.replay == ReplayOp::BindUniformBuffers ? uniform_buffers
+                                                                    : storage_buffers;
+            if (op.args.size() == 3 && op.args[0] < ranges.size() && op.args[1] < 32 &&
                 op.args[2] <= 32 - op.args[1] && op.payload.size() == 16 * op.args[2]) {
                 for (size_t i = 0; i < op.args[2]; ++i) {
                     std::array<u64_le, 2> range{};
                     std::memcpy(range.data(), op.payload.data() + i * 16, 16);
-                    uniform_buffers[op.args[0]][op.args[1] + i] = {range[0], range[1]};
+                    ranges[op.args[0]][op.args[1] + i] = {range[0], range[1]};
                 }
+            }
+            break;
+        }
+        case ReplayOp::BindImage:
+            if (op.args.size() == 3 && op.args[0] < image_handles.size() && op.args[1] < 32) {
+                image_handles[op.args[0]][op.args[1]] = op.args[2];
             }
             break;
         case ReplayOp::BindTexture:
@@ -1771,11 +3036,15 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::PushGraphicsConstants:
+        case ReplayOp::PushComputeConstants: {
+            auto& constants = op.replay == ReplayOp::PushGraphicsConstants ? graphics_constants
+                                                                          : compute_constants;
             if (op.args.size() == 2 && op.args[0] < graphics_constants.size() &&
                 op.args[1] <= 256 && op.payload.size() <= 256 - op.args[1]) {
-                std::ranges::copy(op.payload, graphics_constants[op.args[0]].begin() + op.args[1]);
+                std::ranges::copy(op.payload, constants[op.args[0]].begin() + op.args[1]);
             }
             break;
+        }
         case ReplayOp::UpdateUniformBuffer:
             if (op.args.size() == 4 && !op.payload.empty() && op.payload.size() == op.args[3] &&
                 op.args[0] <= std::numeric_limits<u64>::max() - op.args[1] &&
@@ -1844,6 +3113,15 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                             static_cast<float>(static_cast<s32>(op.args[3])), 0.0f, 1.0f};
             }
             break;
+        case ReplayOp::SetViewports:
+            if (op.args.size() == 2 && op.args[0] == 0 && op.payload.size() >= 4 * sizeof(float)) {
+                std::array<float, 4> rect{};
+                std::memcpy(rect.data(), op.payload.data(), sizeof(rect));
+                if (std::ranges::all_of(rect, [](float value) { return std::isfinite(value); })) {
+                    viewport = {rect[0], rect[1], rect[2], rect[3], 0.0f, 1.0f};
+                }
+            }
+            break;
         case ReplayOp::SetScissor:
             if (op.args.size() == 4) {
                 scissor = {{static_cast<s32>(op.args[0]), static_cast<s32>(op.args[1])},
@@ -1851,18 +3129,46 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 has_scissor = true;
             }
             break;
+        case ReplayOp::SetScissors:
+            if (op.args.size() == 2 && op.args[0] == 0 && op.payload.size() >= 4 * sizeof(u32)) {
+                std::array<s32_le, 4> rect{};
+                std::memcpy(rect.data(), op.payload.data(), sizeof(rect));
+                scissor = {{rect[0], rect[1]},
+                           {static_cast<u32>(std::max<s32>(0, rect[2])),
+                            static_cast<u32>(std::max<s32>(0, rect[3]))}};
+                has_scissor = true;
+            }
+            break;
+        case ReplayOp::SetDepthRanges:
+            if (op.args.size() == 2 && op.args[0] == 0 && op.payload.size() >= sizeof(depth_range)) {
+                std::memcpy(depth_range.data(), op.payload.data(), sizeof(depth_range));
+            }
+            break;
         case ReplayOp::Draw:
         case ReplayOp::DrawIndexed:
         case ReplayOp::DrawIndexedBaseVertex:
         case ReplayOp::DrawIndexedInstanced:
         case ReplayOp::DrawInstanced:
+        case ReplayOp::DrawIndirect:
+        case ReplayOp::DrawIndexedIndirect:
             Draw(op, submission);
             break;
         case ReplayOp::Dispatch:
-            if (!missing_dispatch_logged) {
-                missing_dispatch_logged = true;
-                LOG_WARNING(Render_Vulkan, "Bananza NVN 2 Vulkan replay: guest dispatches need compute pipelines");
+            Dispatch(op, submission);
+            break;
+        case ReplayOp::SignalEvent:
+        case ReplayOp::WaitEvent:
+            ReplayEvent(op, submission);
+            break;
+        case ReplayOp::SetRenderEnable:
+            if (op.args.size() == 1) {
+                render_enabled = (op.args[0] & 255) != 0;
             }
+            break;
+        case ReplayOp::SetRenderEnableConditional:
+        case ReplayOp::ReportCounter:
+        case ReplayOp::ResetCounter:
+            ReplayCounter(op, submission);
             break;
         case ReplayOp::Unsupported:
             break;
@@ -1870,17 +3176,118 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
     }
 }
 
+void BananzaNvn2Replay::CollectOcclusion() {
+    if (!occlusion_queries) {
+        return;
+    }
+    scheduler.Finish();
+    std::array<u64, OcclusionQueryCount> results{};
+    vk::Check(device.GetLogical().GetQueryResults(*occlusion_pool, 0, occlusion_queries,
+                                                  sizeof(results), results.data(), sizeof(u64),
+                                                  VK_QUERY_RESULT_64_BIT));
+    occlusion_samples = std::accumulate(results.begin(), results.begin() + occlusion_queries,
+                                        occlusion_samples);
+    occlusion_queries = 0;
+}
+
+void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& submission) {
+    constexpr u64 SamplesPassed = 1;
+    if (op.replay == ReplayOp::ResetCounter) {
+        if (op.args.size() == 1 && op.args[0] == SamplesPassed) {
+            if (!occlusion_pool) {
+                occlusion_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .queryType = VK_QUERY_TYPE_OCCLUSION,
+                    .queryCount = OcclusionQueryCount,
+                });
+                precise_queries = device.GetPhysical().GetFeatures().occlusionQueryPrecise;
+            }
+            CollectOcclusion();
+            occlusion_samples = 0;
+            count_samples = true;
+        }
+        return;
+    }
+    if (!submission.guest_memory || op.args.size() != 2) {
+        return;
+    }
+    const u64 type = op.args[0];
+    const auto address = submission.event_addresses.find(op.args[1]);
+    if (address == submission.event_addresses.end()) {
+        return;
+    }
+    auto& memory = *submission.guest_memory;
+    if (op.replay == ReplayOp::SetRenderEnableConditional && type <= 1) {
+        std::array<u64_le, 3> data{};
+        if (memory.ReadBlockUnsafe(address->second, data.data(), sizeof(data))) {
+            const bool equal = data[0] == data[2];
+            render_enabled = equal == (type == 0);
+        }
+    } else if (op.replay == ReplayOp::ReportCounter) {
+        if (type == SamplesPassed) {
+            CollectOcclusion();
+        } else if (type == 0) {
+            scheduler.Finish();
+        } else if (type != 16) {
+            if (unsupported_counters.insert(type).second) {
+                LOG_WARNING(Render_Vulkan, "Bananza NVN 2 counter type {} needs a Vulkan query", type);
+            }
+            return;
+        }
+        const std::array<u64_le, 2> report{type == SamplesPassed ? occlusion_samples : 0,
+                                           submission.submitted_ns};
+        memory.WriteBlockUnsafe(address->second, report.data(), sizeof(report));
+    }
+}
+
+void BananzaNvn2Replay::ReplayEvent(const Operation& op, const Submission& submission) {
+    const bool signal = op.replay == ReplayOp::SignalEvent;
+    if (!submission.guest_memory || op.args.size() != (signal ? 5 : 3) || op.args[1] > 1) {
+        return;
+    }
+    const auto address = submission.event_addresses.find(op.args[0]);
+    if (address == submission.event_addresses.end()) {
+        return;
+    }
+    auto& memory = *submission.guest_memory;
+    if (signal) {
+        const auto value = static_cast<u32>(op.args[4]);
+        if (op.args[2] != 0) {
+            scheduler.Finish();
+        }
+        memory.Write32(address->second, op.args[1] == 1 ? memory.Read32(address->second) + value
+                                                        : value);
+        return;
+    }
+    const auto value = static_cast<u32>(op.args[2]);
+    const auto current = memory.Read32(address->second);
+    const bool ready = op.args[1] == 0 ? current == value : static_cast<s32>(current - value) >= 0;
+    if (!ready && missing_event_waits.size() < 16 && missing_event_waits.insert(op.args[0]).second) {
+        LOG_WARNING(Render_Vulkan, "Bananza NVN 2 event wait at {:#x}: current {}, expected {}, mode {}",
+                    op.args[0], current, value, op.args[1]);
+    }
+}
+
 void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& submission) {
     origin_lower_left = submission.origin_lower_left;
-    if (!frame_dump.CapturingSampled()) {
-        captured_inputs.clear();
-    }
-    const u64 previous_work = clears + copies + draws + texture_uploads;
+    const u64 previous_work = clears + copies + draws + dispatches + texture_uploads;
     for (const auto& recording : submission.recordings) {
         ReplayRecording(*recording, submission);
     }
-    if (clears + copies + draws + texture_uploads != previous_work) {
+    if (clears + copies + draws + dispatches + texture_uploads != previous_work) {
+        if (!storage_uploads.empty()) {
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                const VkMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_PIPELINE_STAGE_HOST_BIT, 0, barrier);
+            });
+        }
         scheduler.Finish();
+        WriteBackStorage(submission);
         if (!replay_logged) {
             replay_logged = true;
             LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay completed {} clears and {} copies",
@@ -1888,13 +3295,16 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
         }
     }
     uploaded_ranges.clear();
+    storage_uploads.clear();
     buffer_updates.clear();
+    reset_indirect_draws.clear();
     uploads.clear();
     descriptor_pools.clear();
     samplers.clear();
 }
 
 std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const Texture& texture) {
+    captured_inputs.clear();
     TraceImage("present", texture);
     const auto* image = FindImage(texture, false);
     if (!image || !image->initialized) {
@@ -1906,10 +3316,27 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
         }
         return std::nullopt;
     }
-    if (++present_count % 600 == 0) {
-        LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay: {} draws in 600 presents, {} texture uploads total",
-                 draws - last_reported_draws, texture_uploads);
+    ++present_count;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_replay_report) {
+        const auto presents = present_count - last_reported_present;
+        LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay: {} draws in {} presents, {} dispatches and {} texture uploads total, {} MiB images",
+                 draws - last_reported_draws, presents, dispatches, texture_uploads, image_bytes >> 20);
+        if (trace_images) {
+            for (const auto& [reason, count] : draw_skips) {
+                LOG_INFO(Render_Vulkan, "NVN 2 graphics skipped {} in {} presents: {}", count,
+                         presents, reason);
+            }
+            for (const auto& [reason, count] : dispatch_skips) {
+                LOG_INFO(Render_Vulkan, "NVN 2 compute skipped {} in {} presents: {}", count,
+                         presents, reason);
+            }
+        }
+        draw_skips.clear();
+        dispatch_skips.clear();
         last_reported_draws = draws;
+        last_reported_present = present_count;
+        next_replay_report = now + std::chrono::seconds{10};
     }
     Barrier();
     return Source{
@@ -1918,6 +3345,653 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
         .format = image->surface_format,
         .address = texture.storage.gpu_address + texture.offset,
     };
+}
+
+class BananzaNvn2Replay::ComputeEnvironment final : public Shader::Environment {
+public:
+    ComputeEnvironment(const Core::BananzaNvn2Hle::ResourceShaderInfo& shader_,
+                       const Submission& submission_, u64 texture_pool_, const ComputeLayout& layout_,
+                       std::span<const u8> driver_, const std::array<Range, 32>& uniforms_,
+                       const std::array<Range, 32>& storage_)
+        : shader{shader_}, submission{submission_}, pool{texture_pool_}, layout{layout_},
+          driver{driver_}, uniforms{uniforms_}, storage{storage_} {
+        stage = Shader::Stage::Compute;
+        start_address = sizeof(Shader::ProgramHeader);
+    }
+
+    u64 ReadInstruction(u32) override { return 0; }
+    bool IsNativeProgram() const override { return true; }
+    bool HasHLEMacroState() const override { return false; }
+    u32 ReadViewportTransformState() override { return 1; }
+    u32 TextureBoundBuffer() const override { return texture_bank; }
+    u32 LocalMemorySize() const override { return ControlWord(0x68) + ControlWord(0x6c); }
+    u32 SharedMemorySize() const override { return (ControlWord(0x64) + 255) & ~255U; }
+    std::array<u32, 3> WorkgroupSize() const override {
+        return {ControlWord(0x58), ControlWord(0x5c), ControlWord(0x60)};
+    }
+    void Dump(u64, u64) override {}
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+    bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override {
+        return StorageRange(bank, offset).first != 0;
+    }
+    bool IsCbufIndirectStorageBufferPointer(u32, u32, u32) override { return false; }
+
+    Range StorageRange(u32 bank, u32 offset) const {
+        if (bank == 0) {
+            if (const auto slot = Slot(offset, layout.storage_base, layout.storage, 16)) {
+                return storage[*slot];
+            }
+            if (const auto slot = Slot(offset, layout.uniform_base, layout.uniforms, 16)) {
+                return uniforms[*slot];
+            }
+        }
+        return {};
+    }
+
+    u32 ReadCbufValue(u32 bank, u32 offset) override {
+        const auto data = Bank(bank);
+        return Word(data, offset);
+    }
+
+    Shader::TextureType ReadTextureType(u32 handle) override {
+        const auto* descriptor = TextureDescriptor(handle);
+        if (!descriptor) {
+            missing_texture = true;
+            return Shader::TextureType::Color2D;
+        }
+        const auto& view = descriptor->view;
+        const u32 target = view && ((*view)[7] & 0x20) ? (*view)[6]
+                                                       : descriptor->texture.description.target;
+        switch (target) {
+        case 0: return Shader::TextureType::Color1D;
+        case 1: return Shader::TextureType::Color2D;
+        case 2: return Shader::TextureType::Color3D;
+        case 3: return Shader::TextureType::ColorArray1D;
+        case 4: return Shader::TextureType::ColorArray2D;
+        case 5: return Shader::TextureType::Color2D;
+        case 6: return Shader::TextureType::ColorArray2D;
+        case 7: return Shader::TextureType::Color2DRect;
+        case 8: return Shader::TextureType::ColorCube;
+        case 9: return Shader::TextureType::ColorArrayCube;
+        case 10: return Shader::TextureType::Buffer;
+        default:
+            missing_texture = true;
+            return Shader::TextureType::Color2D;
+        }
+    }
+
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        const auto* descriptor = TextureDescriptor(handle);
+        if (descriptor) {
+            const u32 base = descriptor->texture.description.format;
+            const auto format = FindColorFormat(descriptor->view ? ViewFormat(*descriptor->view, base)
+                                                                  : base);
+            if (format) {
+                return static_cast<Shader::TexturePixelFormat>(format->surface);
+            }
+        }
+        missing_texture = true;
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+
+    bool IsTexturePixelFormatInteger(u32 handle) override {
+        return VideoCore::Surface::IsPixelFormatInteger(
+            static_cast<PixelFormat>(ReadTexturePixelFormat(handle)));
+    }
+
+    bool Matches(const VideoCommon::RecordedEnvQueries& queries) {
+        const auto handle_at = [&](const Shader::HandleKey& at) {
+            const u32 first = ReadCbufValue(at.index, at.offset) << at.shift_left;
+            return at.has_secondary
+                       ? first | (ReadCbufValue(at.sec_index, at.sec_offset) << at.sec_shift_left)
+                       : first;
+        };
+        for (const auto& [key, value] : queries.cbuf_values) {
+            if (ReadCbufValue(static_cast<u32>(key >> 32), static_cast<u32>(key)) != value) {
+                return false;
+            }
+        }
+        for (const auto& [key, mapped] : queries.storage_pointer_types) {
+            const bool current = !(key >> 63) &&
+                                 IsCbufStorageBufferPointer(static_cast<u32>(key >> 32),
+                                                            static_cast<u32>(key));
+            if (current != bool(mapped)) {
+                return false;
+            }
+        }
+        for (const auto& [handle, type] : queries.texture_types) {
+            if (ReadTextureType(handle) != type) {
+                return false;
+            }
+        }
+        for (const auto& [handle, format] : queries.texture_pixel_formats) {
+            if (ReadTexturePixelFormat(handle) != format) {
+                return false;
+            }
+        }
+        for (const auto& [at, type] : queries.location_texture_types) {
+            if (ReadTextureType(handle_at(at)) != type) {
+                return false;
+            }
+        }
+        for (const auto& [at, format] : queries.location_texture_formats) {
+            if (ReadTexturePixelFormat(handle_at(at)) != format) {
+                return false;
+            }
+        }
+        for (const auto& [at, is_integer] : queries.location_integer_formats) {
+            if (IsTexturePixelFormatInteger(handle_at(at)) != is_integer) {
+                return false;
+            }
+        }
+        return !missing_texture;
+    }
+
+    std::span<const u8> Bank(u32 bank) const {
+        if (bank == 0 || bank == 2) {
+            return driver;
+        }
+        if (bank == 1) {
+            return std::span{shader.code}.subspan(shader.constant_offset, shader.constant_size);
+        }
+        if (bank - 3 < uniforms.size()) {
+            const auto data = submission.buffer_snapshots.find(uniforms[bank - 3]);
+            if (data != submission.buffer_snapshots.end()) {
+                return data->second;
+            }
+        }
+        return {};
+    }
+
+    static std::optional<u32> Slot(u32 offset, u32 base, u32 count, u32 stride) {
+        if (offset < base || (offset - base) % stride || (offset - base) / stride >= count) {
+            return std::nullopt;
+        }
+        return (offset - base) / stride;
+    }
+
+    const Core::BananzaNvn2Hle::ResourceShaderInfo& shader;
+    u32 texture_bank{};
+    bool missing_texture{};
+
+private:
+    static u32 Word(std::span<const u8> bytes, u32 offset) {
+        if (offset > bytes.size() || bytes.size() - offset < sizeof(u32)) {
+            return 0;
+        }
+        u32_le value;
+        std::memcpy(&value, bytes.data() + offset, sizeof(value));
+        return value;
+    }
+    u32 ControlWord(u32 offset) const { return Word(shader.control, offset); }
+
+    const Core::BananzaNvn2Hle::ResourceTextureDescriptor* TextureDescriptor(u32 handle) const {
+        const auto descriptors = submission.texture_descriptors.find(pool);
+        if (descriptors == submission.texture_descriptors.end()) {
+            return nullptr;
+        }
+        const auto found = descriptors->second.find(handle & 0xfffff);
+        return found == descriptors->second.end() ? nullptr : &found->second;
+    }
+
+    const Submission& submission;
+    u64 pool;
+    const ComputeLayout& layout;
+    std::span<const u8> driver;
+    const std::array<Range, 32>& uniforms;
+    const std::array<Range, 32>& storage;
+};
+
+std::optional<BananzaNvn2Replay::ComputePipeline> BananzaNvn2Replay::CreateComputePipeline(
+    ComputeEnvironment& environment) {
+    Shader::Backend::Bindings bindings;
+    const auto& profile = pipeline_cache.ShaderProfile();
+    auto shader = TranslateBananzaNvn2Shader(environment.shader, profile,
+                                            pipeline_cache.ShaderHostInfo(), {}, bindings,
+                                            &environment);
+    if (shader.status == BananzaNvn2ShaderStatus::BindingMismatch &&
+        shader.texture_bound != environment.texture_bank) {
+        environment.texture_bank = shader.texture_bound;
+        shader = TranslateBananzaNvn2Shader(environment.shader, profile,
+                                            pipeline_cache.ShaderHostInfo(), {}, bindings,
+                                            &environment);
+    }
+    const u64 serial = compute_program->serial;
+    if (shader.status != BananzaNvn2ShaderStatus::Success || environment.missing_texture) {
+        LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute program {} at {:#x}: {}",
+                    serial, environment.shader.data_address,
+                    environment.missing_texture ? "missing texture metadata" : shader.error);
+        return std::nullopt;
+    }
+    const auto& info = *shader.info;
+    if (!profile.unified_descriptor_binding || info.uses_global_memory ||
+        info.stores_global_memory || !info.image_buffer_descriptors.empty() ||
+        !info.texture_buffer_descriptors.empty() || !info.handle_programs.empty()) {
+        LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute program {} ({:016x}) needs unsupported resources (global {} / {}, texel {}, image buffer {}, dynamic handles {})",
+                    serial, shader.native_hash, info.uses_global_memory, info.stores_global_memory,
+                    info.texture_buffer_descriptors.size(), info.image_buffer_descriptors.size(),
+                    info.handle_programs.size());
+        return std::nullopt;
+    }
+    ComputePipeline result{.queries = std::move(shader.queries), .texture_bank = shader.texture_bound,
+                           .workgroup = shader.workgroup_size};
+    std::vector<VkDescriptorSetLayoutBinding> descriptors;
+    const auto add = [&](VkDescriptorType type) {
+        const u32 index = static_cast<u32>(descriptors.size());
+        descriptors.push_back({index, type, 1, VK_SHADER_STAGE_COMPUTE_BIT});
+        return index;
+    };
+    for (const auto& uniform : info.constant_buffer_descriptors) {
+        if (uniform.count != 1 || uniform.index >= 32) {
+            return std::nullopt;
+        }
+        result.state.uniforms.push_back({5, uniform.index, add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+                                       info.constant_buffer_used_sizes[uniform.index]});
+    }
+    for (const auto& storage : info.storage_buffers_descriptors) {
+        if (storage.count != 1 || storage.indirect_offset != ~0U) {
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute program {} needs indirect storage pointers", serial);
+            return std::nullopt;
+        }
+        result.storage.emplace_back(add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), storage);
+    }
+    for (const auto& texture : info.texture_descriptors) {
+        if (texture.count != 1 || texture.has_secondary || texture.shift_left ||
+            texture.is_multisample || texture.is_integer ||
+            (texture.type != Shader::TextureType::Color2D &&
+             texture.type != Shader::TextureType::ColorArray2D &&
+             texture.type != Shader::TextureType::Color3D &&
+             texture.type != Shader::TextureType::ColorCube &&
+             texture.type != Shader::TextureType::ColorArrayCube)) {
+            return std::nullopt;
+        }
+        result.state.textures.emplace_back(5, add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+                                           texture);
+    }
+    for (const auto& image : info.image_descriptors) {
+        if (image.count != 1 || image.is_byte_addressed ||
+            (image.type != Shader::TextureType::Color2D &&
+             image.type != Shader::TextureType::ColorArray2D)) {
+            return std::nullopt;
+        }
+        result.images.emplace_back(add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE), image);
+    }
+    if (descriptors.size() != bindings.unified) {
+        return std::nullopt;
+    }
+    const auto& logical = device.GetLogical();
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                  sizeof(Shader::Backend::SPIRV::RescalingLayout)};
+    if (!descriptors.empty()) {
+        result.state.set_layout = logical.CreateDescriptorSetLayout({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = static_cast<u32>(descriptors.size()),
+            .pBindings = descriptors.data(),
+        });
+    }
+    const VkDescriptorSetLayout set_layout = result.state.set_layout ? *result.state.set_layout
+                                                                    : VK_NULL_HANDLE;
+    result.state.layout = logical.CreatePipelineLayout({
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = set_layout ? 1U : 0U,
+        .pSetLayouts = &set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    result.state.pipeline = CreateBananzaNvn2ComputePipeline(device, shader, *result.state.layout);
+    LOG_INFO(Render_Vulkan, "Bananza NVN 2 compute program {} ({:016x}) built: {} uniforms, {} storage buffers, {} textures, {} images, group {}x{}x{}",
+             serial, shader.native_hash, result.state.uniforms.size(), result.storage.size(),
+             result.state.textures.size(), result.images.size(), shader.workgroup_size[0],
+             shader.workgroup_size[1], shader.workgroup_size[2]);
+    return result;
+}
+
+std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindStorageImage(
+    const Submission& submission, u64 handle, const Shader::ImageDescriptor& binding,
+    Image*& image) {
+    const auto descriptors = submission.texture_descriptors.find(texture_pool);
+    if (descriptors == submission.texture_descriptors.end()) {
+        return std::nullopt;
+    }
+    const auto found = descriptors->second.find(handle & 0xfffff);
+    if (found == descriptors->second.end()) {
+        return std::nullopt;
+    }
+    const auto& texture = found->second.texture;
+    const auto& desc = texture.description;
+    const auto& view = found->second.view;
+    const u32 format = view ? ViewFormat(*view, desc.format) : desc.format;
+    const u32 level = view && ((*view)[7] & 1) ? (*view)[4] : 0;
+    const bool layer_view = view && ((*view)[7] & 2);
+    const u32 first = layer_view ? u32{(*view)[0]} | (u32{(*view)[1]} << 8) : 0;
+    const u32 layers = layer_view ? u32{(*view)[2]} | (u32{(*view)[3]} << 8)
+                                  : texture.layout.layers;
+    const bool array = binding.type == Shader::TextureType::ColorArray2D;
+    const auto color = FindColorFormat(format);
+    if (!color || !HasCompatibleFormat(format, desc.format) ||
+        !device.IsFormatSupported(color->vk, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal) ||
+        level >= desc.levels || first >= texture.layout.layers || !layers ||
+        layers > texture.layout.layers - first || (!array && layers != 1) ||
+        binding.format != Shader::ImageFormat::Typeless ||
+        binding.is_integer != VideoCore::Surface::IsPixelFormatInteger(color->surface)) {
+        return std::nullopt;
+    }
+    image = FindImage(texture, true);
+    if (!image || !image->storage_image ||
+        (binding.is_read && !PrepareSampledImage(*image, texture, submission))) {
+        return std::nullopt;
+    }
+    Initialize(*image);
+    const std::array<u32, 4> identity{};
+    const auto view_type = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    const auto key = std::tuple{color->vk, level, 1U, first, layers, view_type,
+                                VkImageAspectFlags{VK_IMAGE_ASPECT_COLOR_BIT}, identity};
+    auto target = image->sampled_views.find(key);
+    if (target == image->sampled_views.end()) {
+        const VkImageViewUsageCreateInfo usage{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+        };
+        auto host_view = device.GetLogical().CreateImageView({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = &usage,
+            .image = *image->image,
+            .viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+            .format = color->vk,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, first, layers},
+        });
+        target = image->sampled_views.emplace(key, std::move(host_view)).first;
+    }
+    TraceImage(binding.is_written ? "compute write" : "compute read", texture, compute_program->serial);
+    return VkDescriptorImageInfo{VK_NULL_HANDLE, *target->second, VK_IMAGE_LAYOUT_GENERAL};
+}
+
+void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submission) {
+    if (!compute_program) {
+        return;
+    }
+    const auto& program = *compute_program;
+    const auto skip = [&](std::string_view reason) {
+        ++dispatch_skips[reason];
+        if (dispatch_diagnostics.emplace(program.serial, reason).second) {
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 dispatch skipped (program {}): {}",
+                        program.serial, reason);
+        }
+    };
+    if (op.args.size() != 3) {
+        skip("indirect dispatch");
+        return;
+    }
+    const auto& limits = device.GetPhysical().GetProperties().limits;
+    std::array<u32, 3> groups{};
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (!op.args[i] || op.args[i] > limits.maxComputeWorkGroupCount[i]) {
+            return;
+        }
+        groups[i] = static_cast<u32>(op.args[i]);
+    }
+    const auto shader = std::ranges::find(program.shaders, 5U,
+                                          &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
+    if (shader == program.shaders.end() || shader->control.size() < 0xb7) {
+        skip("compute program control missing");
+        return;
+    }
+    constexpr u32 stage = 5;
+    ComputeLayout layout{};
+    const auto& control = shader->control;
+    std::ranges::copy(std::span{control}.subspan(0xa9, layout.roots.size()), layout.roots.begin());
+    layout.uniforms = control[0xb1];
+    layout.storage = control[0xb2];
+    layout.textures = control[0xb3];
+    layout.images = control[0xb6];
+    if (layout.uniforms > uniform_buffers[stage].size() ||
+        layout.storage > storage_buffers[stage].size() ||
+        layout.textures > texture_handles[stage].size() ||
+        layout.images > image_handles[stage].size() ||
+        std::ranges::any_of(layout.roots, [](u32 words) { return words > 64; })) {
+        skip("compute parameter block exceeds bound state");
+        return;
+    }
+    // NVN 2 computes this parameter block layout from the shader control (DKB Recomp #20).
+    std::array<u8, 4096> driver{};
+    u32 at = 16;
+    for (size_t i = 0; i < layout.roots.size(); ++i) {
+        const u32 bytes = layout.roots[i] * sizeof(u32);
+        std::memcpy(driver.data() + at, compute_constants[i].data(), bytes);
+        at += (bytes + 15) & ~15U;
+    }
+    const auto pack_buffers = [&](const auto& ranges, u32 count) {
+        const u32 base = at;
+        for (const auto& [address, size] : std::span{ranges}.first(count)) {
+            const u64_le gpu = address;
+            const u32_le bytes = static_cast<u32>(size);
+            std::memcpy(driver.data() + at, &gpu, sizeof(gpu));
+            std::memcpy(driver.data() + at + 8, &bytes, sizeof(bytes));
+            at += 16;
+        }
+        return base;
+    };
+    const auto pack_handles = [&](const auto& handles, u32 count) {
+        const u32 base = at;
+        for (const u64_le handle : std::span{handles}.first(count)) {
+            std::memcpy(driver.data() + at, &handle, sizeof(handle));
+            at += 8;
+        }
+        return base;
+    };
+    layout.uniform_base = pack_buffers(uniform_buffers[stage], layout.uniforms);
+    layout.storage_base = pack_buffers(storage_buffers[stage], layout.storage);
+    layout.texture_base = pack_handles(texture_handles[stage], layout.textures);
+    layout.image_base = pack_handles(image_handles[stage], layout.images);
+    layout.size = at;
+    ComputeEnvironment environment{*shader, submission, texture_pool, layout,
+                                   std::span{driver}.first(at), uniform_buffers[stage],
+                                   storage_buffers[stage]};
+    auto& cached = compute_pipelines[program.serial];
+    if (cached) {
+        environment.texture_bank = cached->texture_bank;
+        if (!environment.Matches(cached->queries)) {
+            skip("compute translation inputs changed");
+            return;
+        }
+    } else {
+        if (failed_compute_pipelines.contains(program.serial)) {
+            return;
+        }
+        try {
+            cached = CreateComputePipeline(environment);
+        } catch (const vk::Exception& e) {
+            if (e.GetResult() == VK_ERROR_DEVICE_LOST) {
+                throw;
+            }
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute pipeline {}: {}", program.serial, e.what());
+        } catch (const std::invalid_argument& e) {
+            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute pipeline {}: {}", program.serial, e.what());
+        }
+        if (!cached) {
+            failed_compute_pipelines.insert(program.serial);
+            return;
+        }
+    }
+    const auto& pipeline = *cached;
+    std::vector<VkDescriptorBufferInfo> uniforms;
+    std::vector<VkDescriptorBufferInfo> storage;
+    std::vector<VkDescriptorImageInfo> textures;
+    std::vector<VkDescriptorImageInfo> images_info;
+    std::vector<Image*> writes_to_images;
+    std::vector<std::pair<StorageUpload*, u64>> writes_to_buffers;
+    for (const auto& binding : pipeline.state.uniforms) {
+        const auto bytes = environment.Bank(binding.bank);
+        if (bytes.empty() || bytes.size() > limits.maxUniformBufferRange) {
+            if (dispatch_diagnostics.emplace(program.serial, "uniform binding detail").second) {
+                LOG_WARNING(Render_Vulkan, "NVN 2 compute program {} uniform bank {}: {} bytes bound, {} bytes addressable",
+                            program.serial, binding.bank, bytes.size(), binding.size);
+            }
+            skip("compute uniform range missing or too large");
+            return;
+        }
+        const auto buffer = binding.bank >= 3
+                                ? UploadRange(submission, uniform_buffers[stage][binding.bank - 3])
+                                : Upload(bytes);
+        if (!buffer) {
+            return;
+        }
+        uniforms.push_back({buffer, 0, bytes.size()});
+    }
+    for (const auto& [index, descriptor] : pipeline.storage) {
+        auto range = environment.StorageRange(descriptor.cbuf_index, descriptor.cbuf_offset);
+        if (range.first && !range.second) {
+            const auto size = submission.unsized_storage_sizes.find(range.first);
+            if (size != submission.unsized_storage_sizes.end()) {
+                range.second = size->second;
+            }
+        }
+        if (!range.first && !range.second) {
+            if (!unbound_storage) {
+                unbound_storage = allocator.CreateBuffer({
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .size = sizeof(u32),
+                    .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                }, MemoryUsage::Upload);
+                std::ranges::fill(unbound_storage.Mapped(), 0);
+                unbound_storage.Flush();
+            }
+            // A zero-length storage slot cannot contain any shader elements.
+            storage.push_back({*unbound_storage, 0, 1});
+            continue;
+        }
+        if (!range.second || range.second > limits.maxStorageBufferRange) {
+            if (dispatch_diagnostics.emplace(program.serial, "storage range detail").second) {
+                LOG_WARNING(Render_Vulkan, "NVN 2 compute program {} storage bank {} offset {:#x} at {:#x}, {} bytes",
+                            program.serial, descriptor.cbuf_index, descriptor.cbuf_offset,
+                            range.first, range.second);
+            }
+            skip("compute storage buffer range invalid");
+            return;
+        }
+        VkBuffer buffer{};
+        u64 offset{};
+        if (descriptor.is_written) {
+            if (const auto [upload, start] = WritableStorage(submission, range); upload) {
+                buffer = *upload->buffer;
+                offset = start;
+                const u64 end = Shader::ResolveStorageWriteExtent(descriptor.write_extent,
+                                                                  pipeline.workgroup, groups)
+                                    .value_or(range.second);
+                writes_to_buffers.emplace_back(upload, offset + std::min(end, range.second));
+            }
+        } else {
+            std::tie(buffer, offset) = UploadBufferRange(submission, range);
+        }
+        if (!buffer || offset % limits.minStorageBufferOffsetAlignment) {
+            if (dispatch_diagnostics.emplace(program.serial, "missing storage backing").second) {
+                LOG_WARNING(Render_Vulkan,
+                            "NVN 2 compute program {} storage at {:#x}, {} bytes, write {}, snapshot {}, guest mapping {}",
+                            program.serial, range.first, range.second, descriptor.is_written,
+                            submission.buffer_snapshots.contains(range),
+                            submission.storage_addresses.contains(range));
+            }
+            skip("compute storage buffer range missing");
+            return;
+        }
+        storage.push_back({buffer, offset, range.second});
+    }
+    for (const auto& [slot, index, descriptor] : pipeline.state.textures) {
+        const auto handle = environment.ReadCbufValue(descriptor.cbuf_index, descriptor.cbuf_offset);
+        const auto info = BindTexture(submission, slot, descriptor, {}, handle);
+        if (!info) {
+            if (dispatch_diagnostics.emplace(program.serial, "sample binding detail").second) {
+                LOG_WARNING(Render_Vulkan, "NVN 2 compute program {} sampled bank {} offset {:#x} handle {:#x}",
+                            program.serial, descriptor.cbuf_index, descriptor.cbuf_offset, handle);
+            }
+            skip("compute sampled texture unavailable");
+            return;
+        }
+        textures.push_back(*info);
+    }
+    for (const auto& [index, descriptor] : pipeline.images) {
+        const auto handle = environment.ReadCbufValue(descriptor.cbuf_index, descriptor.cbuf_offset);
+        Image* image{};
+        const auto info = BindStorageImage(submission, handle, descriptor, image);
+        if (!info) {
+            skip("compute storage image unavailable");
+            return;
+        }
+        images_info.push_back(*info);
+        if (descriptor.is_written) {
+            writes_to_images.push_back(image);
+        }
+    }
+    VkDescriptorSet set{};
+    if (pipeline.state.set_layout) {
+        const auto& logical = device.GetLogical();
+        std::vector<VkDescriptorPoolSize> sizes;
+        const auto reserve = [&](size_t count, VkDescriptorType type) {
+            if (count) {
+                sizes.push_back({type, static_cast<u32>(count)});
+            }
+        };
+        reserve(uniforms.size(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        reserve(storage.size(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        reserve(textures.size(), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        reserve(images_info.size(), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        auto pool = logical.CreateDescriptorPool({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1,
+            .poolSizeCount = static_cast<u32>(sizes.size()),
+            .pPoolSizes = sizes.data(),
+        });
+        const VkDescriptorSetLayout set_layout = *pipeline.state.set_layout;
+        set = pool.Allocate({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = *pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &set_layout,
+        })[0];
+        std::vector<VkWriteDescriptorSet> writes;
+        const auto write_buffers = [&](const auto& infos, VkDescriptorType type) {
+            for (const auto& info : infos) {
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstSet = set, .dstBinding = static_cast<u32>(writes.size()),
+                                  .descriptorCount = 1, .descriptorType = type, .pBufferInfo = &info});
+            }
+        };
+        const auto write_images = [&](const auto& infos, VkDescriptorType type) {
+            for (const auto& info : infos) {
+                writes.push_back({.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                  .dstSet = set, .dstBinding = static_cast<u32>(writes.size()),
+                                  .descriptorCount = 1, .descriptorType = type, .pImageInfo = &info});
+            }
+        };
+        write_buffers(uniforms, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        write_buffers(storage, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        write_images(textures, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        write_images(images_info, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        logical.UpdateDescriptorSets(writes, {});
+        descriptor_pools.push_back(std::move(pool));
+    }
+    Barrier();
+    scheduler.Record([groups, handle = *pipeline.state.pipeline, pipeline_layout = *pipeline.state.layout,
+                      set](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, handle);
+        if (set) {
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, {set}, {});
+        }
+        constexpr Shader::Backend::SPIRV::RescalingLayout scale{.down_factor = 1.0f};
+        cmdbuf.PushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, scale);
+        cmdbuf.Dispatch(groups[0], groups[1], groups[2]);
+    });
+    for (auto* image : writes_to_images) {
+        image->gpu_written = true;
+    }
+    for (const auto& [upload, bytes] : writes_to_buffers) {
+        upload->written_bytes = std::max(upload->written_bytes, bytes);
+    }
+    ++dispatches;
 }
 
 } // namespace Vulkan

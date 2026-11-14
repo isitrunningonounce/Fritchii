@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <span>
 
 #include "common/alignment.h"
@@ -13,8 +14,10 @@
 #include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_trace.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/native_indirect_reset.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::BananzaNvn2Hle {
@@ -74,6 +77,7 @@ struct ScalarCommand {
 
 constexpr std::array ScalarCommands{
     ScalarCommand{"nvnCommandBufferBarrier", 1, 0},
+    ScalarCommand{"nvnCommandBufferBindImage", 3, 0},
     ScalarCommand{"nvnCommandBufferBindStorageBuffer", 4, 0},
     ScalarCommand{"nvnCommandBufferBindTexture", 3, 0},
     ScalarCommand{"nvnCommandBufferBindUniformBuffer", 4, 0},
@@ -93,6 +97,7 @@ constexpr std::array ScalarCommands{
     ScalarCommand{"nvnCommandBufferReportCounter", 2, 0},
     ScalarCommand{"nvnCommandBufferResetCounter", 1, 0},
     ScalarCommand{"nvnCommandBufferSetComputeOverlapMode", 1, 0},
+    ScalarCommand{"nvnCommandBufferSetCopyRowStride", 1, 0},
     ScalarCommand{"nvnCommandBufferSetAlphaRef", 0, 1},
     ScalarCommand{"nvnCommandBufferSetConservativeRasterEnable", 1, 0},
     ScalarCommand{"nvnCommandBufferSetDepthBounds", 0, 2},
@@ -445,7 +450,8 @@ std::optional<u64> Session::HandleDevice(Memory::Memory& memory, std::string_vie
         recorder.FinalizeHandle(x[1]);
     } else if (name == "nvnDeviceGetSeparateSamplerHandle") {
         return static_cast<u64>(static_cast<s64>(static_cast<s32>(x[1]))) << 20;
-    } else if (name == "nvnDeviceGetImageHandle" || name == "nvnDeviceGetSeparateTextureHandle") {
+    } else if (name == "nvnDeviceGetImageHandle" || name == "nvnDeviceGetSeparateTextureHandle" ||
+               name == "nvnDeviceGetTexelFetchHandle") {
         return static_cast<u64>(static_cast<s64>(static_cast<s32>(x[1])));
     } else if (name == "nvnDeviceGetTimestampInNanoseconds") {
         // The emulator's NVN 2 counter records already carry nanoseconds.
@@ -607,12 +613,15 @@ std::optional<u64> Session::ResolveGpuRange(u64 address, u64 size) const {
 
 void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Submission& batch,
                                 Queue& queue) {
-    constexpr u64 MaxBufferBytes = 48ULL << 20;
+    batch.guest_memory = &memory;
+    constexpr u64 MaxBufferBytes = 96ULL << 20;
     constexpr u64 MaxTextureBytes = 96ULL << 20;
     constexpr u64 MaxRange = 8ULL << 20;
     u64 buffer_bytes{};
     u64 texture_bytes{};
     std::vector<const ResourceTextureInfo*> sampled_textures;
+    std::map<u64, u64> indirect_index_requests;
+    std::set<std::pair<u64, u64>> indirect_arg_requests;
     const auto read_gpu = [&](u64 address, std::span<u8> dest) {
         const auto read = [&](u64 gpu, std::span<u8> bytes) {
             const auto guest = ResolveGpuRange(gpu, bytes.size());
@@ -670,22 +679,64 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         }
     };
     bool buffers_pending = true;
+    bool storage_pending = true;
     bool descriptors_pending = true;
     const auto scan = [&](auto&& self, const BananzaNvn2Commands::Recording& recording) -> void {
         for (const auto& op : recording.operations) {
+            if (op.replay == ReplayOp::CopyTexture && op.textures.size() == 2) {
+                sampled_textures.push_back(&op.textures[0]);
+            }
             if (op.nested) {
                 self(self, *op.nested);
+            } else if ((op.replay == ReplayOp::SignalEvent || op.replay == ReplayOp::WaitEvent) &&
+                       !op.args.empty() && !batch.event_addresses.contains(op.args[0])) {
+                if (const auto address = ResolveGpuRange(op.args[0], sizeof(u32));
+                    address && ValidRange(memory, *address, sizeof(u32))) {
+                    batch.event_addresses.emplace(op.args[0], *address);
+                }
+            } else if ((op.replay == ReplayOp::ReportCounter ||
+                        op.replay == ReplayOp::SetRenderEnableConditional) && op.args.size() == 2) {
+                const u64 size = op.replay == ReplayOp::ReportCounter ? 16 : 24;
+                const u64 gpu_address = op.args[1];
+                if (const auto address = ResolveGpuRange(gpu_address, size);
+                    address && ValidRange(memory, *address, size)) {
+                    batch.event_addresses.emplace(gpu_address, *address);
+                }
             } else if (op.replay == ReplayOp::SetTexturePool && op.args.size() == 1) {
                 queue.texture_pool = op.args[0];
                 descriptors_pending = true;
+            } else if (op.replay == ReplayOp::BindProgram && op.args.size() == 2 && (op.args[1] & 1)) {
+                queue.resets_indirect_draws = op.program && op.program->resets_indirect_draws;
             } else if (op.replay == ReplayOp::SetSamplerPool && op.args.size() == 1) {
                 queue.sampler_pool = op.args[0];
                 descriptors_pending = true;
+            } else if (op.replay == ReplayOp::SetCopyRowStride && op.args.size() == 1) {
+                queue.copy_row_stride = op.args[0];
+            } else if (op.replay == ReplayOp::CopyBufferToTexture && op.textures.size() == 1 &&
+                       op.args.size() == 3 && op.payload.size() == 40) {
+                const auto block = GetTextureFormatBlock(op.textures[0].description.format);
+                std::array<u32_le, 6> region{};
+                std::memcpy(region.data(), op.payload.data() + 16, 24);
+                if (block && region[3] && region[4] && region[5] && region[3] <= 16384 &&
+                    region[4] <= 16384 && region[5] <= 2048) {
+                    const u64 bytes = (u64{region[3]} + block->width - 1) / block->width *
+                                      block->bytes;
+                    const u64 rows = (u64{region[4]} + block->height - 1) / block->height;
+                    const u64 stride = queue.copy_row_stride ? queue.copy_row_stride : bytes;
+                    if (stride >= bytes && stride <= MaxRange / (rows * region[5])) {
+                        snapshot(op.args[0], stride * (rows * region[5] - 1) + bytes);
+                    }
+                }
             } else if (op.replay == ReplayOp::BindTexture && op.args.size() == 3) {
                 if (op.args[0] < queue.texture_handles.size() && op.args[1] < 64) {
                     queue.texture_handles[op.args[0]][op.args[1]] = op.args[2];
                 }
                 descriptors_pending = true;
+            } else if (op.replay == ReplayOp::BindImage && op.args.size() == 3) {
+                if (op.args[0] < queue.image_handles.size() && op.args[1] < 32) {
+                    queue.image_handles[op.args[0]][op.args[1]] = op.args[2];
+                    descriptors_pending = true;
+                }
             } else if (op.replay == ReplayOp::BindTextures && op.args.size() == 3) {
                 for (size_t offset = 0; offset + 8 <= op.payload.size(); offset += 8) {
                     u64_le handle;
@@ -701,19 +752,27 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                     queue.vertex_ranges[op.args[0]] = {op.args[1], op.args[2]};
                     buffers_pending = true;
                 }
-            } else if (op.replay == ReplayOp::BindUniformBuffer && op.args.size() == 4) {
-                if (op.args[0] < queue.uniform_ranges.size() && op.args[1] < 32) {
-                    queue.uniform_ranges[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
+            } else if ((op.replay == ReplayOp::BindUniformBuffer ||
+                        op.replay == ReplayOp::BindStorageBuffer) && op.args.size() == 4) {
+                auto& ranges = op.replay == ReplayOp::BindUniformBuffer ? queue.uniform_ranges
+                                                                       : queue.storage_ranges;
+                if (op.args[0] < ranges.size() && op.args[1] < 32) {
+                    ranges[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
                     buffers_pending = true;
+                    storage_pending |= op.args[0] == 5;
                 }
+            } else if ((op.replay == ReplayOp::BindUniformBuffers ||
+                        op.replay == ReplayOp::BindStorageBuffers) && op.args.size() == 3) {
                 buffers_pending = true;
-            } else if (op.replay == ReplayOp::BindUniformBuffers && op.args.size() == 3) {
+                storage_pending |= op.args[0] == 5;
+                auto& ranges = op.replay == ReplayOp::BindUniformBuffers ? queue.uniform_ranges
+                                                                        : queue.storage_ranges;
                 for (size_t offset = 0; offset + 16 <= op.payload.size(); offset += 16) {
                     std::array<u64_le, 2> range{};
                     std::memcpy(range.data(), op.payload.data() + offset, 16);
                     const u64 slot = op.args[1] + offset / 16;
-                    if (op.args[0] < queue.uniform_ranges.size() && slot < 32) {
-                        queue.uniform_ranges[op.args[0]][slot] = {range[0], range[1]};
+                    if (op.args[0] < ranges.size() && slot < 32) {
+                        ranges[op.args[0]][slot] = {range[0], range[1]};
                     }
                 }
             } else if (op.replay == ReplayOp::BindTexturesDeferred && op.args.size() == 4) {
@@ -744,11 +803,88 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                        op.args[1] <= 2 && op.args[2] <= MaxRange / 4) {
                 snapshot(op.args[3], op.args[2] << op.args[1]);
             }
-            const bool draw = op.replay >= ReplayOp::Draw && op.replay <= ReplayOp::DrawInstanced;
-            if (draw && buffers_pending) {
+            if (op.replay == ReplayOp::DrawIndirect && op.args.size() == 2) {
+                indirect_arg_requests.emplace(op.args[1], 4 * sizeof(u32));
+            } else if (op.replay == ReplayOp::DrawIndexedIndirect && op.args.size() == 4 &&
+                       op.args[1] <= 2) {
+                const u64 address = op.args[2];
+                indirect_arg_requests.emplace(op.args[3], 5 * sizeof(u32));
+                const auto key = std::tuple{op.args[3], address, op.args[1]};
+                if (!batch.indirect_index_slices.contains(key)) {
+                    std::array<u32_le, 5> words{};
+                    const bool read = read_gpu(op.args[3], {reinterpret_cast<u8*>(words.data()),
+                                                            sizeof(words)});
+                    const u64 start = u64{words[2]} << op.args[1];
+                    const u64 bytes = u64{words[0]} << op.args[1];
+                    const bool valid = read && bytes && words[1] && bytes <= MaxRange &&
+                                       address <= std::numeric_limits<u64>::max() - start;
+                    batch.indirect_index_slices.try_emplace(key, valid ? address + start : 0,
+                                                           valid ? bytes : 0);
+                }
+                if (!indirect_index_requests.contains(address)) {
+                    constexpr u64 wanted = 16ULL << 10;
+                    const auto pool = gpu_pools.upper_bound(address);
+                    if (pool != gpu_pools.begin()) {
+                        const auto& storage = pools.at(std::prev(pool)->second);
+                        const u64 offset = address - storage.gpu_address;
+                        if (offset < storage.size) {
+                            u64 available = std::min(wanted, storage.size - offset);
+                            if (storage.flags & VirtualPool) {
+                                available = std::min(available,
+                                                     PoolAlignment - address % PoolAlignment);
+                            }
+                            indirect_index_requests.try_emplace(address, available);
+                        }
+                    }
+                }
+            }
+            const bool draw = op.replay >= ReplayOp::Draw && op.replay <= ReplayOp::DrawIndexedIndirect;
+            const bool dispatch = op.replay == ReplayOp::Dispatch;
+            if (queue.resets_indirect_draws && op.replay == ReplayOp::Draw &&
+                op.args.size() == 3 && op.args[0] == 0) {
+                const auto& [address, size] = queue.storage_ranges[0][0];
+                const auto list = VideoCommon::NativeIndirectReset::GetListRange(
+                    address, static_cast<u32>(size), static_cast<u32>(op.args[1]),
+                    static_cast<u32>(op.args[2]));
+                if (list) {
+                    snapshot(list->address, list->bytes);
+                    const auto bytes = batch.buffer_snapshots.find({list->address, list->bytes});
+                    if (bytes != batch.buffer_snapshots.end()) {
+                        for (size_t offset = 0; offset < list->bytes; offset += sizeof(u64)) {
+                            u64_le record;
+                            std::memcpy(&record, bytes->second.data() + offset, sizeof(record));
+                            if (batch.indirect_reset_addresses.contains(record)) {
+                                continue;
+                            }
+                            constexpr size_t RecordSize = sizeof(VideoCommon::NativeIndirectReset::Record);
+                            if (const auto guest = ResolveGpuRange(record, RecordSize);
+                                guest && ValidRange(memory, *guest, RecordSize)) {
+                                batch.indirect_reset_addresses.emplace(record, *guest);
+                            }
+                        }
+                    }
+                }
+            }
+            if (dispatch && op.args.size() == 1) {
+                snapshot(op.args[0], 3 * sizeof(u32));
+            }
+            if ((draw || dispatch) && buffers_pending) {
                 buffers_pending = false;
                 for (const auto& [address, size] : queue.vertex_ranges) {
                     snapshot(address, size);
+                }
+                for (u32 stage = 0; stage < 3; ++stage) {
+                    for (const auto& [address, size] : queue.storage_ranges[stage]) {
+                        snapshot(address, size);
+                        const auto range = std::pair{address, size};
+                        if (!batch.storage_addresses.contains(range) &&
+                            batch.buffer_snapshots.contains(range)) {
+                            if (const auto guest = ResolveGpuRange(address, size);
+                                guest && ValidRange(memory, *guest, size)) {
+                                batch.storage_addresses.emplace(range, *guest);
+                            }
+                        }
+                    }
                 }
                 for (const auto& stage : queue.uniform_ranges) {
                     for (const auto& [address, size] : stage) {
@@ -756,9 +892,51 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                     }
                 }
             }
-            if (draw && descriptors_pending) {
+            if (dispatch && storage_pending) {
+                storage_pending = false;
+                for (auto range : queue.storage_ranges[5]) {
+                    if (range.first && !range.second) {
+                        const auto upper = gpu_pools.upper_bound(range.first);
+                        if (upper != gpu_pools.begin()) {
+                            const auto& pool = pools.at(std::prev(upper)->second);
+                            const u64 offset = range.first - pool.gpu_address;
+                            if (offset < pool.size) {
+                                range.second = std::min(MaxRange, pool.size - offset);
+                                if (pool.flags & VirtualPool) {
+                                    range.second = std::min(range.second,
+                                                            PoolAlignment - range.first % PoolAlignment);
+                                }
+                            }
+                        }
+                    }
+                    snapshot(range.first, range.second);
+                    if (batch.buffer_snapshots.contains(range)) {
+                        if (const auto guest = ResolveGpuRange(range.first, range.second);
+                            guest && ValidRange(memory, *guest, range.second)) {
+                            batch.storage_addresses.try_emplace(range, *guest);
+                            batch.unsized_storage_sizes.try_emplace(range.first, range.second);
+                        }
+                    }
+                }
+                for (const auto& range : queue.uniform_ranges[5]) {
+                    if (batch.buffer_snapshots.contains(range)) {
+                        if (const auto guest = ResolveGpuRange(range.first, range.second);
+                            guest && ValidRange(memory, *guest, range.second)) {
+                            batch.storage_addresses.try_emplace(range, *guest);
+                        }
+                    }
+                }
+            }
+            if ((draw || dispatch) && descriptors_pending) {
                 descriptors_pending = false;
                 for (const auto& stage : queue.texture_handles) {
+                    for (const u64 handle : stage) {
+                        if (handle) {
+                            descriptor(handle);
+                        }
+                    }
+                }
+                for (const auto& stage : queue.image_handles) {
                     for (const u64 handle : stage) {
                         if (handle) {
                             descriptor(handle);
@@ -771,23 +949,56 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     for (const auto& recording : batch.recordings) {
         scan(scan, *recording);
     }
-    const auto compressed = [](const ResourceTextureInfo* texture) {
+    for (const auto& [address, size] : indirect_arg_requests) {
+        snapshot(address, size);
+    }
+    std::erase_if(batch.indirect_index_slices, [&](const auto& entry) {
+        const auto& [address, size] = entry.second;
+        snapshot(address, size);
+        return !batch.buffer_snapshots.contains(entry.second);
+    });
+    for (const auto& [address, size] : indirect_index_requests) {
+        snapshot(address, size);
+        if (batch.buffer_snapshots.contains({address, size})) {
+            batch.indirect_index_sizes.try_emplace(address, size);
+        }
+    }
+    const auto prioritize = [](const ResourceTextureInfo* texture) {
         const auto block = GetTextureFormatBlock(texture->description.format);
-        return block && block->width > 1;
+        if (texture->layout.size <= (1ULL << 20) || !(texture->storage.flags & VirtualPool)) {
+            return 0;
+        }
+        return block && block->width > 1 ? 1 : 2;
     };
-    // The replay path creates render targets on demand. Give CPU-backed compressed assets
-    // first use of the snapshot budget, since they cannot be recovered from replayed draws.
-    std::stable_partition(sampled_textures.begin(), sampled_textures.end(), compressed);
+    // Small CPU textures, font atlases and compressed assets need their backing bytes.
+    // Large render targets usually get their contents from replayed work.
+    std::ranges::stable_sort(sampled_textures, {}, prioritize);
+    static const bool trace_images = std::getenv("EDEN_NX2_NVN_TRACE_IMAGES") != nullptr;
+    static thread_local std::set<std::pair<u64, bool>> texture_snapshot_failures;
     for (const auto* texture : sampled_textures) {
         const auto size = texture->layout.size;
-        if (!size || size > (32ULL << 20) || !Fits(texture_bytes, size, MaxTextureBytes) ||
-            batch.texture_snapshots.contains(texture->serial)) {
+        if (!size || batch.texture_snapshots.contains(texture->serial)) {
+            continue;
+        }
+        const u64 address = texture->storage.gpu_address + texture->offset;
+        const auto note_failure = [&](bool budget) {
+            if (trace_images && texture_snapshot_failures.size() < 100 &&
+                texture_snapshot_failures.emplace(address, budget).second) {
+                LOG_INFO(Core_ARM, "NVN 2 texture snapshot {} at {:#x}, {} bytes, format {:#x}, pool flags {:#x}, {} MiB collected",
+                         budget ? "over budget" : "unmapped", address, size,
+                         texture->description.format, texture->storage.flags, texture_bytes >> 20);
+            }
+        };
+        if (size > (32ULL << 20) || !Fits(texture_bytes, size, MaxTextureBytes)) {
+            note_failure(true);
             continue;
         }
         std::vector<u8> data(size);
-        if (read_gpu(texture->storage.gpu_address + texture->offset, data)) {
+        if (read_gpu(address, data)) {
             texture_bytes += size;
             batch.texture_snapshots.emplace(texture->serial, std::move(data));
+        } else {
+            note_failure(false);
         }
     }
 }
@@ -1001,6 +1212,7 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
                               ? recorder.Submit(x[0], *handles)
                               : std::nullopt;
         if (submission) {
+            submission->submitted_ns = static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count());
             if (const auto device = devices.find(queue->second.device); device != devices.end()) {
                 submission->depth_minus_one_to_one = device->second.depth_mode == 0;
                 submission->origin_lower_left = device->second.origin == 0;
@@ -1017,10 +1229,15 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
                          "Bananza NVN 2 HLE accepted submission {} with {} handles and {} commands",
                          submission->sequence, submission->handles.size(), submission->command_count);
             }
+            const bool may_write_storage = !submission->storage_addresses.empty() ||
+                                           !submission->indirect_reset_addresses.empty();
             queue->second.fence = system.GPU().SubmitRendererWork(
                 [batch = std::move(*submission)](VideoCore::RendererBase& renderer) {
                     renderer.ReplayBananzaNvn2(batch);
                 });
+            if (may_write_storage) {
+                system.GPU().WaitForSyncOperation(queue->second.fence);
+            }
         } else {
             ++rejected_submissions;
             if (queue != queues.end()) {
@@ -1367,15 +1584,18 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
         replay = ReplayOp::BindTexturesDeferred;
         args = {static_cast<u32>(x[1]), static_cast<u32>(x[2]), count, x[4]};
         valid = count <= 64 && (!count || ValidRange(memory, x[4], count * sizeof(u64)));
-    } else if (name == "nvnCommandBufferPushGraphicsConstants") {
+    } else if (name == "nvnCommandBufferPushGraphicsConstants" ||
+               name == "nvnCommandBufferPushComputeConstants") {
         const u32 offset = static_cast<u32>(x[2]);
         const u32 size = std::min<u32>(static_cast<u32>(x[3]), 256) & ~3U;
-        replay = ReplayOp::PushGraphicsConstants;
+        replay = name == "nvnCommandBufferPushComputeConstants" ? ReplayOp::PushComputeConstants
+                                                                : ReplayOp::PushGraphicsConstants;
         args = {x[1] & 7, offset};
         valid = offset % 4 == 0 && Fits(offset, size, 256) && copy(x[4], size);
     } else if (name == "nvnCommandBufferBindUniformBuffers" ||
                name == "nvnCommandBufferBindUniformBuffersDeferred" ||
                name == "nvnCommandBufferBindStorageBuffers" ||
+               name == "nvnCommandBufferBindStorageBuffersDeferred" ||
                name == "nvnCommandBufferBindTextures") {
         const u64 count = static_cast<u32>(x[3]);
         const u64 element_size = name == "nvnCommandBufferBindTextures" ? 8 : 16;
@@ -1383,6 +1603,8 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
             replay = ReplayOp::BindUniformBuffers;
         } else if (name == "nvnCommandBufferBindTextures") {
             replay = ReplayOp::BindTextures;
+        } else {
+            replay = ReplayOp::BindStorageBuffers;
         }
         args = {static_cast<u32>(x[1]), static_cast<u32>(x[2]), count};
         valid = count <= 64 && copy(x[4], count * element_size);
@@ -1416,6 +1638,11 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
         valid = x[1] && x[4] && pin_texture(x[1]) && pin_texture(x[4]) &&
                 view(x[2]) && view(x[5]) && copy(x[3], CopyRegionBytes) &&
                 copy(x[6], CopyRegionBytes);
+    } else if (name == "nvnCommandBufferCopyBufferToTexture") {
+        replay = ReplayOp::CopyBufferToTexture;
+        args = {x[1], static_cast<u32>(x[5])};
+        valid = x[1] && x[2] && pin_texture(x[2]) && view(x[3]) &&
+                copy(x[4], CopyRegionBytes);
     } else if (name == "nvnCommandBufferClearColor" || name == "nvnCommandBufferClearColori" ||
                name == "nvnCommandBufferClearColorui") {
         replay = name.ends_with("ui") ? ReplayOp::ClearColorUnsigned
@@ -1427,21 +1654,31 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
         replay = ReplayOp::SetBlendColor;
         valid = copy(x[1], 4 * sizeof(u32));
     } else if (name == "nvnCommandBufferSetScissors" || name == "nvnCommandBufferSetViewports") {
+        replay = name == "nvnCommandBufferSetScissors" ? ReplayOp::SetScissors
+                                                         : ReplayOp::SetViewports;
         const u64 first = static_cast<u32>(x[1]);
         const u64 count = static_cast<u32>(x[2]);
         args = {first, count};
         valid = Fits(first, count, 16) && copy(x[3], count * 4 * sizeof(u32));
+    } else if (name == "nvnCommandBufferSetDepthRanges") {
+        replay = ReplayOp::SetDepthRanges;
+        const u64 first = static_cast<u32>(x[1]);
+        const u64 count = static_cast<u32>(x[2]);
+        args = {first, count};
+        valid = Fits(first, count, 16) && copy(x[3], count * 2 * sizeof(float));
     } else if (name == "nvnCommandBufferUpdateUniformBuffer") {
         replay = ReplayOp::UpdateUniformBuffer;
         args = {x[1], x[2], x[3], x[4]};
         valid = x[4] <= (16ULL << 20) && Fits(x[3], x[4], x[2]) && copy(x[5], x[4]);
     } else if (name == "nvnCommandBufferSignalEvent" || name == "nvnCommandBufferWaitEvent") {
+        const bool signal = name == "nvnCommandBufferSignalEvent";
+        replay = signal ? ReplayOp::SignalEvent : ReplayOp::WaitEvent;
         const auto event = events.find(x[1]);
         valid = event != events.end();
         if (valid) {
             args = {event->second.pool_address + event->second.offset, static_cast<u32>(x[2]),
                     static_cast<u32>(x[3])};
-            if (name == "nvnCommandBufferSignalEvent") {
+            if (signal) {
                 args.push_back(static_cast<u32>(x[4]));
                 args.push_back(static_cast<u32>(x[5]));
             }
@@ -1554,7 +1791,10 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             recorder.Begin(x[0]);
         }
         const auto args = std::span{x}.subspan(1, command->args);
-        const auto floats = std::span{call.v}.first(command->float_args);
+        std::array<u32_le, 8> float_words{};
+        auto floats = std::span{float_words}.first(command->float_args);
+        std::ranges::transform(std::span{call.v}.first(command->float_args), floats.begin(),
+                               [](u64 reg) { return static_cast<u32>(reg); });
         const auto bytes = std::span<const u8>{reinterpret_cast<const u8*>(floats.data()),
                                                floats.size_bytes()};
         const u64 charge = CommandBytes(name, call);
@@ -1563,10 +1803,24 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             replay = ReplayOp::Barrier;
         } else if (name == "nvnCommandBufferSetAlphaRef") {
             replay = ReplayOp::SetAlphaRef;
+        } else if (name == "nvnCommandBufferReportCounter") {
+            replay = ReplayOp::ReportCounter;
+        } else if (name == "nvnCommandBufferResetCounter") {
+            replay = ReplayOp::ResetCounter;
+        } else if (name == "nvnCommandBufferSetRenderEnable") {
+            replay = ReplayOp::SetRenderEnable;
+        } else if (name == "nvnCommandBufferSetRenderEnableConditional") {
+            replay = ReplayOp::SetRenderEnableConditional;
         } else if (name == "nvnCommandBufferClearDepthStencil") {
             replay = ReplayOp::ClearDepthStencil;
         } else if (name == "nvnCommandBufferSetDepthRange") {
             replay = ReplayOp::SetDepthRange;
+        } else if (name == "nvnCommandBufferSetDepthClamp") {
+            replay = ReplayOp::SetDepthClamp;
+        } else if (name == "nvnCommandBufferSetRasterizerDiscard") {
+            replay = ReplayOp::SetRasterizerDiscard;
+        } else if (name == "nvnCommandBufferSetPolygonOffsetClamp") {
+            replay = ReplayOp::SetPolygonOffsetClamp;
         } else if (name == "nvnCommandBufferSetStencilRef") {
             replay = ReplayOp::SetStencilRef;
         } else if (name == "nvnCommandBufferSetStencilMask") {
@@ -1575,6 +1829,10 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             replay = ReplayOp::SetStencilValueMask;
         } else if (name == "nvnCommandBufferBindUniformBuffer") {
             replay = ReplayOp::BindUniformBuffer;
+        } else if (name == "nvnCommandBufferBindStorageBuffer") {
+            replay = ReplayOp::BindStorageBuffer;
+        } else if (name == "nvnCommandBufferBindImage") {
+            replay = ReplayOp::BindImage;
         } else if (name == "nvnCommandBufferBindTexture") {
             replay = ReplayOp::BindTexture;
         } else if (name == "nvnCommandBufferBindVertexBuffer") {
@@ -1583,6 +1841,8 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             replay = ReplayOp::SetTexturePool;
         } else if (name == "nvnCommandBufferSetSamplerPool") {
             replay = ReplayOp::SetSamplerPool;
+        } else if (name == "nvnCommandBufferSetCopyRowStride") {
+            replay = ReplayOp::SetCopyRowStride;
         } else if (name == "nvnCommandBufferSetStencilCullCriteria") {
             replay = ReplayOp::StencilCullCriteria;
         } else if (name == "nvnCommandBufferSetViewport") {
@@ -1599,6 +1859,10 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
             replay = ReplayOp::DrawIndexedBaseVertex;
         } else if (name == "nvnCommandBufferDrawElementsInstanced") {
             replay = ReplayOp::DrawIndexedInstanced;
+        } else if (name == "nvnCommandBufferDrawArraysIndirect") {
+            replay = ReplayOp::DrawIndirect;
+        } else if (name == "nvnCommandBufferDrawElementsIndirect") {
+            replay = ReplayOp::DrawIndexedIndirect;
         } else if (name.starts_with("nvnCommandBufferDispatch")) {
             replay = ReplayOp::Dispatch;
         }

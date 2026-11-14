@@ -122,7 +122,7 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
     operation.program = std::move(program);
     buffer.operations.push_back(std::move(operation));
     ++buffer.command_count;
-    buffer.draw_count += replay >= ReplayOp::Draw && replay <= ReplayOp::DrawInstanced;
+    buffer.draw_count += replay >= ReplayOp::Draw && replay <= ReplayOp::DrawIndexedIndirect;
     buffer.payload_bytes += payload.size();
     buffer.argument_bytes += argument_bytes;
     buffer.state.command_used += command_bytes;

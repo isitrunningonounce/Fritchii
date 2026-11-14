@@ -647,11 +647,29 @@ void FrameDump::CapturePresent(VkImage image, VideoCore::Surface::PixelFormat fo
 }
 
 void FrameDump::CaptureNvn2Input(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
-                                 u32 height, GPUVAddr address) {
+                                 u32 height, GPUVAddr address, VkFormat depth_format, u32 level,
+                                 u32 layer, u64 program) {
     if (CapturingSampled()) {
-        const Target target{0, image, format, width, height, 1, 0, 0, address, false, false,
-                            DepthEncoding::None};
-        Record(target, fmt::format("{:04}_nvn2_input", sequence++), R"("kind":"nvn2_input")");
+        DepthEncoding encoding = DepthEncoding::None;
+        switch (depth_format) {
+        case VK_FORMAT_D16_UNORM:
+            encoding = DepthEncoding::Unorm16;
+            break;
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+            encoding = DepthEncoding::Unorm24;
+            break;
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            encoding = DepthEncoding::Float32;
+            break;
+        default:
+            break;
+        }
+        const Target target{0, image, format, width, height, 1, level, layer, address, false, false,
+                            encoding};
+        Record(target, fmt::format("{:04}_nvn2_input", sequence++),
+               fmt::format(R"("kind":"nvn2_input","program":{})", program));
     }
 }
 
