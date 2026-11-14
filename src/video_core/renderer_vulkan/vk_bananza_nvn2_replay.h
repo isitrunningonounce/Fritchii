@@ -43,7 +43,7 @@ private:
     using Submission = Core::BananzaNvn2Commands::Submission;
     using Program = Core::BananzaNvn2Hle::ResourceProgramInfo;
     using Range = std::pair<u64, u64>;
-    using ImageKey = std::tuple<GPUVAddr, u32, u32, u32, u32>;
+    using ImageKey = std::tuple<GPUVAddr, u32, u32, u32, u32, u32, u32>;
     using ColorFormats = std::array<VkFormat, 8>;
     struct ColorState {
         std::array<u64, 8> blend{};
@@ -71,10 +71,12 @@ private:
         VkFormat format;
         VideoCore::Surface::PixelFormat surface_format;
         u32 levels;
+        u32 layers;
         bool color_attachment;
         VkImageAspectFlags aspects;
         std::map<VkFormat, vk::ImageView> attachment_views;
-        std::map<std::tuple<VkFormat, u32, u32, std::array<u32, 4>>, vk::ImageView> sampled_views;
+        std::map<std::tuple<VkFormat, u32, u32, u32, u32, std::array<u32, 4>>, vk::ImageView>
+            sampled_views;
         bool initialized{};
     };
 
