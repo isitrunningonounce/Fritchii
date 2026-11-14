@@ -139,7 +139,8 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
                              const Layout::FramebufferLayout& layout,
                              size_t current_swapchain_image_count,
                              VkFormat current_swapchain_view_format, const HdrPresent& output,
-                             bool prepare_hudless) {
+                             bool prepare_hudless,
+                             std::span<const FramebufferTextureInfo> sources) {
     bool resource_update_required = false;
     bool presentation_recreate_required = false;
 
@@ -204,11 +205,11 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
     frame->hudless_valid = false;
     FramebufferTextureInfo source;
     if (hdr10_encode) {
-        DrawHdr10(device, rasterizer, frame, framebuffers, layout, output);
+        DrawHdr10(device, rasterizer, frame, framebuffers, layout, output, sources);
     } else {
         window_adapt->Draw(device, rasterizer, scheduler, image_index, layers, framebuffers, layout,
                            *frame->framebuffer, VkExtent2D{frame->width, frame->height}, output,
-                           {}, hudless_wanted ? &source : nullptr);
+                           sources, hudless_wanted ? &source : nullptr);
     }
     if (hudless_wanted) {
         bool effects = false;
@@ -287,7 +288,8 @@ VkRenderPass BlitScreen::FrameRenderPass() const {
 
 void BlitScreen::DrawHdr10(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
                            std::span<const Tegra::FramebufferConfig> framebuffers,
-                           const Layout::FramebufferLayout& layout, const HdrPresent& output) {
+                           const Layout::FramebufferLayout& layout, const HdrPresent& output,
+                           std::span<const FramebufferTextureInfo> sources) {
     const VkExtent2D extent{frame->width, frame->height};
     if (hdr10_composite.size() != image_count || hdr10_composite_extent.width != extent.width ||
         hdr10_composite_extent.height != extent.height) {
@@ -312,7 +314,7 @@ void BlitScreen::DrawHdr10(const Device& device, RasterizerVulkan& rasterizer, F
     HdrPresent linear{output};
     linear.color_space = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
     window_adapt->Draw(device, rasterizer, scheduler, image_index, layers, framebuffers, layout,
-                       *composite.framebuffer, extent, linear);
+                       *composite.framebuffer, extent, linear, sources);
     hdr10_encode->Record(device, scheduler, image_index,
                          {
                              .input = HdrEncoding::Scrgb,

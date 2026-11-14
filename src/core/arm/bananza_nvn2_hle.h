@@ -16,6 +16,10 @@
 #include "core/arm/bananza_nvn2_commands.h"
 #include "core/arm/bananza_nvn2_resources.h"
 
+namespace Core {
+class System;
+}
+
 namespace Core::Memory {
 class Memory;
 }
@@ -44,7 +48,7 @@ struct CallbackContinuation {
 
 class Session {
 public:
-    Session(u64 bootstrap, u64 internal_bootstrap, u64 callback_return);
+    Session(System& system, u64 bootstrap, u64 internal_bootstrap, u64 callback_return);
     bool IsBootstrap(u64 pc) const;
     bool IsCallbackReturn(u64 pc) const;
     u64 CallbackReturn() const;
@@ -90,6 +94,12 @@ private:
         u64 storage_size{};
         u64 primary{};
         u64 flush_threshold{};
+        u64 fence{};
+        u64 texture_pool{};
+        u64 sampler_pool{};
+        std::array<std::pair<u64, u64>, 32> vertex_ranges{};
+        std::array<std::array<std::pair<u64, u64>, 32>, 2> uniform_ranges{};
+        std::array<std::array<u64, 64>, 2> texture_handles{};
         u32 flags{};
         bool rejected_submit{};
     };
@@ -98,6 +108,7 @@ private:
 
     struct Sync {
         u64 device{};
+        u64 fence{};
         SyncStatus status{};
     };
 
@@ -155,6 +166,8 @@ private:
     bool MapVirtual(Memory::Memory& memory, const GuestCall& call);
     std::optional<ResourcePoolInfo> GetPool(u64 address) const;
     std::optional<u64> ResolveGpuRange(u64 address, u64 size) const;
+    void SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Submission& submission,
+                           Queue& queue);
     std::optional<u64> HandleCommands(Memory::Memory& memory, size_t index,
                                       std::string_view name, const GuestCall& call);
     std::optional<u64> HandleCommandPayload(Memory::Memory& memory, size_t index,
@@ -168,6 +181,7 @@ private:
     const u64 bootstrap;
     const u64 internal_bootstrap;
     const u64 callback_return;
+    System& system;
     std::mutex mutex;
     std::unordered_map<u64, Device> devices;
     std::unordered_map<u64, Pool> pools;

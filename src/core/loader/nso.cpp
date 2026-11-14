@@ -58,7 +58,7 @@ constexpr u32 PageAlignSize(u32 size) {
     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
 }
 
-void SetUpBananzaNvn2(Kernel::KProcess& process, const NSOHeader& header,
+void SetUpBananzaNvn2(Core::System& system, Kernel::KProcess& process, const NSOHeader& header,
                       std::span<const u8> image, VAddr base, bool debugger_enabled) {
     const char* value = std::getenv("EDEN_NX2_NVN_HLE");
     if (!value || process.GetProgramId() != Settings::DonkeyKongBananzaProgramId) {
@@ -79,6 +79,10 @@ void SetUpBananzaNvn2(Kernel::KProcess& process, const NSOHeader& header,
         LOG_WARNING(Loader, "Bananza NVN 2 HLE requires the update SDK and gdbstub off.");
         return;
     }
+    if (hle && Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
+        LOG_WARNING(Loader, "Bananza NVN 2 HLE requires Vulkan. Using the guest SDK.");
+        return;
+    }
     auto trace = Core::BananzaNvn2Trace::Session::Create(*layout, image, base);
     if (!trace) {
         LOG_WARNING(Loader, "Bananza NVN 2: could not read the SDK procedure table.");
@@ -95,7 +99,7 @@ void SetUpBananzaNvn2(Kernel::KProcess& process, const NSOHeader& header,
     process.SetBananzaNvn2Trace(std::move(trace));
     if (hle) {
         process.SetBananzaNvn2Hle(std::make_unique<Core::BananzaNvn2Hle::Session>(
-            base + layout->bootstrap, base + layout->internal_bootstrap,
+            system, base + layout->bootstrap, base + layout->internal_bootstrap,
             base + layout->callback_return));
         LOG_INFO(Loader, "Bananza NVN 2 HLE: installed {} SDK procedures at {:#x}",
                  layout->entry_count, base);
@@ -104,6 +108,7 @@ void SetUpBananzaNvn2(Kernel::KProcess& process, const NSOHeader& header,
                  layout->entry_count, base);
     }
 #else
+    (void)system;
     (void)header;
     (void)image;
     (void)base;
@@ -388,7 +393,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Load codeset for current process
     if (name == "sdk") {
-        SetUpBananzaNvn2(process, nso_header,
+        SetUpBananzaNvn2(system, process, nso_header,
                         std::span<const u8>{codeset.memory}.subspan(module_start),
                         load_base + module_start, system.DebuggerEnabled());
         const bool matching_sdk =

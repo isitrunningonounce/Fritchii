@@ -37,6 +37,8 @@ class GPU;
 
 namespace Vulkan {
 
+class BananzaNvn2Replay;
+
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld,
                     VkSurfaceKHR surface);
 
@@ -48,6 +50,9 @@ public:
     ~RendererVulkan() override;
 
     void Composite(std::span<const Tegra::FramebufferConfig> framebuffers) override;
+    void ReplayBananzaNvn2(const Core::BananzaNvn2Commands::Submission& submission) override;
+    void PresentBananzaNvn2(const Core::BananzaNvn2Hle::ResourceTextureInfo& texture,
+                           const Tegra::FramebufferConfig& config) override;
 
     std::vector<u8> GetAppletCaptureBuffer() override;
 
@@ -81,8 +86,10 @@ private:
 
     vk::Buffer RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                               const Layout::FramebufferLayout& layout, VkFormat format,
-                              VkDeviceSize buffer_size);
-    void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
+                              VkDeviceSize buffer_size,
+                              std::span<const FramebufferTextureInfo> sources = {});
+    void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers,
+                          std::span<const FramebufferTextureInfo> sources = {});
     void RenderAppletCaptureLayer(std::span<const Tegra::FramebufferConfig> framebuffers);
 
     std::vector<Tegra::FramebufferConfig> applet_capture_layers;
@@ -114,6 +121,7 @@ private:
     BlitScreen blit_capture;
     BlitScreen blit_applet;
     RasterizerVulkan rasterizer;
+    std::unique_ptr<BananzaNvn2Replay> bananza_nvn2_replay;
 #ifdef HAS_LSFG
     FrameGen frame_gen;
 #endif

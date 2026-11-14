@@ -636,6 +636,25 @@ void FrameDump::CapturePresent(ImageView& view) {
     }
 }
 
+void FrameDump::CapturePresent(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
+                               u32 height, GPUVAddr address) {
+    if (Capturing()) {
+        const Target target{0, image, format, width, height, 1, 0, 0, address, false, false,
+                            DepthEncoding::None};
+        Record(target, fmt::format("{:04}_present", sequence++),
+               fmt::format(R"("kind":"present","after_draws":{})", draws));
+    }
+}
+
+void FrameDump::CaptureNvn2Input(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
+                                 u32 height, GPUVAddr address) {
+    if (CapturingSampled()) {
+        const Target target{0, image, format, width, height, 1, 0, 0, address, false, false,
+                            DepthEncoding::None};
+        Record(target, fmt::format("{:04}_nvn2_input", sequence++), R"("kind":"nvn2_input")");
+    }
+}
+
 bool FrameDump::Record(const Target& target, std::string name, std::string tags) {
     name += target.depth > 1 ? fmt::format("_{}_{}x{}x{}_{:x}", target.format, target.width,
                                            target.height, target.depth, target.gpu_addr)

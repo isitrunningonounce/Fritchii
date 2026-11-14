@@ -60,6 +60,28 @@ struct ResourceProgramInfo {
     std::vector<ResourceShaderInfo> shaders;
 };
 
+struct ResourceSamplerInfo {
+    u64 device{};
+    u32 min_filter{4};
+    u32 mag_filter{1};
+    std::array<u32, 3> wrap{1, 1, 1};
+    u32 compare_mode{};
+    u32 compare_func{2};
+    u32 reduction{};
+    std::array<u32, 4> border{};
+    u32 border_kind{};
+    float min_lod{-1000.0f};
+    float max_lod{1000.0f};
+    float lod_bias{};
+    float anisotropy{1.0f};
+    float lod_snap{};
+};
+
+struct ResourceTextureDescriptor {
+    ResourceTextureInfo texture;
+    std::optional<std::array<u8, 16>> view;
+};
+
 // The owning Session serializes access. No guest callbacks are executed here.
 class Resources {
 public:
@@ -75,6 +97,8 @@ public:
     bool HasTexture(u64 device, u64 texture) const;
     std::optional<ResourceTextureInfo> GetTexture(u64 texture) const;
     std::shared_ptr<const ResourceProgramInfo> GetProgram(u64 program) const;
+    const std::unordered_map<u32, ResourceTextureDescriptor>* GetTexturePool(u64 pool) const;
+    const std::unordered_map<u32, ResourceSamplerInfo>* GetSamplerPool(u64 pool) const;
 
 private:
     struct TextureBuilder {
@@ -86,27 +110,8 @@ private:
         TextureDescription description;
     };
 
-    struct Sampler {
-        u64 device{};
-        u32 min_filter{4};
-        u32 mag_filter{1};
-        std::array<u32, 3> wrap{1, 1, 1};
-        u32 compare_mode{};
-        u32 compare_func{2};
-        u32 reduction{};
-        std::array<u32, 4> border{};
-        u32 border_kind{};
-        float min_lod{-1000.0f};
-        float max_lod{1000.0f};
-        float lod_bias{};
-        float anisotropy{1.0f};
-        float lod_snap{};
-    };
-
-    struct TextureDescriptor {
-        ResourceTextureInfo texture;
-        std::optional<std::array<u8, 16>> view;
-    };
+    using Sampler = ResourceSamplerInfo;
+    using TextureDescriptor = ResourceTextureDescriptor;
 
     struct DescriptorPool {
         u64 pool{};

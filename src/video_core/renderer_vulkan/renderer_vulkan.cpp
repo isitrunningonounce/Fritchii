@@ -21,6 +21,7 @@
 #include <ranges>
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/core.h"
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
@@ -33,6 +34,7 @@
 #endif
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_replay.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -391,6 +393,47 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 }
 
+void RendererVulkan::ReplayBananzaNvn2(const Core::BananzaNvn2Commands::Submission& submission) {
+    if (!bananza_nvn2_replay) {
+        bananza_nvn2_replay = std::make_unique<BananzaNvn2Replay>(
+            device, memory_allocator, scheduler, rasterizer.GetPipelineCache(),
+            rasterizer.GetFrameDump());
+    }
+    bananza_nvn2_replay->Replay(submission);
+}
+
+void RendererVulkan::PresentBananzaNvn2(const Core::BananzaNvn2Hle::ResourceTextureInfo& texture,
+                                       const Tegra::FramebufferConfig& config) {
+    if (!bananza_nvn2_replay) {
+        return;
+    }
+    const auto source = bananza_nvn2_replay->PresentSource(texture);
+    if (!source) {
+        return;
+    }
+    const std::array configs{config};
+    const std::array sources{source->texture};
+    auto& frame_dump = rasterizer.GetFrameDump();
+    frame_dump.CapturePresent(source->texture.image, source->format, config.width, config.height,
+                              source->address);
+    RenderScreenshot(configs, sources);
+    if (render_window.IsShown()) {
+        auto* frame = present_manager.GetRenderFrame();
+        const auto output = UpdateHdrPresent();
+        const auto layout = render_window.GetFramebufferLayout();
+        frame->color_space = output.color_space;
+        blit_swapchain.DrawToFrame(device, rasterizer, frame, configs, layout,
+                                   present_manager.SwapchainImageCount(), output_format.format,
+                                   output, false, sources);
+        frame->render_tick = scheduler.Flush(*frame->render_ready);
+        present_manager.Present(frame);
+    }
+    Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+    gpu.RendererFrameEndNotify();
+    rasterizer.TickFrame();
+    render_window.OnFrameDisplayed();
+}
+
 HdrPresent RendererVulkan::UpdateHdrPresent() {
     const auto& monitor = Common::DisplayHdrMonitor::Instance();
     const u64 key = (monitor.Generation() << 8) |
@@ -465,7 +508,8 @@ void RendererVulkan::Report() const {
 
 vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                                           const Layout::FramebufferLayout& layout, VkFormat format,
-                                          VkDeviceSize buffer_size) {
+                                          VkDeviceSize buffer_size,
+                                          std::span<const FramebufferTextureInfo> sources) {
     auto frame = [&]() {
         Frame f{};
         f.image =
@@ -477,7 +521,7 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
 
     auto dst_buffer = CreateWrappedBuffer(memory_allocator, buffer_size, MemoryUsage::Download);
     blit_capture.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, 1, format,
-                             CaptureHdrPresent());
+                             CaptureHdrPresent(), false, sources);
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([&](vk::CommandBuffer cmdbuf) {
@@ -493,7 +537,8 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
     return dst_buffer;
 }
 
-void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers) {
+void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers,
+                                      std::span<const FramebufferTextureInfo> sources) {
     if (!renderer_settings.screenshot_requested) {
         return;
     }
@@ -503,7 +548,9 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 
     const auto& layout{renderer_settings.screenshot_framebuffer_layout};
     const auto dst_buffer = RenderToBuffer(screenshot_layers, layout, VK_FORMAT_B8G8R8A8_UNORM,
-                                           layout.width * layout.height * 4);
+                                          layout.width * layout.height * 4,
+                                          screenshot_layers.empty() ? std::span<const FramebufferTextureInfo>{}
+                                                                    : sources);
 
     std::memcpy(renderer_settings.screenshot_bits, dst_buffer.Mapped().data(),
                 dst_buffer.Mapped().size());

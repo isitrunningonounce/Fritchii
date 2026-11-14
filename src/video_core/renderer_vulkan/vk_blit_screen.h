@@ -67,7 +67,8 @@ public:
                      std::span<const Tegra::FramebufferConfig> framebuffers,
                      const Layout::FramebufferLayout& layout, size_t current_swapchain_image_count,
                      VkFormat current_swapchain_view_format, const HdrPresent& output = {},
-                     bool prepare_hudless = false);
+                     bool prepare_hudless = false,
+                     std::span<const FramebufferTextureInfo> sources = {});
 
     void PrepareFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
 
@@ -83,7 +84,8 @@ private:
     /// Composites the layers in scRGB, then encodes the composite to PQ into the frame.
     void DrawHdr10(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
                    std::span<const Tegra::FramebufferConfig> framebuffers,
-                   const Layout::FramebufferLayout& layout, const HdrPresent& output);
+                   const Layout::FramebufferLayout& layout, const HdrPresent& output,
+                   std::span<const FramebufferTextureInfo> sources);
     vk::Framebuffer CreateFramebuffer(const Device& device, const VkImageView& image_view, VkExtent2D extent,
                                       VkRenderPass render_pass);
 

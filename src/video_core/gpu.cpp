@@ -645,6 +645,13 @@ u64 GPU::RunOnGpuThread(std::function<void()>&& action) {
     return impl->RequestSyncOperation(std::move(action));
 }
 
+u64 GPU::SubmitRendererWork(std::function<void(VideoCore::RendererBase&)>&& action) {
+    const u64 fence = impl->RequestSyncOperation(
+        [this, work = std::move(action)] { work(*impl->renderer); });
+    impl->gpu_thread.TickGPU(impl->is_async);
+    return fence;
+}
+
 u64 GPU::CurrentSyncRequestFence() const {
     return impl->CurrentSyncRequestFence();
 }

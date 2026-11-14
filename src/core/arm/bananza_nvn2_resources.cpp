@@ -302,6 +302,16 @@ std::shared_ptr<const ResourceProgramInfo> Resources::GetProgram(u64 program) co
     return found == programs.end() ? nullptr : found->second.snapshot;
 }
 
+const std::unordered_map<u32, ResourceTextureDescriptor>* Resources::GetTexturePool(u64 pool) const {
+    const auto found = texture_pools.find(pool);
+    return found != texture_pools.end() ? &found->second.textures : nullptr;
+}
+
+const std::unordered_map<u32, ResourceSamplerInfo>* Resources::GetSamplerPool(u64 pool) const {
+    const auto found = sampler_pools.find(pool);
+    return found != sampler_pools.end() ? &found->second.samplers : nullptr;
+}
+
 bool Resources::IsFloatReturn(std::string_view name) {
     return (name.starts_with("nvnSamplerBuilder") || name.starts_with("nvnSampler")) &&
            (name.ends_with("GetLodBias") || name.ends_with("GetMaxAnisotropy") ||

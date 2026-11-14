@@ -89,7 +89,8 @@ bool Recorder::Begin(u64 command_buffer) {
 bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
                       std::span<const u8> payload, u64 command_bytes,
                       std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures,
-                      std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program) {
+                      std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program,
+                      ReplayOp replay) {
     if (args.size() > MaxPayloadBytes / sizeof(u64) || payload.size() > MaxPayloadBytes ||
         textures.size() > 9) {
         return false;
@@ -109,6 +110,7 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
     }
     Operation operation;
     operation.id = op;
+    operation.replay = replay;
     operation.args.assign(args.begin(), args.end());
     operation.payload.assign(payload.begin(), payload.end());
     operation.textures.assign(textures.begin(), textures.end());

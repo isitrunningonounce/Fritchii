@@ -122,6 +122,10 @@ public:
     bool EndPass();
     void CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written);
     void CapturePresent(ImageView& view);
+    void CapturePresent(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
+                        u32 height, GPUVAddr address);
+    void CaptureNvn2Input(VkImage image, VideoCore::Surface::PixelFormat format, u32 width,
+                          u32 height, GPUVAddr address);
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
     void TickFrame();

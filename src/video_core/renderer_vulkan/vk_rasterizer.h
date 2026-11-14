@@ -149,6 +149,8 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void TickFrame() override;
+    FrameDump& GetFrameDump() { return frame_dump; }
+    const PipelineCache& GetPipelineCache() const { return pipeline_cache; }
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
