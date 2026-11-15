@@ -253,6 +253,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkQueueBindSparse);
     X(vkQueueSubmit);
     X(vkQueueSubmit2);
+    X(vkResetDescriptorPool);
     X(vkResetFences);
     X(vkResetQueryPool);
     X(vkSetDebugUtilsObjectNameEXT);
@@ -569,9 +570,9 @@ bool Image::IsDeviceLocal() const noexcept {
     return (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 }
 
-void Buffer::Flush() const {
+void Buffer::Flush(VkDeviceSize offset, VkDeviceSize size) const {
     if (!is_coherent) {
-        vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        vmaFlushAllocation(allocator, allocation, offset, size);
     }
 }
 
@@ -649,6 +650,26 @@ DescriptorSets DescriptorPool::Allocate(const VkDescriptorSetAllocateInfo& ai) c
     default:
         throw Exception(result);
     }
+}
+
+VkDescriptorSet DescriptorPool::AllocateOne(VkDescriptorSetLayout layout) const {
+    const VkDescriptorSetAllocateInfo info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = handle,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &layout,
+    };
+    VkDescriptorSet set{};
+    const VkResult result = dld->vkAllocateDescriptorSets(owner, &info, &set);
+    if (result == VK_ERROR_OUT_OF_POOL_MEMORY || result == VK_ERROR_FRAGMENTED_POOL) {
+        return VK_NULL_HANDLE;
+    }
+    Check(result);
+    return set;
+}
+
+void DescriptorPool::Reset() const {
+    Check(dld->vkResetDescriptorPool(owner, handle, 0));
 }
 
 void DescriptorPool::SetObjectNameEXT(const char* name) const {

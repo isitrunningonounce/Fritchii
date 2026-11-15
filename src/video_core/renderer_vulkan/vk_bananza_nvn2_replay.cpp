@@ -12,6 +12,9 @@
 #include <numeric>
 #include <stdexcept>
 
+#include <boost/container/small_vector.hpp>
+
+#include "common/alignment.h"
 #include "common/logging.h"
 #include "common/cityhash.h"
 #include "common/swap.h"
@@ -36,6 +39,14 @@ namespace {
 
 using Core::BananzaNvn2Commands::ReplayOp;
 using VideoCore::Surface::PixelFormat;
+constexpr u64 DrawsBeforeFlush = 256;
+constexpr u32 ScopesBeforeFlush = 6;
+constexpr auto ScopeFlushInterval = std::chrono::microseconds{250};
+constexpr auto ReplayFlushInterval = std::chrono::microseconds{700};
+constexpr u64 MaxFreeStorageBytes = 128ULL << 20;
+constexpr u64 StorageArenaBytes = 8ULL << 20;
+constexpr u64 DeviceArenaBytes = 1ULL << 20;
+constexpr u64 MaxFreeDeviceBytes = 32ULL << 20;
 constexpr std::array<u32, 3> GraphicsStorageBase{0x110, 0x510, 0x410};
 
 struct ColorFormat {
@@ -323,7 +334,742 @@ BananzaNvn2Replay::BananzaNvn2Replay(const Device& device_, MemoryAllocator& all
                                      FrameDump& frame_dump_)
     : device{device_}, allocator{allocator_}, scheduler{scheduler_},
       pipeline_cache{pipeline_cache_}, frame_dump{frame_dump_},
-      trace_images{std::getenv("EDEN_NX2_NVN_TRACE_IMAGES") != nullptr} {}
+      trace_images{std::getenv("EDEN_NX2_NVN_TRACE_IMAGES") != nullptr},
+      profile_replay{std::getenv("EDEN_NX2_NVN_CALL_PROFILE") != nullptr} {
+    device_limits = device.GetPhysical().GetProperties().limits;
+    device_features = device.GetPhysical().GetFeatures();
+    upload_alignment = std::max<u64>({device_limits.minUniformBufferOffsetAlignment,
+                                      device_limits.minStorageBufferOffsetAlignment, 64});
+    constexpr float max_point_size = 2047.0f;
+    std::memcpy(driver_constants.data() + 0x610, &max_point_size, sizeof(max_point_size));
+    Core::BananzaNvn2Commands::GetRetirement().Start();
+    retire_thread = std::jthread([this](std::stop_token token) { RetireLoop(token); });
+}
+
+BananzaNvn2Replay::~BananzaNvn2Replay() {
+    retire_thread.request_stop();
+    if (retire_thread.joinable()) {
+        retire_thread.join();
+    }
+    Core::BananzaNvn2Commands::GetRetirement().Stop();
+}
+
+namespace {
+// Writes the runs of mapped that differ from the submit-time snapshots; returns the bytes
+// written and compared.
+std::pair<u64, u64> WriteChangedBytes(Core::Memory::Memory& memory, u64 guest, u64 base,
+                                      std::span<const u8> mapped,
+                                      std::span<const std::pair<u64, u64>> snapshots,
+                                      const Core::BananzaNvn2Commands::Submission& submission) {
+    if (snapshots.empty()) {
+        memory.WriteBlockUnsafe(guest, mapped.data(), mapped.size());
+        return {mapped.size(), 0};
+    }
+    u64 written{};
+    u64 compared{};
+    for (const auto& snapshot : snapshots) {
+        const u64 offset = snapshot.first - base;
+        if (offset >= mapped.size()) {
+            continue;
+        }
+        const auto before = submission.BufferSnapshot(snapshot);
+        const size_t size = std::min<size_t>(before.size(), mapped.size() - offset);
+        const u8* const now = mapped.data() + offset;
+        compared += size;
+        // Most ranges come back as they went in.
+        if (std::memcmp(now, before.data(), size) == 0) {
+            continue;
+        }
+        size_t i = 0;
+        while (i < size) {
+            const auto first = std::mismatch(now + i, now + size, before.data() + i);
+            i = static_cast<size_t>(first.first - now);
+            if (i == size) {
+                break;
+            }
+            // Merge runs separated by fewer than 64 equal bytes.
+            size_t end = i + 1;
+            size_t same = 0;
+            for (size_t j = end; j < size && same < 64; ++j) {
+                if (now[j] != before[j]) {
+                    end = j + 1;
+                    same = 0;
+                } else {
+                    ++same;
+                }
+            }
+            memory.WriteBlockUnsafe(guest + offset + i, now + i, end - i);
+            written += end - i;
+            i = end;
+        }
+    }
+    return {written, compared};
+}
+} // Anonymous namespace
+
+void BananzaNvn2Replay::RetireLoop(std::stop_token token) {
+    while (true) {
+        std::unique_lock lock{retire_mutex};
+        if (!retire_cv.wait(lock, token, [&] { return !retire_jobs.empty(); })) {
+            return;
+        }
+        RetireJob job = std::move(retire_jobs.front());
+        retire_jobs.pop_front();
+        retire_running = true;
+        lock.unlock();
+        const u64 dequeued_ns = Core::BananzaNvn2Commands::HostNs();
+        const auto write_back = [this, &job](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                const auto& write = job.writes[i];
+                const auto [written, compared] = WriteChangedBytes(
+                    *job.submission->guest_memory, write.guest_address, write.base,
+                    std::span<const u8>{write.data, write.bytes}, write.snapshots,
+                    *job.submission);
+                writeback_bytes.fetch_add(written, std::memory_order_relaxed);
+                writeback_compared.fetch_add(compared, std::memory_order_relaxed);
+            }
+        };
+        static const bool serial_copies = std::getenv("EDEN_NX2_NVN_SERIAL_COPIES") != nullptr;
+        // Batches of about 1 MiB; the last one runs here.
+        const auto compare = [&](size_t first, size_t last) {
+            for (const auto* buffer : job.written_buffers) {
+                buffer->Invalidate();
+            }
+            size_t begin = first;
+            u64 batch_bytes = 0;
+            for (size_t i = first; i < last && !serial_copies; ++i) {
+                batch_bytes += job.writes[i].bytes;
+                if (batch_bytes >= (1ULL << 20) && i + 1 < last) {
+                    retire_workers.QueueWork(
+                        [write_back, begin, end = i + 1] { write_back(begin, end); });
+                    begin = i + 1;
+                    batch_bytes = 0;
+                }
+            }
+            write_back(begin, last);
+            retire_workers.WaitForRequests();
+        };
+        // Spans the GPU wrote for the last time in an earlier command buffer are compared
+        // while it finishes the later ones.
+        std::ranges::stable_sort(job.writes, {}, &WriteBack::tick);
+        size_t compared_writes = 0;
+        while (compared_writes < job.writes.size() &&
+               job.writes[compared_writes].tick < job.tick) {
+            const u64 tick = job.writes[compared_writes].tick;
+            size_t end = compared_writes;
+            while (end < job.writes.size() && job.writes[end].tick == tick) {
+                ++end;
+            }
+            scheduler.GetMasterSemaphore().Wait(tick);
+            compare(compared_writes, end);
+            compared_writes = end;
+        }
+        // What the game can see of the submission: its event signals and counters, then the
+        // sync. The caller holds retire_mutex.
+        const auto finish = [&] {
+            std::span<const u64> results;
+            if (job.query_results) {
+                job.query_results->Invalidate();
+                results = {reinterpret_cast<const u64*>(job.query_results->Mapped().data()),
+                           job.queries};
+            }
+            ApplyCounterEvents(results, job.counters, job.queries);
+            for (const auto& event : job.counters) {
+                if (event.kind == CounterEvent::Kind::Report) {
+                    if (const auto it = pending_reports.find(event.gpu_address);
+                        it != pending_reports.end() && --it->second == 0) {
+                        pending_reports.erase(it);
+                    }
+                }
+            }
+            if (!job.counters.empty()) {
+                pending_counter_jobs.fetch_sub(1, std::memory_order_relaxed);
+            }
+        };
+        // The last command buffers usually hold the post-processing passes only. With every
+        // written range back and no counter to read, the game has nothing to wait for in them.
+        static const bool late_retire = std::getenv("EDEN_NX2_NVN_LATE_RETIRE") != nullptr;
+        // EDEN_NX2_NVN_EARLY_SYNC=1: also when the last ranges are still to come back; they
+        // stay pending for the next scan that reads them (Retirement::WritesDone).
+        static const bool early_sync = std::getenv("EDEN_NX2_NVN_EARLY_SYNC") != nullptr;
+        const bool writes_done = compared_writes == job.writes.size();
+        const bool early = !late_retire && (writes_done || early_sync) && !job.query_results &&
+                           std::ranges::all_of(job.counters, [](const CounterEvent& event) {
+                               return event.kind == CounterEvent::Kind::Signal;
+                           });
+        u64 retired_ns{};
+        if (early) {
+            lock.lock();
+            finish();
+            lock.unlock();
+            Core::BananzaNvn2Commands::GetRetirement().Retire(job.sequence, writes_done);
+            retired_ns = Core::BananzaNvn2Commands::HostNs();
+        }
+        static std::atomic<u64> retired_jobs{};
+        static std::atomic<u64> retired_early{};
+        static std::atomic<u64> late_writes{};
+        static std::atomic<u64> late_write_bytes{};
+        static std::atomic<u64> late_counters{};
+        static std::atomic<u64> late_queries{};
+        static std::atomic<u64> late_ranges{};
+        static std::atomic<u64> late_changed{};
+        late_ranges.fetch_add(job.writes.size() - compared_writes, std::memory_order_relaxed);
+        retired_early.fetch_add(early, std::memory_order_relaxed);
+        if (compared_writes < job.writes.size()) {
+            late_writes.fetch_add(1, std::memory_order_relaxed);
+            for (size_t i = compared_writes; i < job.writes.size(); ++i) {
+                late_write_bytes.fetch_add(job.writes[i].bytes, std::memory_order_relaxed);
+            }
+        }
+        late_queries.fetch_add(job.query_results != nullptr, std::memory_order_relaxed);
+        late_counters.fetch_add(
+            std::ranges::any_of(job.counters, [](const CounterEvent& event) {
+                return event.kind != CounterEvent::Kind::Signal;
+            }),
+            std::memory_order_relaxed);
+        if (const u64 count = retired_jobs.fetch_add(1, std::memory_order_relaxed) + 1;
+            count % 2400 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 retire: {} of the last 2400 submissions retired before the GPU "
+                     "finished them; kept to the end: {} by ranges written in the last command "
+                     "buffer ({} KiB in {} ranges, {} bytes of them changed), {} by counters, "
+                     "{} by query results",
+                     retired_early.exchange(0, std::memory_order_relaxed),
+                     late_writes.exchange(0, std::memory_order_relaxed),
+                     late_write_bytes.exchange(0, std::memory_order_relaxed) >> 10,
+                     late_ranges.exchange(0, std::memory_order_relaxed),
+                     late_changed.exchange(0, std::memory_order_relaxed),
+                     late_counters.exchange(0, std::memory_order_relaxed),
+                     late_queries.exchange(0, std::memory_order_relaxed));
+        }
+        scheduler.GetMasterSemaphore().Wait(job.tick);
+        const u64 gpu_done_ns = Core::BananzaNvn2Commands::HostNs();
+        if (!job.pass_labels.empty()) {
+            ReportPassTimes(job);
+            pass_trace_busy.store(false, std::memory_order_release);
+        }
+        if (compared_writes < job.writes.size()) {
+            const u64 before = writeback_bytes.load(std::memory_order_relaxed);
+            compare(compared_writes, job.writes.size());
+            late_changed.fetch_add(writeback_bytes.load(std::memory_order_relaxed) - before,
+                                   std::memory_order_relaxed);
+        }
+        lock.lock();
+        if (!early) {
+            finish();
+        }
+        retire_running = false;
+        lock.unlock();
+        if (!early) {
+            Core::BananzaNvn2Commands::GetRetirement().Retire(job.sequence);
+            retired_ns = Core::BananzaNvn2Commands::HostNs();
+        } else if (!writes_done) {
+            Core::BananzaNvn2Commands::GetRetirement().RetireWrites(job.sequence);
+        }
+        retire_idle_cv.notify_all();
+        if (profile_replay && Core::BananzaNvn2Commands::InTimelineWindow(job.sequence)) {
+            const u64 base = job.submission->host_submit_ns;
+            const auto at = [&](u64 ns) { return (static_cast<double>(ns) - base) / 1e6; };
+            const auto [first_begin, first_end] = scheduler.SubmitTimes(job.first_tick);
+            const auto [last_begin, last_end] = scheduler.SubmitTimes(job.tick);
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 timeline: seq {} draws {} submit at {:.3f} ms, queued +{:.3f}, replay "
+                     "+{:.3f} to +{:.3f}, ticks {} to {}, first vkQueueSubmit +{:.3f}, last "
+                     "vkQueueSubmit +{:.3f} to +{:.3f}, retire thread free +{:.3f}, gpu done "
+                     "+{:.3f}, retired +{:.3f}",
+                     job.sequence, job.draws, base / 1e6, at(job.submission->host_queued_ns),
+                     at(job.replay_start_ns), at(job.push_ns), job.first_tick, job.tick,
+                     job.tick >= job.first_tick ? at(first_begin) : 0.0, at(last_begin),
+                     at(last_end), at(dequeued_ns), at(gpu_done_ns), at(retired_ns));
+        }
+    }
+}
+
+void BananzaNvn2Replay::PassTimestamp(PassLabel label, bool top) {
+    if (!pass_trace_active || pass_trace_labels.size() + 1 >= PassTraceQueries) {
+        return;
+    }
+    Record([pool = *pass_trace_pool, query = static_cast<u32>(pass_trace_labels.size()),
+            top](vk::CommandBuffer cmdbuf) {
+        cmdbuf.WriteTimestamp(top ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                  : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              pool, query);
+    });
+    label.draws = draws;
+    pass_trace_labels.push_back(label);
+}
+
+void BananzaNvn2Replay::ReportPassTimes(const RetireJob& job) {
+    const auto& labels = job.pass_labels;
+    std::vector<u64> stamps(labels.size() + 1);
+    const auto result = device.GetLogical().GetQueryResults(
+        *pass_trace_pool, 0, static_cast<u32>(stamps.size()), stamps.size() * sizeof(u64),
+        stamps.data(), sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result != VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "NVN 2 GPU passes: query result {}", static_cast<int>(result));
+        return;
+    }
+    const double period = device.GetPhysical().GetProperties().limits.timestampPeriod / 1e6;
+    struct Total {
+        double ms{};
+        u32 scopes{};
+        u64 draws{};
+    };
+    std::map<std::tuple<u64, u32, u32>, Total> by_target;
+    std::array<Total, 7> by_reason{};
+    struct Scope {
+        double ms;
+        size_t index;
+        u64 draws;
+    };
+    std::vector<Scope> slowest;
+    std::array<u32, 3> fresh{};
+    std::map<std::pair<u64, u64>, u32> storage_ranges;
+    std::map<u64, u32> storage_programs;
+    std::array<u32, 9> fresh_slots{};
+    std::map<u64, u32> fresh_programs;
+    double idle_ms{};
+    u32 flushes{};
+    for (size_t i = 0; i < labels.size(); ++i) {
+        const double ms = static_cast<double>(static_cast<s64>(stamps[i + 1] - stamps[i])) * period;
+        const u64 scope_draws = (i + 1 < labels.size() ? labels[i + 1].draws : job.pass_end_draws) -
+                                labels[i].draws;
+        if (labels[i].reason & 32) {
+            // From the end of the work before a flush to the start of the next command buffer.
+            idle_ms += ms;
+            ++flushes;
+            continue;
+        }
+        auto& total = by_target[{labels[i].target, labels[i].width, labels[i].height}];
+        total.ms += ms;
+        total.draws += scope_draws;
+        ++total.scopes;
+        for (size_t bit = 0; bit < by_reason.size(); ++bit) {
+            if (labels[i].reason & (1U << bit)) {
+                by_reason[bit].ms += ms;
+                ++by_reason[bit].scopes;
+            }
+        }
+        slowest.push_back({ms, i, scope_draws});
+        fresh[0] += (labels[i].fresh & 1) != 0;
+        fresh[1] += (labels[i].fresh & 2) != 0;
+        fresh[2] += (labels[i].fresh & 4) != 0;
+        if (labels[i].fresh & 2) {
+            ++fresh_slots[std::min<u32>(labels[i].fresh_slot, 8)];
+            ++fresh_programs[labels[i].program];
+        }
+        if (labels[i].reason & 8) {
+            ++storage_ranges[{labels[i].storage, labels[i].storage_size}];
+            ++storage_programs[labels[i].program];
+        }
+    }
+    const double span = static_cast<double>(stamps.back() - stamps.front()) * period;
+    {
+        // What the GPU is left with once the replay has handed over its last command buffer.
+        size_t tail = 0;
+        for (size_t i = 0; i < labels.size(); ++i) {
+            if (labels[i].reason & 32) {
+                tail = i + 1;
+            }
+        }
+        std::string passes;
+        for (size_t i = tail; i < labels.size(); ++i) {
+            const double ms = static_cast<double>(static_cast<s64>(stamps[i + 1] - stamps[i])) * period;
+            if (ms >= 0.05) {
+                passes += fmt::format(" {}x{} program {} {:.3f} ms;", labels[i].width,
+                                      labels[i].height, labels[i].program, ms);
+            }
+        }
+        // The GPU's last 2 ms, newest first: passes, and gaps where it waited for a command buffer.
+        std::string last;
+        for (size_t i = labels.size(); i-- > 0;) {
+            const double ms = static_cast<double>(static_cast<s64>(stamps[i + 1] - stamps[i])) * period;
+            const double before_end =
+                static_cast<double>(static_cast<s64>(stamps.back() - stamps[i + 1])) * period;
+            if (before_end > 2.0) {
+                break;
+            }
+            if (labels[i].reason & 32) {
+                last += fmt::format(" [waited {:.3f} ms]", ms);
+            } else if (ms >= 0.03) {
+                last += fmt::format(" {}x{} p{} {:.3f};", labels[i].width, labels[i].height,
+                                    labels[i].program, ms);
+            }
+        }
+        LOG_INFO(Render_Vulkan, "NVN 2 GPU passes: last 2 ms on the GPU, newest first:{}", last);
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 GPU passes: after the last flush {:.3f} ms of GPU work in {} scopes:{}",
+                 tail < stamps.size()
+                     ? static_cast<double>(static_cast<s64>(stamps.back() - stamps[tail])) * period
+                     : 0.0,
+                 labels.size() - tail, passes);
+    }
+    LOG_INFO(Render_Vulkan,
+             "NVN 2 GPU passes: seq {} with {} draws, {} scopes on {} targets, GPU span {:.3f} ms of "
+             "which {:.3f} ms between command buffers ({} flushes)",
+             job.sequence, job.pass_end_draws - labels.front().draws, slowest.size(),
+             by_target.size(), span, idle_ms, flushes);
+    LOG_INFO(Render_Vulkan,
+             "NVN 2 GPU passes: scopes begun because targets changed {} ({:.3f} ms), sampled a "
+             "written image {} ({:.3f} ms), storage written before {} ({:.3f} ms), storage written "
+             "by the draw {} ({:.3f} ms), after other work {} ({:.3f} ms), after a flush {} ({:.3f} ms)",
+             by_reason[0].scopes, by_reason[0].ms, by_reason[1].scopes, by_reason[1].ms,
+             by_reason[2].scopes, by_reason[2].ms, by_reason[3].scopes, by_reason[3].ms,
+             by_reason[4].scopes, by_reason[4].ms, by_reason[6].scopes, by_reason[6].ms);
+    {
+        std::vector<std::pair<u32, u32>> sites(job.scope_end_sites.begin(), job.scope_end_sites.end());
+        std::ranges::sort(sites, std::greater{}, [](const auto& entry) { return entry.second; });
+        std::string top;
+        for (size_t i = 0; i < sites.size() && i < 10; ++i) {
+            top += fmt::format(" line {} x{}", sites[i].first, sites[i].second);
+        }
+        LOG_INFO(Render_Vulkan, "NVN 2 GPU passes: scopes ended by:{}", top);
+    }
+    LOG_INFO(Render_Vulkan,
+             "NVN 2 GPU passes: sampled a written depth target {}, colour target {}, other image {}; "
+             "storage written by {} programs to {} ranges",
+             fresh[0], fresh[1], fresh[2], storage_programs.size(), storage_ranges.size());
+    {
+        std::vector<std::pair<u64, u32>> programs(fresh_programs.begin(), fresh_programs.end());
+        std::ranges::sort(programs, std::greater{}, [](const auto& entry) { return entry.second; });
+        std::string top;
+        for (size_t i = 0; i < programs.size() && i < 8; ++i) {
+            top += fmt::format(" {}x{}", programs[i].first, programs[i].second);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 GPU passes: sampled colour slot 0: {}, 1: {}, 2: {}, 3: {}, 4+: {}; {} "
+                 "programs (program x scopes):{}",
+                 fresh_slots[0], fresh_slots[1], fresh_slots[2], fresh_slots[3],
+                 fresh_slots[4] + fresh_slots[5] + fresh_slots[6] + fresh_slots[7],
+                 programs.size(), top);
+    }
+    {
+        std::vector<std::pair<std::pair<u64, u64>, u32>> ranges(storage_ranges.begin(),
+                                                                storage_ranges.end());
+        std::ranges::sort(ranges, std::greater{}, [](const auto& entry) { return entry.second; });
+        for (size_t i = 0; i < ranges.size() && i < 6; ++i) {
+            LOG_INFO(Render_Vulkan, "NVN 2 GPU passes: storage {:#x} of {} bytes written by {} scopes",
+                     ranges[i].first.first, ranges[i].first.second, ranges[i].second);
+        }
+        std::vector<std::pair<u64, u32>> programs(storage_programs.begin(), storage_programs.end());
+        std::ranges::sort(programs, std::greater{}, [](const auto& entry) { return entry.second; });
+        for (size_t i = 0; i < programs.size() && i < 6; ++i) {
+            LOG_INFO(Render_Vulkan, "NVN 2 GPU passes: program {} writes storage in {} scopes",
+                     programs[i].first, programs[i].second);
+        }
+    }
+    std::vector<std::pair<std::tuple<u64, u32, u32>, Total>> targets(by_target.begin(),
+                                                                    by_target.end());
+    std::ranges::sort(targets, std::greater{}, [](const auto& entry) { return entry.second.ms; });
+    for (size_t i = 0; i < targets.size() && i < 16; ++i) {
+        const auto& [key, total] = targets[i];
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 GPU passes: target {:#x} {}x{}: {:.3f} ms in {} scopes, {} draws",
+                 std::get<0>(key), std::get<1>(key), std::get<2>(key), total.ms, total.scopes,
+                 total.draws);
+    }
+    std::ranges::sort(slowest, std::greater{}, &Scope::ms);
+    for (size_t i = 0; i < slowest.size() && i < 12; ++i) {
+        const auto& label = labels[slowest[i].index];
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 GPU passes: scope {} took {:.3f} ms: target {:#x} {}x{}, first program {}, "
+                 "{} draws, reason {:#x}",
+                 slowest[i].index, slowest[i].ms, label.target, label.width, label.height,
+                 label.program, slowest[i].draws, label.reason);
+    }
+}
+
+void BananzaNvn2Replay::ProbeHostImport(const u8* pointer, u64 size) {
+    const auto& dld = device.GetDispatchLoader();
+    const VkDevice handle = *device.GetLogical();
+    const auto host_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+        dld.vkGetDeviceProcAddr(handle, "vkGetMemoryHostPointerPropertiesEXT"));
+    if (!host_properties) {
+        LOG_INFO(Render_Vulkan, "NVN 2 import probe: VK_EXT_external_memory_host is not enabled");
+        return;
+    }
+    const auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
+    constexpr std::array types{VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT};
+    for (const auto type : types) {
+        for (const u64 alignment : {u64{4096}, u64{65536}}) {
+            const u64 address = reinterpret_cast<u64>(pointer);
+            const u64 low = address & ~(alignment - 1);
+            const u64 high = (address + size + alignment - 1) & ~(alignment - 1);
+            const u64 bytes = high - low;
+            VkMemoryHostPointerPropertiesEXT properties{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+            auto start = std::chrono::steady_clock::now();
+            VkResult result = host_properties(handle, type, reinterpret_cast<void*>(low), &properties);
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 import probe: handle type {:#x}, alignment {}, {} KiB at {:#x}: "
+                     "properties result {}, memory types {:#x}, {:.3f} ms",
+                     static_cast<u32>(type), alignment, bytes >> 10, low, static_cast<int>(result),
+                     properties.memoryTypeBits, ms_since(start));
+            if (result != VK_SUCCESS || !properties.memoryTypeBits) {
+                continue;
+            }
+            const VkExternalMemoryBufferCreateInfo external{
+                .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                .handleTypes = static_cast<VkExternalMemoryHandleTypeFlags>(type)};
+            const VkBufferCreateInfo buffer_info{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = &external,
+                .size = bytes,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            };
+            VkBuffer buffer{};
+            result = dld.vkCreateBuffer(handle, &buffer_info, nullptr, &buffer);
+            if (result != VK_SUCCESS) {
+                LOG_INFO(Render_Vulkan, "NVN 2 import probe: vkCreateBuffer result {}",
+                         static_cast<int>(result));
+                continue;
+            }
+            const VkMemoryRequirements requirements =
+                device.GetLogical().GetBufferMemoryRequirements(buffer);
+            const u32 usable = requirements.memoryTypeBits & properties.memoryTypeBits;
+            VkDeviceMemory memory{};
+            if (usable && requirements.size <= bytes) {
+                const VkImportMemoryHostPointerInfoEXT import{
+                    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                    .handleType = type,
+                    .pHostPointer = reinterpret_cast<void*>(low),
+                };
+                const VkMemoryAllocateInfo allocate{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    .pNext = &import,
+                    .allocationSize = bytes,
+                    .memoryTypeIndex = static_cast<u32>(std::countr_zero(usable)),
+                };
+                start = std::chrono::steady_clock::now();
+                result = dld.vkAllocateMemory(handle, &allocate, nullptr, &memory);
+                const double allocate_ms = ms_since(start);
+                VkResult bound = VK_ERROR_UNKNOWN;
+                if (result == VK_SUCCESS) {
+                    bound = dld.vkBindBufferMemory(handle, buffer, memory, 0);
+                }
+                LOG_INFO(Render_Vulkan,
+                         "NVN 2 import probe: memory type {} of {:#x}, vkAllocateMemory result {} in "
+                         "{:.3f} ms, vkBindBufferMemory result {}",
+                         std::countr_zero(usable), usable, static_cast<int>(result), allocate_ms,
+                         static_cast<int>(bound));
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "NVN 2 import probe: no usable memory type (buffer {:#x}, host {:#x}, size "
+                         "{} of {})",
+                         requirements.memoryTypeBits, properties.memoryTypeBits, requirements.size,
+                         bytes);
+            }
+            dld.vkDestroyBuffer(handle, buffer, nullptr);
+            if (memory) {
+                dld.vkFreeMemory(handle, memory, nullptr);
+            }
+        }
+    }
+}
+
+void BananzaNvn2Replay::DispatchCopies() {
+    if (!copy_jobs.empty()) {
+        copy_workers.QueueWork([jobs = std::move(copy_jobs), late = late_copies] {
+            if (late) {
+                late->Wait();
+            }
+            for (const auto& job : jobs) {
+                std::memcpy(job.dest, job.source, job.size);
+            }
+        });
+        copy_jobs.clear();
+        copy_job_bytes = 0;
+    }
+}
+
+void BananzaNvn2Replay::WaitCopies() {
+    const auto pending = [](const StorageArena& arena) { return arena.used > arena.flushed; };
+    const bool unflushed = std::ranges::any_of(storage_arenas, pending) ||
+                           std::ranges::any_of(device_arenas, pending);
+    if (copy_jobs.empty() && !unflushed) {
+        return;
+    }
+    if (late_copies && !copy_jobs.empty()) {
+        late_copies->Wait();
+    }
+    for (const auto& job : copy_jobs) {
+        std::memcpy(job.dest, job.source, job.size);
+    }
+    copy_jobs.clear();
+    copy_job_bytes = 0;
+    copy_workers.WaitForRequests();
+    for (auto* arenas : {&storage_arenas, &device_arenas}) {
+        for (auto& arena : *arenas) {
+            if (arena.used > arena.flushed) {
+                arena.buffer.Flush(arena.flushed, arena.used - arena.flushed);
+                arena.flushed = arena.used;
+            }
+        }
+    }
+}
+
+std::pair<VkBuffer, u64> BananzaNvn2Replay::AllocateDeviceStorage(u64 aligned, u8*& mapped) {
+    if (device_arenas.empty() ||
+        device_arenas.back().capacity - device_arenas.back().used < aligned) {
+        const u64 capacity = std::max(DeviceArenaBytes, std::bit_ceil(aligned));
+        auto& free = free_device_storage[capacity];
+        vk::Buffer buffer;
+        if (free.empty()) {
+            buffer = allocator.CreateBuffer({
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = capacity,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            }, MemoryUsage::Stream);
+        } else {
+            buffer = std::move(free.back());
+            free.pop_back();
+            free_device_bytes -= capacity;
+        }
+        device_arenas.push_back({std::move(buffer), capacity});
+    }
+    auto& arena = device_arenas.back();
+    const u64 base = arena.used;
+    arena.used += aligned;
+    mapped = arena.buffer.Mapped().data() + base;
+    return {*arena.buffer, base};
+}
+
+void BananzaNvn2Replay::MoveStorageToDevice(StorageUpload& upload) {
+    u8* mapped{};
+    const auto [buffer, base] =
+        AllocateDeviceStorage(Common::AlignUp(upload.size, upload_alignment), mapped);
+    // What the CPU filled and the GPU wrote so far goes along; the fills are waited for
+    // before the command buffer is submitted.
+    Barrier();
+    Record([source = upload.buffer, target = buffer,
+            region = VkBufferCopy{upload.base, base, upload.size}](vk::CommandBuffer cmdbuf) {
+        cmdbuf.CopyBuffer(source, target, region);
+    });
+    Barrier();
+    upload.readback_buffer = upload.buffer;
+    upload.readback_base = upload.base;
+    upload.buffer = buffer;
+    upload.base = base;
+    device_uploads.push_back(&upload);
+    // A vertex stream over the same range must not keep the host copy.
+    vertex_uploads.fill({});
+    ++upload_generation;
+    ++device_moves;
+    ++device_spans;
+    device_span_bytes += upload.size;
+}
+
+void BananzaNvn2Replay::RecordStorageReadback(bool flush) {
+    device_readback_pending = false;
+    boost::container::small_vector<std::tuple<VkBuffer, VkBuffer, VkBufferCopy>, 8> copies;
+    boost::container::small_vector<StorageUpload*, 8> copied;
+    for (auto* upload : device_uploads) {
+        if (upload->dirty && upload->written_bytes && upload->readback_stale) {
+            copies.emplace_back(upload->buffer, upload->readback_buffer,
+                                VkBufferCopy{upload->base, upload->readback_base,
+                                             upload->written_bytes});
+            copied.push_back(upload);
+        }
+    }
+    if (copies.empty()) {
+        return;
+    }
+    Barrier();
+    for (auto* upload : copied) {
+        upload->readback_stale = false;
+        upload->readback_tick = scheduler.CurrentTick();
+    }
+    Record([copies = std::move(copies)](vk::CommandBuffer cmdbuf) {
+        for (const auto& [source, target, region] : copies) {
+            cmdbuf.CopyBuffer(source, target, region);
+        }
+    });
+    if (flush && !frame_dump.CapturingSampled()) {
+        // The copy's command buffer ends here, so its tick does not wait for later passes.
+        PassTimestamp({.reason = 32});
+        WaitCopies();
+        scheduler.Flush();
+        PassTimestamp({.reason = 64}, true);
+        ++replay_flushes;
+        flush_scopes = 0;
+        next_flush_draw = draws + DrawsBeforeFlush;
+        next_replay_flush = std::chrono::steady_clock::now() + ReplayFlushInterval;
+    }
+}
+
+void BananzaNvn2Replay::WaitRetireIdle() {
+    std::unique_lock lock{retire_mutex};
+    retire_idle_cv.wait(lock, [&] { return retire_jobs.empty() && !retire_running; });
+}
+
+void BananzaNvn2Replay::ApplyCounterEvents(std::span<const u64> results,
+                                           std::span<const CounterEvent> events, u32 queries) {
+    const auto sum = [&](u32 begin, u32 end) {
+        end = std::min<u32>(end, static_cast<u32>(results.size()));
+        return begin < end ? std::accumulate(results.begin() + begin, results.begin() + end, u64{})
+                           : u64{};
+    };
+    u32 position = 0;
+    for (const auto& event : events) {
+        switch (event.kind) {
+        case CounterEvent::Kind::Reset:
+            counted_samples = 0;
+            position = event.query;
+            break;
+        case CounterEvent::Kind::Report: {
+            counted_samples += sum(position, event.query);
+            position = event.query;
+            const std::array<u64_le, 2> data{counted_samples, event.submitted_ns};
+            event.memory->WriteBlockUnsafe(event.guest_address, data.data(), sizeof(data));
+            break;
+        }
+        case CounterEvent::Kind::Signal:
+            event.memory->Write32(event.guest_address,
+                                  event.add ? event.memory->Read32(event.guest_address) + event.value
+                                            : event.value);
+            break;
+        }
+    }
+    counted_samples += sum(position, queries);
+}
+
+template <typename T>
+void BananzaNvn2Replay::Record(T&& command, std::source_location location) {
+    if (pass_trace_active && rendering_scope) {
+        ++scope_end_sites[location.line()];
+    }
+    EndRendering();
+    scheduler.Record(std::forward<T>(command));
+}
+
+void BananzaNvn2Replay::EndRendering() {
+    if (rendering_scope) {
+        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.EndRendering(); });
+        rendering_scope.reset();
+        scope_pipeline = VK_NULL_HANDLE;
+        scope_descriptor_set = VK_NULL_HANDLE;
+        scope_wrote_storage = false;
+    }
+}
+
+VkFormatFeatureFlags2 BananzaNvn2Replay::FormatFeatures(VkFormat format) {
+    const auto [entry, inserted] = format_features.try_emplace(format);
+    if (inserted) {
+        entry->second = device.GetPhysical().GetFormatProperties3(format).optimalTilingFeatures;
+    }
+    return entry->second;
+}
 
 bool BananzaNvn2Replay::ReserveImageBytes(u64 bytes) {
     const u64 limit = std::clamp<u64>(device.GetDeviceLocalMemory() / 4,
@@ -346,6 +1092,8 @@ bool BananzaNvn2Replay::ReserveImageBytes(u64 bytes) {
     }
     std::ranges::sort(cold, {}, [](const auto& it) { return it->second.last_present; });
     // Finish outstanding transfers and presentation reads before releasing Vulkan objects.
+    EndRendering();
+    WaitCopies();
     scheduler.Finish();
     const u64 previous_bytes = image_bytes;
     // Leave room for the next resources in the same load transition.
@@ -363,6 +1111,7 @@ bool BananzaNvn2Replay::ReserveImageBytes(u64 bytes) {
         }
         image_bytes -= image.allocation_bytes;
         images.erase(it);
+        image_memo.fill({});
         if (image_bytes <= target) {
             break;
         }
@@ -379,10 +1128,10 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
     const u32 layers = texture.layout.layers;
     const bool volume = d.target == 2;
     const u32 depth = volume ? d.depth : 1;
-    const auto& limits = device.GetPhysical().GetProperties().limits;
+    const auto& limits = device_limits;
     if (!texture.serial || !texture.storage.gpu_address ||
         (d.target != 1 && !volume && d.target != 4 && d.target != 8 && d.target != 9) ||
-        !layers || layers > device.GetPhysical().GetProperties().limits.maxImageArrayLayers ||
+        !layers || layers > device_limits.maxImageArrayLayers ||
         d.samples > 1 || !depth || !d.width || !d.height ||
         d.width > (volume ? limits.maxImageDimension3D : limits.maxImageDimension2D) ||
         d.height > (volume ? limits.maxImageDimension3D : limits.maxImageDimension2D) ||
@@ -392,8 +1141,16 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
     }
     const ImageKey key{texture.storage.gpu_address + texture.offset, d.width, d.height, d.format,
                        d.levels, d.target, layers, depth};
+    const u64 address = std::get<0>(key);
+    auto& memo = image_memo[(address >> 12 ^ address >> 22 ^ d.width ^ d.format << 4 ^
+                             d.levels << 7 ^ layers << 9) % image_memo.size()];
+    if (memo.image && memo.key == key) {
+        memo.image->last_present = present_count;
+        return memo.image;
+    }
     if (const auto it = images.find(key); it != images.end()) {
         it->second.last_present = present_count;
+        memo = {key, &it->second};
         return &it->second;
     }
     if (!create) {
@@ -442,6 +1199,7 @@ BananzaNvn2Replay::Image* BananzaNvn2Replay::FindImage(const Texture& texture, b
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     });
+    ++image_creates;
     const u64 bytes = image.GetMemoryBlock().size;
     if (!ReserveImageBytes(bytes)) {
         if (!image_budget_logged) {
@@ -516,7 +1274,7 @@ void BananzaNvn2Replay::Initialize(Image& image) {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([handle = *image.image, levels = image.levels, layers = image.layers,
+    Record([handle = *image.image, levels = image.levels, layers = image.layers,
                       aspects = image.aspects](vk::CommandBuffer cmdbuf) {
         const VkImageMemoryBarrier transition{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -534,9 +1292,16 @@ void BananzaNvn2Replay::Initialize(Image& image) {
     image.initialized = true;
 }
 
-void BananzaNvn2Replay::Barrier() {
+void BananzaNvn2Replay::Barrier(std::source_location location) {
+    if (device_readback_pending) {
+        // Now and not at the submission's end: the game can then be told about the bytes
+        // before the GPU has drawn the passes that follow.
+        RecordStorageReadback(true);
+    }
+    ++barrier_serial;
+    ++barriers;
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+    Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -544,7 +1309,25 @@ void BananzaNvn2Replay::Barrier() {
         };
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
-    });
+    }, location);
+    // Give the GPU completed passes while replay records the rest of the submission.
+    // Passes with few draws (post-processing) count too, or all of them wait for the end.
+    static const bool pass_flush = std::getenv("EDEN_NX2_NVN_NO_PASS_FLUSH") == nullptr;
+    const bool many_scopes = pass_flush && flush_scopes >= ScopesBeforeFlush;
+    if ((draws >= next_flush_draw || many_scopes) && !frame_dump.CapturingSampled()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_replay_flush ||
+            (many_scopes && now + (ReplayFlushInterval - ScopeFlushInterval) >= next_replay_flush)) {
+            PassTimestamp({.reason = 32});
+            WaitCopies();
+            scheduler.Flush();
+            PassTimestamp({.reason = 64}, true);
+            ++replay_flushes;
+            flush_scopes = 0;
+            next_flush_draw = draws + DrawsBeforeFlush;
+            next_replay_flush = std::chrono::steady_clock::now() + ReplayFlushInterval;
+        }
+    }
 }
 
 VkRect2D BananzaNvn2Replay::ScissorFor(VkExtent2D extent) const {
@@ -563,7 +1346,7 @@ VkRect2D BananzaNvn2Replay::ScissorFor(VkExtent2D extent) const {
 }
 
 void BananzaNvn2Replay::ClearColor(const Operation& op) {
-    if (!render_enabled || op.args.size() != 2 || op.payload.size() != 16 || op.args[0] >= colors.size() ||
+    if (!render_enabled || op.args.size() != 2 || op.Payload().size() != 16 || op.args[0] >= colors.size() ||
         op.args[1] != 0xf || !colors[op.args[0]] || !color_views[op.args[0]].format) {
         return;
     }
@@ -587,11 +1370,11 @@ void BananzaNvn2Replay::ClearColor(const Operation& op) {
     Initialize(*image);
     Barrier();
     VkClearColorValue value{};
-    std::memcpy(&value, op.payload.data(), op.payload.size());
+    std::memcpy(&value, op.Payload().data(), op.Payload().size());
     TraceImage("clear", *colors[op.args[0]]);
     image->gpu_written = true;
     ++image->write_version;
-    scheduler.Record([attachment, value, extent, rect, whole, initialized,
+    Record([attachment, value, extent, rect, whole, initialized,
                       layers = view.layers](vk::CommandBuffer cmdbuf) {
         const VkRenderingAttachmentInfo color{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -623,7 +1406,7 @@ void BananzaNvn2Replay::ClearColor(const Operation& op) {
 }
 
 void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
-    if (!render_enabled || !depth_texture || op.args.size() != 3 || op.payload.size() != sizeof(float)) {
+    if (!render_enabled || !depth_texture || op.args.size() != 3 || op.Payload().size() != sizeof(float)) {
         return;
     }
     auto* image = FindImage(*depth_texture, true);
@@ -641,7 +1424,7 @@ void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
         return;
     }
     VkClearDepthStencilValue value{.stencil = static_cast<u32>(op.args[1]) & 255};
-    std::memcpy(&value.depth, op.payload.data(), sizeof(value.depth));
+    std::memcpy(&value.depth, op.Payload().data(), sizeof(value.depth));
     const VkExtent2D extent{std::max(1U, image->extent.width >> depth_view.level),
                             std::max(1U, image->extent.height >> depth_view.level)};
     const VkRect2D rect = ScissorFor(extent);
@@ -653,7 +1436,7 @@ void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
     image->gpu_written = true;
     ++image->write_version;
     Barrier();
-    scheduler.Record([view = attachment, rect, aspects, image_aspects = image->aspects, value,
+    Record([view = attachment, rect, aspects, image_aspects = image->aspects, value,
                       initialized, extent, layers = depth_view.layers](vk::CommandBuffer cmdbuf) {
         const VkRenderingAttachmentInfo target{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -678,15 +1461,15 @@ void BananzaNvn2Replay::ClearDepthStencil(const Operation& op) {
 }
 
 void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submission) {
-    if (op.textures.size() != 2 || op.args.size() != 5 ||
-        op.payload.size() != 32 + 2 * sizeof(CopyRegion)) {
+    if (op.Textures().size() != 2 || op.args.size() != 5 ||
+        op.Payload().size() != 32 + 2 * sizeof(CopyRegion)) {
         return;
     }
-    const auto source_address = op.textures[0].storage.gpu_address + op.textures[0].offset;
+    const auto source_address = op.Textures()[0].storage.gpu_address + op.Textures()[0].offset;
     const auto reject = [&](const char* reason) {
-        TraceImage(reason, op.textures[1], source_address);
+        TraceImage(reason, op.Textures()[1], source_address);
     };
-    TraceImage("copy request", op.textures[1], source_address);
+    TraceImage("copy request", op.Textures()[1], source_address);
     if (op.args[2] & ~0x1fULL) {
         reject("copy flags unsupported");
         return;
@@ -698,9 +1481,9 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
         CopyRegion region;
     };
     const auto decode = [&](size_t index) -> std::optional<CopyView> {
-        const auto& texture = op.textures[index];
+        const auto& texture = op.Textures()[index];
         const auto& d = texture.description;
-        const auto view = std::span{op.payload}.subspan(16 * index, 16);
+        const auto view = std::span{op.Payload()}.subspan(16 * index, 16);
         const u8 flags = op.args[3 + index] ? view[7] : 0;
         const u32 level = flags & 1 ? view[4] : 0;
         const u32 layer = flags & 2 ? u32{view[0]} | (u32{view[1]} << 8) : 0;
@@ -709,7 +1492,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
             return std::nullopt;
         }
         CopyRegion region{};
-        std::memcpy(&region, op.payload.data() + 32 + index * sizeof(region), sizeof(region));
+        std::memcpy(&region, op.Payload().data() + 32 + index * sizeof(region), sizeof(region));
         const u32 width = std::max(1U, d.width >> level);
         const u32 height = std::max(1U, d.height >> level);
         const bool volume = d.target == 2;
@@ -731,14 +1514,14 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
     }
     const auto& from = source_view->region;
     const auto& to = dest_view->region;
-    auto* source = FindImage(op.textures[0], true);
+    auto* source = FindImage(op.Textures()[0], true);
     if (!source || (source->aspects != VK_IMAGE_ASPECT_COLOR_BIT &&
                     source->aspects != VK_IMAGE_ASPECT_DEPTH_BIT) ||
-        !PrepareSampledImage(*source, op.textures[0], submission)) {
+        !PrepareSampledImage(*source, op.Textures()[0], submission)) {
         reject("copy source unavailable");
         return;
     }
-    auto* dest = FindImage(op.textures[1], true);
+    auto* dest = FindImage(op.Textures()[1], true);
     if (!dest || dest == source ||
         (dest->aspects != VK_IMAGE_ASPECT_COLOR_BIT && dest->aspects != VK_IMAGE_ASPECT_DEPTH_BIT)) {
         reject("copy destination unsupported");
@@ -757,8 +1540,8 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
     };
     const auto prepare_dest = [&] {
         if (dest->aspects == VK_IMAGE_ASPECT_COLOR_BIT && !dest->gpu_written &&
-            submission.texture_snapshots.contains(op.textures[1].serial)) {
-            if (!PrepareSampledImage(*dest, op.textures[1], submission)) {
+            submission.texture_snapshots.contains(op.Textures()[1].serial)) {
+            if (!PrepareSampledImage(*dest, op.Textures()[1], submission)) {
                 return false;
             }
         }
@@ -793,7 +1576,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
                 .imageOffset = offset(*dest_view, slice),
                 .imageExtent = {to.width, to.height, 1},
             };
-            scheduler.Record([src = *source->image, dst = *dest->image, buffer = *scratch,
+            Record([src = *source->image, dst = *dest->image, buffer = *scratch,
                               read, write](vk::CommandBuffer cmdbuf) {
                 const VkMemoryBarrier transfer{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -811,7 +1594,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
         uploads.push_back(std::move(scratch));
         dest->gpu_written = true;
         ++dest->write_version;
-        TraceImage("depth copy", op.textures[1], source_address);
+        TraceImage("depth copy", op.Textures()[1], source_address);
         ++copies;
         return;
     }
@@ -840,8 +1623,8 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
             return;
         }
     } else {
-        for (size_t index = 0; index < op.textures.size(); ++index) {
-            const auto& texture = op.textures[index];
+        for (size_t index = 0; index < op.Textures().size(); ++index) {
+            const auto& texture = op.Textures()[index];
             const auto& view = index == 0 ? *source_view : *dest_view;
             const auto& region = view.region;
             const u32 width = std::max(1U, texture.description.width >> view.level);
@@ -860,7 +1643,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
     }
     dest->gpu_written = true;
     ++dest->write_version;
-    TraceImage("copy", op.textures[1], source_address);
+    TraceImage("copy", op.Textures()[1], source_address);
     for (u32 slice = 0; slice < to.depth; ++slice) {
         const u32 source_slice = flip_z ? from.depth - 1 - slice : slice;
         const auto source_offset = offset(*source_view, source_slice);
@@ -878,7 +1661,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
             };
             if (flip_x) std::swap(region.srcOffsets[0].x, region.srcOffsets[1].x);
             if (flip_y) std::swap(region.srcOffsets[0].y, region.srcOffsets[1].y);
-            scheduler.Record([src = *source->image, dst = *dest->image, region, filter](
+            Record([src = *source->image, dst = *dest->image, region, filter](
                                  vk::CommandBuffer cmdbuf) {
                 cmdbuf.BlitImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL,
                                  {region}, filter);
@@ -891,7 +1674,7 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
                 .dstOffset = dest_offset,
                 .extent = {from.width, from.height, 1},
             };
-            scheduler.Record([src = *source->image, dst = *dest->image, copy](vk::CommandBuffer cmdbuf) {
+            Record([src = *source->image, dst = *dest->image, copy](vk::CommandBuffer cmdbuf) {
                 cmdbuf.CopyImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, {copy});
             });
         }
@@ -900,14 +1683,14 @@ void BananzaNvn2Replay::CopyTexture(const Operation& op, const Submission& submi
 }
 
 void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submission& submission) {
-    if (op.args.size() != 3 || op.args[1] & ~2ULL || op.textures.size() != 1 ||
-        op.payload.size() != 16 + sizeof(CopyRegion)) {
+    if (op.args.size() != 3 || op.args[1] & ~2ULL || op.Textures().size() != 1 ||
+        op.Payload().size() != 16 + sizeof(CopyRegion)) {
         return;
     }
-    const auto& texture = op.textures[0];
+    const auto& texture = op.Textures()[0];
     const auto& desc = texture.description;
     const auto block = Core::BananzaNvn2Hle::GetTextureFormatBlock(desc.format);
-    const auto view = std::span{op.payload}.first(16);
+    const auto view = std::span{op.Payload()}.first(16);
     const u8 flags = op.args[2] ? view[7] : 0;
     const u32 level = flags & 1 ? view[4] : 0;
     const u32 base_layer = flags & 2 ? u32{view[0]} | (u32{view[1]} << 8) : 0;
@@ -916,7 +1699,7 @@ void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submissio
         return;
     }
     CopyRegion region{};
-    std::memcpy(&region, op.payload.data() + 16, sizeof(region));
+    std::memcpy(&region, op.Payload().data() + 16, sizeof(region));
     const VkExtent2D extent{std::max(1U, desc.width >> level), std::max(1U, desc.height >> level)};
     const bool volume = desc.target == 2;
     const u32 available = volume ? std::max(1U, desc.depth >> level)
@@ -937,9 +1720,9 @@ void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submissio
     if (stride < row_bytes || stride > (8ULL << 20) / (rows * region.depth)) {
         return;
     }
-    const auto data = submission.buffer_snapshots.find(
+    const auto data = submission.BufferSnapshot(
         {op.args[0], stride * (rows * region.depth - 1) + row_bytes});
-    if (data == submission.buffer_snapshots.end()) {
+    if (data.empty()) {
         TraceImage("buffer copy source unavailable", texture, op.args[0]);
         return;
     }
@@ -956,7 +1739,7 @@ void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submissio
         auto output = astc ? std::span{compressed} : layer;
         for (u64 row = 0; row < rows; ++row) {
             std::memcpy(output.data() + row * row_bytes,
-                        data->second.data() + (z * rows + row) * stride, row_bytes);
+                        data.data() + (z * rows + row) * stride, row_bytes);
         }
         if (astc) {
             Tegra::Texture::ASTC::Decompress(compressed, region.width, region.height, 1,
@@ -973,7 +1756,7 @@ void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submissio
                         volume ? static_cast<s32>(region.z) : 0},
         .imageExtent = {region.width, region.height, volume ? region.depth : 1U},
     };
-    scheduler.Record([buffer = *upload, target = *image->image, copy](vk::CommandBuffer cmdbuf) {
+    Record([buffer = *upload, target = *image->image, copy](vk::CommandBuffer cmdbuf) {
         cmdbuf.CopyBufferToImage(buffer, target, VK_IMAGE_LAYOUT_GENERAL, {copy});
     });
     uploads.push_back(std::move(upload));
@@ -983,7 +1766,8 @@ void BananzaNvn2Replay::CopyBufferToTexture(const Operation& op, const Submissio
     ++copies;
 }
 
-VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage) {
+VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage,
+                                  std::optional<u64> patch_address) {
     if (bytes.empty()) {
         return VK_NULL_HANDLE;
     }
@@ -998,38 +1782,281 @@ VkBuffer BananzaNvn2Replay::Upload(std::span<const u8> bytes, VkBufferUsageFlags
         },
         MemoryUsage::Upload);
     std::memcpy(buffer.Mapped().data(), bytes.data(), bytes.size());
+    if (patch_address) {
+        ApplyBufferUpdates(*patch_address, buffer.Mapped().first(bytes.size()));
+    }
     buffer.Flush();
     const VkBuffer handle = *buffer;
     uploads.push_back(std::move(buffer));
     return handle;
 }
 
-VkBuffer BananzaNvn2Replay::UploadRange(const Submission& submission, Range range) {
-    if (const auto storage = storage_uploads.find(range); storage != storage_uploads.end()) {
-        return *storage->second.buffer;
+BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadStream(std::span<const u8> bytes,
+                                                            std::optional<u64> patch_address) {
+    constexpr u64 ChunkSize = 32ULL << 20;
+    if (bytes.empty()) {
+        return {};
     }
+    if (bytes.size() > ChunkSize / 4) {
+        return {Upload(bytes, 0, patch_address), 0};
+    }
+    while (true) {
+        auto& chunk = active_chunks.empty() ? NextUploadChunk() : upload_chunks[active_chunks.back()];
+        // An early submit can leave earlier slices of this chunk in use on the GPU.
+        const u64 alignment = chunk.buffer.IsHostCoherent()
+                                  ? upload_alignment
+                                  : std::max(upload_alignment, device_limits.nonCoherentAtomSize);
+        const u64 offset = Common::AlignUp(chunk.used, alignment);
+        if (offset + bytes.size() <= ChunkSize) {
+            auto mapped = chunk.buffer.Mapped().subspan(offset, bytes.size());
+            std::memcpy(mapped.data(), bytes.data(), bytes.size());
+            if (patch_address) {
+                ApplyBufferUpdates(*patch_address, mapped);
+            }
+            chunk.buffer.Flush(offset, bytes.size());
+            chunk.used = offset + bytes.size();
+            stream_bytes += bytes.size();
+            ++stream_uploads;
+            return {*chunk.buffer, offset};
+        }
+        NextUploadChunk();
+    }
+}
+
+BananzaNvn2Replay::UploadChunk& BananzaNvn2Replay::NextUploadChunk() {
+    constexpr u64 ChunkSize = 32ULL << 20;
+    for (size_t i = 0; i < upload_chunks.size(); ++i) {
+        auto& chunk = upload_chunks[i];
+        if (!chunk.active && scheduler.IsFree(chunk.tick)) {
+            chunk.active = true;
+            chunk.used = 0;
+            active_chunks.push_back(i);
+            return chunk;
+        }
+    }
+    upload_chunks.push_back({allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = ChunkSize,
+            .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        },
+        MemoryUsage::Stream)});
+    upload_chunks.back().active = true;
+    active_chunks.push_back(upload_chunks.size() - 1);
+    return upload_chunks.back();
+}
+
+void BananzaNvn2Replay::ReclaimBusyResources() {
+    constexpr size_t MaxFreeDescriptorPools = 12;
+    auto& retirement = Core::BananzaNvn2Commands::GetRetirement();
+    std::erase_if(busy_resources, [&](BusyResources& busy) {
+        if (!scheduler.IsFree(busy.tick) || !retirement.IsRetired(busy.sequence)) {
+            return false;
+        }
+        for (auto& buffer : busy.query_results) {
+            free_query_results.push_back(std::move(buffer));
+        }
+        for (auto& [capacity, buffer] : busy.storage) {
+            if (capacity <= MaxFreeStorageBytes - free_storage_bytes) {
+                free_storage_buffers[capacity].push_back(std::move(buffer));
+                free_storage_bytes += capacity;
+            }
+        }
+        for (auto& [capacity, buffer] : busy.device_storage) {
+            if (capacity <= MaxFreeDeviceBytes - free_device_bytes) {
+                free_device_storage[capacity].push_back(std::move(buffer));
+                free_device_bytes += capacity;
+            }
+        }
+        for (auto& [reusable, pool] : busy.pools) {
+            if (reusable && free_descriptor_pools.size() < MaxFreeDescriptorPools) {
+                pool.Reset();
+                free_descriptor_pools.push_back(std::move(pool));
+            }
+        }
+        for (auto& block : busy.pushed) {
+            if (free_push_blocks.size() < 16) {
+                free_push_blocks.push_back(std::move(block));
+            }
+        }
+        return true;
+    });
+}
+
+VkDescriptorSet BananzaNvn2Replay::AllocateSet(VkDescriptorSetLayout layout, size_t uniforms,
+                                               size_t storage, size_t textures, size_t images) {
+    constexpr u32 Sets = 1024;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const bool fits = !descriptor_chunks.empty() && descriptor_chunks.back().sets &&
+                          descriptor_chunks.back().uniforms >= uniforms &&
+                          descriptor_chunks.back().storage >= storage &&
+                          descriptor_chunks.back().textures >= textures &&
+                          descriptor_chunks.back().images >= images;
+        if (!fits || attempt) {
+            auto& counts = descriptor_chunks.emplace_back();
+            counts.sets = Sets;
+            counts.uniforms = static_cast<u32>(std::max<size_t>(Sets * 8, uniforms));
+            counts.storage = static_cast<u32>(std::max<size_t>(Sets * 4, storage));
+            counts.textures = static_cast<u32>(std::max<size_t>(Sets * 16, textures));
+            counts.images = static_cast<u32>(std::max<size_t>(Sets, images));
+            counts.reusable = counts.uniforms == Sets * 8 && counts.storage == Sets * 4 &&
+                              counts.textures == Sets * 16 && counts.images == Sets;
+            if (counts.reusable && !free_descriptor_pools.empty()) {
+                counts.pool = std::move(free_descriptor_pools.back());
+                free_descriptor_pools.pop_back();
+            } else {
+                const std::array sizes{
+                    VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, counts.uniforms},
+                    VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, counts.storage},
+                    VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, counts.textures},
+                    VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, counts.images},
+                };
+                counts.pool = device.GetLogical().CreateDescriptorPool({
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                    .maxSets = Sets,
+                    .poolSizeCount = static_cast<u32>(sizes.size()),
+                    .pPoolSizes = sizes.data(),
+                });
+            }
+        }
+        auto& chunk = descriptor_chunks.back();
+        const VkDescriptorSet set = chunk.pool.AllocateOne(layout);
+        if (!set) {
+            continue;
+        }
+        --chunk.sets;
+        chunk.uniforms -= static_cast<u32>(uniforms);
+        chunk.storage -= static_cast<u32>(storage);
+        chunk.textures -= static_cast<u32>(textures);
+        chunk.images -= static_cast<u32>(images);
+        return set;
+    }
+    return VK_NULL_HANDLE;
+}
+
+BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadRange(const Submission& submission,
+                                                            Range range) {
+    // A storage upload made for a range takes that range out of uploaded_ranges.
     if (const auto cached = uploaded_ranges.find(range); cached != uploaded_ranges.end()) {
         return cached->second;
     }
-    const auto bytes = submission.buffer_snapshots.find(range);
-    if (bytes == submission.buffer_snapshots.end()) {
-        return VK_NULL_HANDLE;
-    }
-    std::vector<u8> updated;
-    for (const auto& write : buffer_updates) {
-        const auto begin = std::max(range.first, write.address);
-        const auto end = std::min(range.first + range.second, write.address + write.bytes.size());
-        if (begin >= end) {
-            continue;
+    static const bool fixed_cache_on = std::getenv("EDEN_NX2_NVN_NO_FIXED_CACHE") == nullptr;
+    const auto* const snapshot = submission.FindSnapshot(range);
+    // A range the GPU never writes is not a storage upload: no need to look for one.
+    if (!(fixed_cache_on && snapshot && snapshot->fixed_pool)) {
+        if (const auto storage = storage_upload_of.find(range);
+            storage != storage_upload_of.end()) {
+            return {storage->second->buffer, storage->second->base};
         }
-        if (updated.empty()) {
-            updated = bytes->second;
-        }
-        std::memcpy(updated.data() + (begin - range.first),
-                    write.bytes.data() + (begin - write.address), end - begin);
     }
-    const auto buffer = Upload(updated.empty() ? bytes->second : updated);
+    if (!snapshot || !range.second) {
+        return {};
+    }
+    submission.WaitLate(*snapshot);
+    const std::span<const u8> bytes{snapshot->data, range.second};
+    const bool patched = HasBufferUpdates(range);
+    if (fixed_cache_on && !patched) {
+        if (const auto& entry = *snapshot; entry.fixed_pool) {
+            if (const auto buffer = FixedUpload(bytes, entry.fixed_pool, entry.fixed_stamp);
+                buffer.first) {
+                uploaded_ranges.emplace(range, buffer);
+                return buffer;
+            }
+        }
+    }
+    const auto buffer = UploadStream(bytes, patched ? std::optional{range.first} : std::nullopt);
     uploaded_ranges.emplace(range, buffer);
+    return buffer;
+}
+
+BananzaNvn2Replay::BufferRef BananzaNvn2Replay::FixedUpload(std::span<const u8> bytes, u64 pool,
+                                                           u64 stamp) {
+    constexpr u64 ChunkSize = 32ULL << 20;
+    constexpr u64 MaxChunks = 24;
+    static const bool host_chunks = std::getenv("EDEN_NX2_NVN_FIXED_HOST") != nullptr;
+    if (bytes.size() > ChunkSize / 4) {
+        return {};
+    }
+    const Range key{reinterpret_cast<u64>(bytes.data()), bytes.size()};
+    const auto found = fixed_cache.find(key);
+    if (found != fixed_cache.end() && found->second.pool == pool && found->second.stamp == stamp) {
+        // Now and then compare a kept range with guest memory: a change without a flush would
+        // mean the game does not follow the pool's flush rule.
+        bool same = true;
+        if ((key.first / 64 + replayed_submissions) % 256 == 0 && fixed_check_budget >= bytes.size()) {
+            fixed_check_budget -= bytes.size();
+            ++fixed_checks;
+            same = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size()) ==
+                   found->second.hash;
+            if (!same && ++fixed_mismatches <= 16) {
+                LOG_WARNING(Render_Vulkan,
+                            "NVN 2 kept range of {} bytes changed without a flush (pool serial {}, "
+                            "stamp {})",
+                            bytes.size(), pool, stamp);
+            }
+        }
+        if (same) {
+            ++fixed_hits;
+            return found->second.buffer;
+        }
+    }
+    if (fixed_chunks.empty() ||
+        Common::AlignUp(fixed_chunks.back().used,
+                        std::max(upload_alignment, device_limits.nonCoherentAtomSize)) +
+                bytes.size() > ChunkSize) {
+        if (fixed_chunks.size() >= MaxChunks) {
+            // Start over; the old chunks live until this submission's work is done.
+            for (auto& chunk : fixed_chunks) {
+                uploads.push_back(std::move(chunk.buffer));
+            }
+            fixed_chunks.clear();
+            fixed_cache.clear();
+        }
+        fixed_chunks.push_back({allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = ChunkSize,
+                .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            host_chunks ? MemoryUsage::Upload : MemoryUsage::DeviceLocal)});
+    }
+    auto& chunk = fixed_chunks.back();
+    const u64 alignment = std::max(upload_alignment, device_limits.nonCoherentAtomSize);
+    const u64 offset = Common::AlignUp(chunk.used, alignment);
+    if (offset + bytes.size() > ChunkSize) {
+        return {};
+    }
+    if (host_chunks) {
+        auto mapped = chunk.buffer.Mapped().subspan(offset, bytes.size());
+        std::memcpy(mapped.data(), bytes.data(), bytes.size());
+        chunk.buffer.Flush(offset, bytes.size());
+    } else {
+        // The chunk is device memory: the bytes go through the upload stream once.
+        const auto staging = UploadStream(bytes);
+        if (!staging.first) {
+            return {};
+        }
+        Record([source = staging.first, source_offset = staging.second, target = *chunk.buffer,
+                offset, size = bytes.size()](vk::CommandBuffer cmdbuf) {
+            const VkBufferCopy copy{source_offset, offset, size};
+            cmdbuf.CopyBuffer(source, target, copy);
+        });
+        Barrier();
+    }
+    chunk.used = offset + bytes.size();
+    ++fixed_uploads;
+    fixed_upload_bytes += bytes.size();
+    const BufferRef buffer{*chunk.buffer, offset};
+    fixed_cache.insert_or_assign(
+        key, FixedEntry{buffer, pool, stamp,
+                        Common::CityHash64(reinterpret_cast<const char*>(bytes.data()),
+                                           bytes.size())});
     return buffer;
 }
 
@@ -1041,27 +2068,65 @@ BananzaNvn2Replay::FindStorageRange(Range range) {
         const auto& [start, size] = entry->first;
         const u64 offset = range.first - start;
         if (offset < size && range.second <= size - offset) {
+            NoteStorageRead(entry->second, offset, range.second);
             return entry;
         }
     }
     return storage_uploads.end();
 }
 
+void BananzaNvn2Replay::NoteStorageRead(const StorageUpload& upload, u64 offset, u64 size) {
+    if (upload.written_barrier == barrier_serial) {
+        const auto next = upload.fresh.upper_bound(offset);
+        storage_fresh |= (next != upload.fresh.begin() && std::prev(next)->second > offset) ||
+                         (next != upload.fresh.end() && next->first < offset + size);
+    }
+}
+
+BananzaNvn2Replay::StorageSpan* BananzaNvn2Replay::BoundSpan(Range range) {
+    if (!storage_spans_disjoint) {
+        return nullptr;
+    }
+    const auto found = storage_span_of.find(range);
+    return found != storage_span_of.end() ? found->second : nullptr;
+}
+
 std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& submission,
                                                             Range range) {
+    // A range the GPU never writes is in no storage upload: UploadRange has it in VRAM.
+    static const bool fixed_cache_on = std::getenv("EDEN_NX2_NVN_NO_FIXED_CACHE") == nullptr;
+    if (fixed_cache_on) {
+        if (const auto* const snapshot = submission.FindSnapshot(range);
+            snapshot && snapshot->fixed_pool) {
+            return UploadRange(submission, range);
+        }
+    }
+    if (const auto* span = BoundSpan(range)) {
+        // No other span holds these bytes: its buffer, or a new one.
+        if (span->upload) {
+            const u64 offset = range.first - span->range.first;
+            NoteStorageRead(*span->upload, offset, range.second);
+            return {span->upload->buffer, span->upload->base + offset};
+        }
+        if (const auto [upload, offset] = CreateStorageUpload(submission, range); upload) {
+            return {upload->buffer, upload->base + offset};
+        }
+        return UploadRange(submission, range);
+    }
     if (const auto storage = FindStorageRange(range); storage != storage_uploads.end()) {
-        return {*storage->second.buffer, range.first - storage->first.first};
+        return {storage->second.buffer,
+                storage->second.base + range.first - storage->first.first};
     }
-    if (const auto [upload, offset] = WritableStorage(submission, range); upload) {
-        return {*upload->buffer, offset};
+    if (const auto [upload, offset] = CreateStorageUpload(submission, range); upload) {
+        return {upload->buffer, upload->base + offset};
     }
-    return {UploadRange(submission, range), 0};
+    return UploadRange(submission, range);
 }
 
 void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
     storage_spans.clear();
     const u64 alignment =
-        device.GetPhysical().GetProperties().limits.minStorageBufferOffsetAlignment;
+        device_limits.minStorageBufferOffsetAlignment;
     StorageSpan* span{};
     for (const auto& [range, guest] : submission.storage_addresses) {
         const auto [address, size] = range;
@@ -1075,61 +2140,199 @@ void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
         span->range.second = std::max(span->range.second, address - span->range.first + size);
         span->snapshots.push_back(range);
     }
+    static const bool use_maps = std::getenv("EDEN_NX2_NVN_STORAGE_MAPS") != nullptr;
+    storage_span_of.clear();
+    storage_spans_disjoint = !use_maps;
+    storage_guest_disjoint = !use_maps;
+    if (use_maps) {
+        return;
+    }
+    std::vector<Range> guest_ranges;
+    guest_ranges.reserve(storage_spans.size());
+    u64 end{};
+    for (auto& [key, entry] : storage_spans) {
+        storage_spans_disjoint &= entry.range.first >= end;
+        end = std::max(end, entry.range.first + entry.range.second);
+        guest_ranges.emplace_back(entry.guest_address, entry.guest_address + entry.range.second);
+        for (const auto& snapshot : entry.snapshots) {
+            storage_span_of.emplace(snapshot, &entry);
+        }
+    }
+    std::ranges::sort(guest_ranges);
+    for (size_t i = 1; i < guest_ranges.size(); ++i) {
+        storage_guest_disjoint &= guest_ranges[i].first >= guest_ranges[i - 1].second;
+    }
+}
+
+void BananzaNvn2Replay::AddBufferUpdate(u64 address, std::span<const u8> bytes) {
+    while (!bytes.empty()) {
+        const u64 page = Common::AlignDown(address, BufferUpdatePageSize);
+        const size_t size = std::min<u64>(bytes.size(), BufferUpdatePageSize - (address - page));
+        buffer_updates[page].push_back({address, bytes.first(size)});
+        bytes = bytes.subspan(size);
+        address += size;
+    }
+}
+
+bool BananzaNvn2Replay::HasBufferUpdates(Range range) const {
+    const auto page = buffer_updates.lower_bound(Common::AlignDown(range.first, BufferUpdatePageSize));
+    return page != buffer_updates.end() && page->first < range.first + range.second;
+}
+
+void BananzaNvn2Replay::ApplyBufferUpdates(u64 address, std::span<u8> bytes) const {
+    const u64 range_end = address + bytes.size();
+    for (auto page = buffer_updates.lower_bound(Common::AlignDown(address, BufferUpdatePageSize));
+         page != buffer_updates.end() && page->first < range_end; ++page) {
+        for (const auto& write : page->second) {
+            const auto begin = std::max(address, write.address);
+            const auto end = std::min(range_end, write.address + write.bytes.size());
+            if (begin < end) {
+                std::memcpy(bytes.data() + (begin - address),
+                            write.bytes.data() + (begin - write.address), end - begin);
+            }
+        }
+    }
 }
 
 std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::WritableStorage(
     const Submission& submission, Range range) {
+    const auto align = device_limits.minStorageBufferOffsetAlignment;
+    if (const auto* span = BoundSpan(range)) {
+        if (!span->upload) {
+            return CreateStorageUpload(submission, range);
+        }
+        const u64 offset = range.first - span->range.first;
+        NoteStorageRead(*span->upload, offset, range.second);
+        return offset % align == 0 ? std::pair{span->upload, offset}
+                                   : std::pair<StorageUpload*, u64>{};
+    }
     if (const auto found = FindStorageRange(range); found != storage_uploads.end()) {
         const u64 offset = range.first - found->first.first;
-        const auto align = device.GetPhysical().GetProperties().limits.minStorageBufferOffsetAlignment;
         return offset % align == 0 ? std::pair{&found->second, offset}
                                    : std::pair<StorageUpload*, u64>{};
     }
-    if (!submission.storage_addresses.contains(range)) {
-        return {};
+    return CreateStorageUpload(submission, range);
+}
+
+std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStorageUpload(
+    const Submission& submission, Range range) {
+    StorageSpan* bound{};
+    if (storage_spans_disjoint) {
+        const auto found = storage_span_of.find(range);
+        if (found == storage_span_of.end()) {
+            return {};
+        }
+        bound = found->second;
+    } else {
+        if (!submission.storage_addresses.contains(range)) {
+            return {};
+        }
+        auto entry = storage_spans.upper_bound({range.first, std::numeric_limits<u64>::max()});
+        if (entry == storage_spans.begin()) {
+            return {};
+        }
+        bound = &std::prev(entry)->second;
     }
-    auto entry = storage_spans.upper_bound({range.first, std::numeric_limits<u64>::max()});
-    if (entry == storage_spans.begin()) {
-        return {};
-    }
-    const auto& span = std::prev(entry)->second;
+    auto& span = *bound;
     const u64 offset = range.first - span.range.first;
     if (offset >= span.range.second || range.second > span.range.second - offset ||
-        !std::ranges::binary_search(span.snapshots, range)) {
+        (!storage_spans_disjoint && !std::ranges::binary_search(span.snapshots, range))) {
         return {};
     }
     const u64 end = span.guest_address + span.range.second;
-    for (const auto& [other_range, upload] : storage_uploads) {
-        if (upload.guest_address < end && span.guest_address < upload.guest_address + other_range.second) {
+    // Two spans over the same guest bytes get one buffer: the first one made.
+    auto next = storage_guest_ends.end();
+    if (!storage_guest_disjoint) {
+        next = storage_guest_ends.lower_bound(span.guest_address);
+        if ((next != storage_guest_ends.end() && next->first < end) ||
+            (next != storage_guest_ends.begin() &&
+             std::prev(next)->second > span.guest_address)) {
             return {};
         }
     }
-    auto buffer = allocator.CreateBuffer({
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = span.range.second,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    }, MemoryUsage::Download);
-    auto mapped = buffer.Mapped();
-    for (const auto& snapshot : span.snapshots) {
-        const auto& bytes = submission.buffer_snapshots.at(snapshot);
-        std::ranges::copy(bytes, mapped.begin() + (snapshot.first - span.range.first));
+    static const bool per_span = std::getenv("EDEN_NX2_NVN_STORAGE_PER_SPAN") != nullptr;
+    const u64 aligned = Common::AlignUp(span.range.second, upload_alignment);
+    if (per_span || storage_arenas.empty() ||
+        storage_arenas.back().capacity - storage_arenas.back().used < aligned) {
+        const u64 capacity = per_span ? std::bit_ceil(aligned)
+                                      : std::max(StorageArenaBytes, std::bit_ceil(aligned));
+        auto& free = free_storage_buffers[capacity];
+        vk::Buffer buffer;
+        if (free.empty()) {
+            buffer = allocator.CreateBuffer({
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = capacity,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            }, MemoryUsage::Download);
+            ++storage_creates;
+        } else {
+            buffer = std::move(free.back());
+            free.pop_back();
+            free_storage_bytes -= capacity;
+            ++storage_reuses;
+        }
+        storage_arenas.push_back({std::move(buffer), capacity});
     }
-    for (const auto& write : buffer_updates) {
-        const auto begin = std::max(span.range.first, write.address);
-        const auto limit = std::min(span.range.first + span.range.second,
-                                    write.address + write.bytes.size());
-        if (begin < limit) {
-            std::memcpy(mapped.data() + begin - span.range.first,
-                        write.bytes.data() + begin - write.address,
-                        limit - begin);
+    auto& arena = storage_arenas.back();
+    const u64 base = arena.used;
+    arena.used += aligned;
+    storage_bytes += span.range.second;
+    const std::span<u8> host = arena.buffer.Mapped().subspan(base, span.range.second);
+    std::span<u8> mapped = host;
+    VkBuffer bound_buffer = *arena.buffer;
+    u64 bound_base = base;
+    static const bool device_storage = std::getenv("EDEN_NX2_NVN_NO_DEVICE_STORAGE") == nullptr;
+    const bool in_device = device_storage && storage_for_fragment;
+    if (in_device) {
+        // A fragment shader touches the span for every pixel: keep it next to the GPU.
+        u8* device_mapped{};
+        std::tie(bound_buffer, bound_base) = AllocateDeviceStorage(aligned, device_mapped);
+        mapped = {device_mapped, span.range.second};
+        ++device_spans;
+        device_span_bytes += span.range.second;
+    }
+    static const bool serial_copies = std::getenv("EDEN_NX2_NVN_SERIAL_COPIES") != nullptr;
+    const bool fill_later = !serial_copies && !HasBufferUpdates(span.range);
+    for (const auto& snapshot : span.snapshots) {
+        // A fill that runs later waits for the bytes itself (DispatchCopies, WaitCopies).
+        const auto bytes = submission.BufferSnapshot(snapshot, !fill_later);
+        u8* const dest = mapped.data() + (snapshot.first - span.range.first);
+        if (fill_later) {
+            copy_jobs.push_back({dest, bytes.data(), bytes.size()});
+            copy_job_bytes += bytes.size();
+        } else {
+            std::memcpy(dest, bytes.data(), bytes.size());
         }
     }
-    buffer.Flush();
+    if (!fill_later) {
+        ApplyBufferUpdates(span.range.first, mapped);
+    }
     const auto upload = storage_uploads.emplace(
-        span.range, StorageUpload{std::move(buffer), span.guest_address});
+        span.range, StorageUpload{bound_buffer, bound_base, mapped.data(), span.guest_address,
+                                  host.data(), in_device ? *arena.buffer : VkBuffer{}, base,
+                                  span.range.second});
+    if (in_device) {
+        device_uploads.push_back(&upload.first->second);
+    }
+    if (fill_later && copy_job_bytes >= (512ULL << 10)) {
+        DispatchCopies();
+    }
+    // An exact range match now resolves to the writable allocation.
+    for (size_t stream = 0; stream < vertex_uploads.size(); ++stream) {
+        if (vertex_buffers[stream] == span.range) {
+            vertex_uploads[stream] = {};
+        }
+    }
+    if (!storage_guest_disjoint) {
+        storage_guest_ends.emplace_hint(next, span.guest_address, end);
+    }
+    span.upload = &upload.first->second;
+    storage_upload_of.insert_or_assign(span.range, span.upload);
+    uploaded_ranges.erase(span.range);
+    ForgetUploads(span.range.first, span.range.first + span.range.second);
     return {&upload.first->second, offset};
 }
 
@@ -1137,13 +2340,24 @@ void BananzaNvn2Replay::WriteBackStorage(const Submission& submission) {
     if (!submission.guest_memory) {
         return;
     }
+    for (const auto& arena : storage_arenas) {
+        arena.buffer.Invalidate();
+    }
     for (auto& [range, upload] : storage_uploads) {
-        if (upload.written_bytes) {
-            upload.buffer.Invalidate();
-            submission.guest_memory->WriteBlockUnsafe(upload.guest_address,
-                                                       upload.buffer.Mapped().data(),
-                                                       upload.written_bytes);
+        if (!upload.dirty) {
+            continue;
         }
+        upload.dirty = false;
+        // Spans are keyed by their first snapshot, which starts where the upload starts.
+        const auto span = storage_spans.lower_bound({range.first, 0});
+        const bool found = span != storage_spans.end() && span->first.first == range.first;
+        const auto [written, compared] = WriteChangedBytes(
+            *submission.guest_memory, upload.guest_address, range.first,
+            std::span<const u8>{upload.readback, upload.written_bytes},
+            found ? std::span<const Range>{span->second.snapshots} : std::span<const Range>{},
+            submission);
+        writeback_bytes.fetch_add(written, std::memory_order_relaxed);
+        writeback_compared.fetch_add(compared, std::memory_order_relaxed);
     }
 }
 
@@ -1235,7 +2449,7 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
     upload.Flush();
     Initialize(image);
     Barrier();
-    scheduler.Record([buffer = *upload, target = *image.image, copies = std::move(copies)](
+    Record([buffer = *upload, target = *image.image, copies = std::move(copies)](
                          vk::CommandBuffer cmdbuf) {
         cmdbuf.CopyBufferToImage(buffer, target, VK_IMAGE_LAYOUT_GENERAL, copies);
     });
@@ -1249,7 +2463,7 @@ VkImage BananzaNvn2Replay::PrepareDepthComparisonImage(const Image& source, VkFo
     if (found != depth_comparison_images.end() && found->second.write_version == source.write_version) {
         return *found->second.image;
     }
-    const auto features = device.GetPhysical().GetFormatProperties3(depth_format).optimalTilingFeatures;
+    const auto features = FormatFeatures(depth_format);
     constexpr auto required = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT |
                               VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
     if ((features & required) != required ||
@@ -1314,7 +2528,7 @@ VkImage BananzaNvn2Replay::PrepareDepthComparisonImage(const Image& source, VkFo
     const auto target = *depth.image;
     Barrier();
     // Preserve the texel bits across the color and depth formats, as in DKB Recomp.
-    scheduler.Record([src = *source.image, target, buffer = *scratch,
+    Record([src = *source.image, target, buffer = *scratch,
                       color_regions = std::move(color_regions),
                       depth_regions = std::move(depth_regions),
                       created, levels = source.levels, layers = source.layers](
@@ -1385,7 +2599,7 @@ VkDescriptorImageInfo BananzaNvn2Replay::BindUnboundTexture(VkImageViewType type
             });
         }
         scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([handle = *image, subresource](vk::CommandBuffer cmdbuf) {
+        Record([handle = *image, subresource](vk::CommandBuffer cmdbuf) {
             const VkImageMemoryBarrier barrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1439,14 +2653,13 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         std::memcpy(&word, staged->code.data() + staged->constant_offset + offset, 4);
         handle = word;
     } else if (binding.cbuf_index >= 3 && binding.cbuf_index - 3 < uniform_buffers[stage].size()) {
-        const auto found = submission.buffer_snapshots.find(uniform_buffers[stage][binding.cbuf_index - 3]);
-        if (found == submission.buffer_snapshots.end() || offset > found->second.size() ||
-            found->second.size() - offset < 4) {
+        const auto bytes = submission.BufferSnapshot(uniform_buffers[stage][binding.cbuf_index - 3]);
+        if (offset > bytes.size() || bytes.size() - offset < 4) {
             NoteSkip("texture handle buffer range missing at submit");
             return std::nullopt;
         }
         u32_le word;
-        std::memcpy(&word, found->second.data() + offset, 4);
+        std::memcpy(&word, bytes.data() + offset, 4);
         handle = word;
     } else {
         if (trace_images && draw_diagnostics.emplace(bound_program->serial,
@@ -1463,6 +2676,27 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     handle <<= binding.shift_left;
     const u32 texture_id = static_cast<u32>(handle) & 0xfffff;
     const u32 sampler_id = static_cast<u32>(handle >> 20) & 0xfff;
+    const u64 view_kind = u64{static_cast<u32>(binding.type)} * 4 +
+                          u64{binding.is_depth} * 2 + u64{binding.is_integer};
+    const SampledBindingKey binding_key{texture_pool, sampler_pool,
+                                        (view_kind << 32) | static_cast<u32>(handle)};
+    const bool capture_sampled = frame_dump.CapturingSampled();
+    if (!capture_sampled) {
+        if (const auto found = sampled_bindings.find(binding_key); found != sampled_bindings.end()) {
+            const auto& entry = found->second;
+            if (std::ranges::find(destinations, entry.image) == destinations.end()) {
+                entry.image->last_present = present_count;
+                if (entry.image->written_barrier == barrier_serial) {
+                    sampled_fresh = true;
+                    fresh_image = entry.image;
+                }
+                if (PrepareSampledImage(*entry.image, *entry.texture, submission)) {
+                    TraceImage("sampled", *entry.texture, bound_program->serial);
+                    return entry.descriptor;
+                }
+            }
+        }
+    }
     const auto textures = submission.texture_descriptors.find(texture_pool);
     if (textures == submission.texture_descriptors.end()) {
         NoteSkip("missing texture pool snapshot");
@@ -1568,7 +2802,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
             return BindUnboundTexture(VK_IMAGE_VIEW_TYPE_CUBE);
         }
         if (target == 1 && binding.type == Shader::TextureType::ColorArrayCube &&
-            device.GetPhysical().GetFeatures().imageCubeArray) {
+            device_features.imageCubeArray) {
             return BindUnboundTexture(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
         }
     }
@@ -1606,6 +2840,10 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         return std::nullopt;
     }
     const bool color = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    if (image->written_barrier == barrier_serial) {
+        sampled_fresh = true;
+        fresh_image = image;
+    }
     if (!PrepareSampledImage(*image, tex, submission)) {
         TraceImage("missing sampled snapshot", tex, bound_program->serial);
         if (trace_images && draw_diagnostics.emplace(bound_program->serial,
@@ -1621,10 +2859,11 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     }
     TraceImage("sampled", tex, bound_program->serial);
     const auto address = tex.storage.gpu_address + tex.offset;
-    if (frame_dump.CapturingSampled() && (d.width >= 900 || aspect == VK_IMAGE_ASPECT_DEPTH_BIT) &&
+    if (capture_sampled && (d.width >= 900 || aspect == VK_IMAGE_ASPECT_DEPTH_BIT) &&
         !image->volume &&
         (color || aspect == VK_IMAGE_ASPECT_DEPTH_BIT) &&
         captured_inputs.emplace(address, first_level, first_layer).second) {
+        Barrier();
         frame_dump.CaptureNvn2Input(*image->image, image->surface_format,
                                     std::max(1U, d.width >> first_level),
                                     std::max(1U, d.height >> first_level), address,
@@ -1636,8 +2875,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
     VkImage sampled_image = *image->image;
     bool comparison_copy{};
     if (binding.is_depth && color &&
-        !(device.GetPhysical().GetFormatProperties3(vk_format).optimalTilingFeatures &
-          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT)) {
+        !(FormatFeatures(vk_format) & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT)) {
         const VkFormat depth_format = vk_format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT
                                       : vk_format == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM
                                                                         : VK_FORMAT_UNDEFINED;
@@ -1660,8 +2898,9 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
                                   first_layer < attachment.layer + attachment.layers));
     };
     bool feedback{};
+    // Sampling a bound target the draw does not write needs no copy.
     for (size_t i = 0; i < destinations.size(); ++i) {
-        feedback |= overlaps(i);
+        feedback |= overlaps(i) && ((draw_color_writes >> i) & 1);
     }
     auto* views = &image->sampled_views;
     if (feedback && !comparison_copy) {
@@ -1696,7 +2935,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         sampled_image = *copy.image;
         views = &copy.views;
         Barrier();
-        scheduler.Record([source = *image->image, sampled_image, inserted, first_level,
+        Record([source = *image->image, sampled_image, inserted, first_level,
                           levels, first_layer, layers, image_levels = image->levels,
                           image_layers = image->layers, extent = image->extent,
                           depth = image->depth](vk::CommandBuffer cmdbuf) {
@@ -1763,16 +3002,14 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         .sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
         .reductionMode = static_cast<VkSamplerReductionMode>(desc.reduction),
     };
-    const auto physical = device.GetPhysical();
     const bool point_depth = aspect == VK_IMAGE_ASPECT_DEPTH_BIT && !binding.is_depth;
     const bool use_reduction = desc.reduction && !binding.is_depth &&
         device.IsExtSamplerFilterMinmaxSupported() &&
-        (physical.GetFormatProperties(vk_format).optimalTilingFeatures &
-         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT);
+        (FormatFeatures(vk_format) & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT);
     const bool anisotropic = desc.anisotropy > 1.0f && desc.mag_filter == 1 &&
                              (desc.min_filter & 1) && !point_depth && !binding.is_depth &&
-                             !use_reduction && physical.GetFeatures().samplerAnisotropy;
-    const auto& limits = physical.GetProperties().limits;
+                             !use_reduction && device_features.samplerAnisotropy;
+    const auto& limits = device_limits;
     VkBorderColor border = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (std::ranges::find(desc.wrap, 5U) != desc.wrap.end() && desc.border_kind == 0) {
         const auto rgba = std::bit_cast<std::array<float, 4>>(desc.border);
@@ -1782,7 +3019,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
             border = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
         }
     }
-    auto host_sampler = device.GetLogical().CreateSampler({
+    const VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = use_reduction ? &reduction : nullptr,
         .magFilter = !point_depth && desc.mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
@@ -1801,36 +3038,85 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         .minLod = desc.min_filter < 2 ? 0.0f : std::clamp(desc.min_lod, 0.0f, float(levels - 1)),
         .maxLod = desc.min_filter < 2 ? 0.25f : std::clamp(desc.max_lod, 0.0f, float(levels - 1)),
         .borderColor = border,
-    });
-    const VkSampler handle_sampler = *host_sampler;
-    samplers.push_back(std::move(host_sampler));
-    return VkDescriptorImageInfo{handle_sampler, *sampled_view->second, VK_IMAGE_LAYOUT_GENERAL};
+    };
+    // The fields from flags to unnormalizedCoordinates are sixteen 32-bit words.
+    static_assert(offsetof(VkSamplerCreateInfo, unnormalizedCoordinates) -
+                      offsetof(VkSamplerCreateInfo, flags) == 15 * sizeof(u32));
+    std::array<u32, 17> sampler_key{};
+    std::memcpy(sampler_key.data(), &sampler_info.flags, 16 * sizeof(u32));
+    sampler_key[16] = use_reduction ? desc.reduction : 0;
+    auto host_sampler = sampler_cache.find(sampler_key);
+    if (host_sampler == sampler_cache.end()) {
+        host_sampler = sampler_cache.emplace(sampler_key,
+                                             device.GetLogical().CreateSampler(sampler_info)).first;
+    }
+    const VkDescriptorImageInfo descriptor{*host_sampler->second, *sampled_view->second,
+                                            VK_IMAGE_LAYOUT_GENERAL};
+    // Feedback and comparison copies depend on writes within this submission.
+    if (!capture_sampled && !feedback && !comparison_copy) {
+        sampled_bindings.try_emplace(binding_key, SampledBinding{descriptor, image, &tex});
+    }
+    return descriptor;
 }
 
 bool BananzaNvn2Replay::PrepareSampledImage(Image& image, const Texture& texture,
                                            const Submission& submission) {
+    if (image.gpu_written) {
+        if (image.confirmed_replay_submission != submission.sequence) {
+            if (const auto state = submission.texture_replay_states.find(texture.serial);
+                state != submission.texture_replay_states.end()) {
+                state->second->gpu_written.store(true, std::memory_order_relaxed);
+                image.confirmed_replay_submission = submission.sequence;
+            }
+        }
+        return image.initialized;
+    }
     if (image.aspects != VK_IMAGE_ASPECT_COLOR_BIT && image.format != VK_FORMAT_D16_UNORM &&
         image.format != VK_FORMAT_D32_SFLOAT) {
         return image.initialized;
     }
-    if (!image.gpu_written && image.checked_submission != submission.sequence) {
-        const auto data = submission.texture_snapshots.find(texture.serial);
-        if (data != submission.texture_snapshots.end()) {
-            const auto& bytes = data->second;
-            const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()),
-                                                bytes.size());
-            if (!image.initialized || image.cpu_serial != texture.serial || image.cpu_hash != hash) {
-                if (!UploadTexture(image, texture, bytes)) {
+    if (image.checked_submission != submission.sequence) {
+        const auto source = submission.texture_sources.find(texture.serial);
+        if (source != submission.texture_sources.end() &&
+            (!image.initialized || image.cpu_serial != texture.serial ||
+             image.cpu_hash != source->second.hash)) {
+            const auto upload_start = std::chrono::steady_clock::now();
+            const auto data = submission.texture_snapshots.find(texture.serial);
+            std::vector<u8> fetched;
+            std::span<const u8> bytes;
+            if (data != submission.texture_snapshots.end()) {
+                bytes = data->second;
+            } else if (submission.guest_memory) {
+                // The bytes were sent with an earlier submission and the image is gone since.
+                fetched.resize(texture.layout.size);
+                bool read = true;
+                u64 offset{};
+                for (const auto& [guest, size] : source->second.segments) {
+                    read = read && offset + size <= fetched.size() &&
+                           submission.guest_memory->ReadBlockUnsafe(guest, fetched.data() + offset,
+                                                                    size);
+                    offset += size;
+                }
+                if (read && offset == fetched.size()) {
+                    bytes = fetched;
+                    hash_bytes += fetched.size();
+                }
+            }
+            if (!bytes.empty()) {
+                const bool uploaded = UploadTexture(image, texture, bytes);
+                upload_ns += static_cast<u64>(
+                    (std::chrono::steady_clock::now() - upload_start).count());
+                if (!uploaded) {
                     return false;
                 }
-                image.cpu_hash = hash;
+                image.cpu_hash = source->second.hash;
                 image.cpu_serial = texture.serial;
                 ++texture_uploads;
             }
         }
         image.checked_submission = submission.sequence;
     }
-    return image.initialized && (image.gpu_written || image.cpu_serial == texture.serial);
+    return image.initialized && image.cpu_serial == texture.serial;
 }
 
 std::optional<BananzaNvn2Replay::DrawState> BananzaNvn2Replay::DecodeDraw(
@@ -1895,7 +3181,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     const auto* fragment = find_shader(fragment_program, 4);
     const auto* geometry = find_shader(geometry_program, 3);
     if (vertex == shaders.end() || (fragment_program && !fragment) ||
-        (geometry_program && (!geometry || !device.GetPhysical().GetFeatures().geometryShader)) ||
+        (geometry_program && (!geometry || !device_features.geometryShader)) ||
         !device.IsDynamicRenderingSupported()) {
         return std::nullopt;
     }
@@ -2038,7 +3324,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
                    (offset - storage_base) % 16 == 0;
         };
         for (const auto& storage : info.storage_buffers_descriptors) {
-            const auto features = device.GetPhysical().GetFeatures();
+            const auto features = device_features;
             const bool supports_write = stage == 1 ? features.fragmentStoresAndAtomics
                                                     : features.vertexPipelineStoresAndAtomics;
             if ((storage.is_written && !supports_write) ||
@@ -2169,8 +3455,14 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     }
     const auto& logical = device.GetLogical();
     if (!layout_bindings.empty()) {
+        static const bool push_off = std::getenv("EDEN_NX2_NVN_NO_PUSH_DESCRIPTORS") != nullptr;
+        result.push_descriptors = !push_off && device.IsKhrPushDescriptorSupported() &&
+                                  layout_bindings.size() <= device.MaxPushDescriptors();
         result.set_layout = logical.CreateDescriptorSetLayout({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .flags = result.push_descriptors
+                         ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR
+                         : VkDescriptorSetLayoutCreateFlags{},
             .bindingCount = static_cast<u32>(layout_bindings.size()),
             .pBindings = layout_bindings.data(),
         });
@@ -2188,6 +3480,30 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push,
     });
+    if (!layout_bindings.empty()) {
+        std::vector<VkDescriptorUpdateTemplateEntry> entries;
+        entries.reserve(layout_bindings.size());
+        for (const auto& binding : layout_bindings) {
+            entries.push_back({
+                .dstBinding = binding.binding,
+                .descriptorCount = 1,
+                .descriptorType = binding.descriptorType,
+                .offset = binding.binding * sizeof(DescriptorData),
+            });
+        }
+        result.update_template = logical.CreateDescriptorUpdateTemplate({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+            .descriptorUpdateEntryCount = static_cast<u32>(entries.size()),
+            .pDescriptorUpdateEntries = entries.data(),
+            .templateType = result.push_descriptors
+                                ? VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR
+                                : VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+            .descriptorSetLayout = *result.set_layout,
+            .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .pipelineLayout = *result.layout,
+            .set = 0,
+        });
+    }
     const auto make_shader = [&](std::span<const u32> spirv) {
         return logical.CreateShaderModule({
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -2245,12 +3561,12 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         .scissorCount = 1,
     };
     const u32 polygon = (raster.polygon >> 3) & 3;
-    if (polygon > 2 || (polygon < 2 && !device.GetPhysical().GetFeatures().fillModeNonSolid)) {
+    if (polygon > 2 || (polygon < 2 && !device_features.fillModeNonSolid)) {
         NoteSkip("unsupported polygon mode");
         return std::nullopt;
     }
     const bool clockwise = ((raster.polygon & 4) == 0) != raster.origin_lower_left;
-    const auto features = device.GetPhysical().GetFeatures();
+    const auto features = device_features;
     const VkPipelineRasterizationStateCreateInfo rasterization{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
         .depthClampEnable = raster.depth_clamp && features.depthClamp,
@@ -2290,6 +3606,8 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         .back = stencil(static_cast<u32>(ds >> 48)),
         .maxDepthBounds = 1.0f,
     };
+    result.uses_stencil = depth_stencil.stencilTestEnable;
+    result.depth_write = depth_stencil.depthWriteEnable;
     std::array<VkPipelineColorBlendAttachmentState, 8> attachments{};
     constexpr std::array blend_ops{VK_BLEND_OP_MAX_ENUM, VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT,
                                    VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX};
@@ -2297,6 +3615,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         auto& attachment = attachments[slot];
         const u32 shader_mask = fs.info ? fs.info->frag_color_components[slot] : 0;
         attachment.colorWriteMask = ((color_state.channel_mask >> (slot * 4)) & 15) & shader_mask;
+        result.color_writes |= attachment.colorWriteMask ? 1U << slot : 0U;
         attachment.blendEnable = (color_state.control >> (slot + 8)) & 1;
         if (!attachment.blendEnable) {
             continue;
@@ -2322,6 +3641,14 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         }
         attachment.colorBlendOp = blend_ops[rgb_op];
         attachment.alphaBlendOp = blend_ops[alpha_op];
+        const auto uses_constant = [](VkBlendFactor factor) {
+            return factor >= VK_BLEND_FACTOR_CONSTANT_COLOR &&
+                   factor <= VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+        };
+        result.uses_blend_constants |= uses_constant(attachment.srcColorBlendFactor) ||
+                                       uses_constant(attachment.dstColorBlendFactor) ||
+                                       uses_constant(attachment.srcAlphaBlendFactor) ||
+                                       uses_constant(attachment.dstAlphaBlendFactor);
     }
     const u32 logic_op = (color_state.control >> 16) & 255;
     if (logic_op > VK_LOGIC_OP_SET) {
@@ -2368,7 +3695,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         .pDynamicState = &dynamic,
         .layout = *result.layout,
         .basePipelineIndex = -1,
-    });
+    }, device.StaticPipelineCache());
     return result;
 }
 
@@ -2401,58 +3728,64 @@ bool BananzaNvn2Replay::ResetIndirectDraws(const DrawState& draw, const Submissi
     if (!list || !submission.guest_memory) {
         return false;
     }
-    const auto snapshot = submission.buffer_snapshots.find({list->address, list->bytes});
-    if (snapshot == submission.buffer_snapshots.end()) {
+    const auto snapshot = submission.BufferSnapshot({list->address, list->bytes});
+    if (snapshot.empty()) {
         return false;
     }
-    std::vector<u64> records;
+    std::vector<std::pair<u64, u64>> records;
+    std::vector<u64> changed;
     records.reserve(draw.count);
+    changed.reserve(draw.count);
     for (size_t offset = 0; offset < list->bytes; offset += sizeof(u64)) {
         u64_le record;
-        std::memcpy(&record, snapshot->second.data() + offset, sizeof(record));
+        std::memcpy(&record, snapshot.data() + offset, sizeof(record));
         if (!record) {
             continue;
         }
-        if (record % alignof(u32) || !submission.indirect_reset_addresses.contains(record) ||
+        const auto guest = submission.indirect_reset_addresses.find(record);
+        if (record % alignof(u32) || guest == submission.indirect_reset_addresses.end() ||
             (record < list->address + list->bytes && list->address < record + sizeof(Reset::Record))) {
             return false;
         }
-        records.push_back(record);
+        records.emplace_back(record, guest->second);
+        changed.push_back(record);
     }
     static constexpr std::array<u32_le, 5> reset_words{0, 1, 0, 0, 0};
     const std::span<const u8> reset_bytes{reinterpret_cast<const u8*>(reset_words.data()),
                                          sizeof(reset_words)};
-    const std::set<u64> changed(records.begin(), records.end());
+    std::ranges::sort(changed);
     std::vector<std::pair<VkBuffer, VkBufferCopy>> copies_to_storage;
-    for (const u64 record : records) {
-        submission.guest_memory->WriteBlockUnsafe(submission.indirect_reset_addresses.at(record),
-                                                   reset_bytes.data(), reset_bytes.size());
-        buffer_updates.push_back({record, reset_bytes});
+    for (const auto& [record, guest] : records) {
+        submission.guest_memory->WriteBlockUnsafe(guest, reset_bytes.data(), reset_bytes.size());
+        AddBufferUpdate(record, reset_bytes);
         if (const auto storage = FindStorageRange({record, reset_bytes.size()});
             storage != storage_uploads.end()) {
-            copies_to_storage.emplace_back(*storage->second.buffer,
-                                           VkBufferCopy{0, record - storage->first.first,
-                                                        reset_bytes.size()});
+            copies_to_storage.emplace_back(
+                storage->second.buffer,
+                VkBufferCopy{0, storage->second.base + record - storage->first.first,
+                             reset_bytes.size()});
         }
         reset_indirect_draws.insert(record);
     }
-    std::erase_if(uploaded_ranges, [&](const auto& entry) {
+    erase_if(uploaded_ranges, [&](const auto& entry) {
         const auto [start, size] = entry.first;
-        const auto next = changed.lower_bound(start);
+        const auto next = std::ranges::lower_bound(changed, start);
         return (next != changed.end() && *next < start + size) ||
                (next != changed.begin() && *std::prev(next) + reset_bytes.size() > start);
     });
+    vertex_uploads.fill({});
+    ++upload_generation;
     if (!copies_to_storage.empty()) {
         const auto source = Upload(reset_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         Barrier();
-        bool overlaps = changed.size() != records.size();
+        bool overlaps{};
         if (!changed.empty()) {
             auto last = changed.begin();
             for (auto next = std::next(last); next != changed.end(); last = next++) {
                 overlaps |= *next - *last < reset_bytes.size();
             }
         }
-        scheduler.Record([source, destinations = std::move(copies_to_storage), overlaps](vk::CommandBuffer cmdbuf) {
+        Record([source, destinations = std::move(copies_to_storage), overlaps](vk::CommandBuffer cmdbuf) {
             const VkMemoryBarrier barrier{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2488,6 +3821,18 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         NoteSkip("no vertex program bound");
         return;
     }
+    sampled_fresh = false;
+    storage_fresh = false;
+    auto phase_start = profile_replay ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    const auto mark = [&](size_t phase) {
+        if (!profile_replay) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        draw_phase_ns[phase] += static_cast<u64>((now - phase_start).count());
+        phase_start = now;
+    };
     const auto topology = Topology(op.args[0]);
     std::optional<DrawState> draw;
     if (op.replay == ReplayOp::DrawIndirect && op.args.size() == 2) {
@@ -2506,13 +3851,13 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                                  arguments.first - argument_storage->first.first <
                                      argument_storage->second.written_bytes;
         const auto slice = submission.indirect_index_slices.find({op.args[3], op.args[2], op.args[1]});
-        const auto snapshot = submission.buffer_snapshots.find(arguments);
+        const auto snapshot = submission.BufferSnapshot(arguments);
         if (!gpu_written && reset_indirect_draws.contains(arguments.first)) {
             return;
         }
-        if (!gpu_written && snapshot != submission.buffer_snapshots.end()) {
+        if (!gpu_written && !snapshot.empty()) {
             VkDrawIndexedIndirectCommand command{};
-            std::memcpy(&command, snapshot->second.data(), sizeof(command));
+            std::memcpy(&command, snapshot.data(), sizeof(command));
             if (!command.indexCount || !command.instanceCount) {
                 return;
             }
@@ -2537,7 +3882,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                     LOG_INFO(Render_Vulkan,
                              "NVN 2 program {} indirect indices {:#x} type {}, args {:#x}, GPU written {}, args snapshot {}, index slice {}",
                              graphics_program->serial, op.args[2], op.args[1], arguments.first,
-                             gpu_written, snapshot != submission.buffer_snapshots.end(),
+                             gpu_written, !snapshot.empty(),
                              slice != submission.indirect_index_slices.end());
                 }
                 NoteSkip("indirect index buffer range missing at submit");
@@ -2581,12 +3926,12 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         }
         if (draw->indexed_indirect &&
             FindStorageRange(draw->indirect_range) == storage_uploads.end()) {
-            const auto args = submission.buffer_snapshots.find(draw->indirect_range);
-            if (args == submission.buffer_snapshots.end()) {
+            const auto args = submission.BufferSnapshot(draw->indirect_range);
+            if (args.empty()) {
                 return;
             }
             VkDrawIndexedIndirectCommand command{};
-            std::memcpy(&command, args->second.data(), sizeof(command));
+            std::memcpy(&command, args.data(), sizeof(command));
             const u64 element_size = u64{1} << op.args[1];
             const u64 end = (u64{command.firstIndex} + command.indexCount) * element_size;
             if (end > draw->index_range.second) {
@@ -2595,6 +3940,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             }
         }
     }
+    mark(0);
     ColorFormats formats{};
     std::array<Image*, 8> targets{};
     std::array<VkImageView, 8> views{};
@@ -2646,7 +3992,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         return;
     }
     if (!color_count && !depth) {
-        const auto limits = device.GetPhysical().GetProperties().limits;
+        const auto& limits = device_limits;
         const auto dimension = [](float viewport_end, s64 scissor_end, u32 limit) {
             const double end = std::isfinite(viewport_end) && viewport_end >= 1.0f
                                    ? std::ceil(viewport_end)
@@ -2662,6 +4008,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     if (depth) {
         include(*depth, depth_view);
     }
+    mark(1);
     auto raster = raster_state;
     raster.depth_format = depth ? depth->format : VK_FORMAT_UNDEFINED;
     raster.depth_aspects = depth ? depth->aspects : 0;
@@ -2669,21 +4016,28 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     raster.origin_lower_left = submission.origin_lower_left;
     const bool biased = raster.depth_bias;
     const auto bias = depth_bias;
-    const float bias_clamp = device.GetPhysical().GetFeatures().depthBiasClamp ? bias[2] : 0.0f;
+    const float bias_clamp = device_features.depthBiasClamp ? bias[2] : 0.0f;
     const PipelineKey key{graphics_program->serial, fragment_program ? fragment_program->serial : 0,
                           geometry_program ? geometry_program->serial : 0,
                           formats, topology, vertex_attributes,
                           vertex_strides, vertex_divisors, color_state, raster};
-    const auto [entry, inserted] = pipelines.try_emplace(key);
-    if (inserted) {
-        try {
-            entry->second = CreatePipeline(formats, color_count, topology, raster);
-        } catch (const vk::Exception& error) {
-            LOG_WARNING(Render_Vulkan, "Bananza NVN 2 graphics pipeline {}: {}",
-                        graphics_program->serial, error.what());
+    if (last_pipeline == pipelines.end() || last_pipeline->first != key) {
+        const auto [entry, inserted] = pipelines.try_emplace(key);
+        if (inserted) {
+            try {
+                const auto create_start = std::chrono::steady_clock::now();
+                entry->second = CreatePipeline(formats, color_count, topology, raster);
+                ++pipeline_creates;
+                pipeline_create_ns += static_cast<u64>(
+                    (std::chrono::steady_clock::now() - create_start).count());
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "Bananza NVN 2 graphics pipeline {}: {}",
+                            graphics_program->serial, error.what());
+            }
         }
+        last_pipeline = entry;
     }
-    if (!entry->second) {
+    if (!last_pipeline->second) {
         NoteSkip("graphics pipeline unavailable");
         if (!missing_draw_logged) {
             missing_draw_logged = true;
@@ -2691,15 +4045,23 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         }
         return;
     }
-    const auto& pipeline = *entry->second;
-    std::vector<std::pair<u32, VkBuffer>> vertices;
+    auto& pipeline = *last_pipeline->second;
+    static const bool copy_all_feedback = std::getenv("EDEN_NX2_NVN_ALWAYS_WRITTEN") != nullptr;
+    draw_color_writes = copy_all_feedback ? ~0U : pipeline.color_writes;
+    mark(2);
+    boost::container::small_vector<std::tuple<u32, VkBuffer, u64>, 4> vertices;
+    vertices.reserve(pipeline.streams.size());
     for (const u32 stream : pipeline.streams) {
-        const auto buffer = UploadRange(submission, vertex_buffers[stream]);
+        auto& upload = vertex_uploads[stream];
+        if (!upload.first) {
+            upload = UploadRange(submission, vertex_buffers[stream]);
+        }
+        const auto [buffer, buffer_offset] = upload;
         if (!buffer) {
             NoteSkip("vertex buffer range missing at submit");
             return;
         }
-        vertices.emplace_back(stream, buffer);
+        vertices.emplace_back(stream, buffer, buffer_offset);
     }
     VkBuffer index_buffer{};
     u64 index_offset{};
@@ -2711,12 +4073,11 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         }
         std::span<const u8> source;
         if (draw->index_type != VK_INDEX_TYPE_MAX_ENUM) {
-            const auto found = submission.buffer_snapshots.find(draw->index_range);
-            if (found == submission.buffer_snapshots.end()) {
+            source = submission.BufferSnapshot(draw->index_range);
+            if (source.empty()) {
                 NoteSkip("quad index buffer range missing at submit");
                 return;
             }
-            source = found->second;
         }
         const auto index = [&](u32 offset) -> u32 {
             if (source.empty()) {
@@ -2743,8 +4104,9 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                 triangles.push_back(index(quad * (strip ? 2 : 4) + corner));
             }
         }
-        index_buffer = Upload({reinterpret_cast<const u8*>(triangles.data()),
-                               triangles.size() * sizeof(u32)});
+        std::tie(index_buffer, index_offset) =
+            UploadStream({reinterpret_cast<const u8*>(triangles.data()),
+                          triangles.size() * sizeof(u32)});
         draw->index_type = VK_INDEX_TYPE_UINT32;
         draw->count = static_cast<u32>(triangles.size());
     } else if (draw->index_type != VK_INDEX_TYPE_MAX_ENUM) {
@@ -2754,37 +4116,30 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             return;
         }
     }
+    mark(3);
     VkDescriptorSet set{};
-    std::vector<std::pair<StorageUpload*, u64>> written_storage;
+    const DescriptorData* pushed{};
+    VkDescriptorUpdateTemplate push_template{};
+    boost::container::small_vector<std::pair<StorageUpload*, u64>, 4> written_storage;
+    boost::container::small_vector<std::tuple<StorageUpload*, u64, u64>, 4> written_intervals;
     if (!pipeline.uniforms.empty() || !pipeline.storage.empty() || !pipeline.textures.empty()) {
-        std::array<u8, 0x1000> driver{};
-        constexpr float max_point_size = 2047.0f;
-        const u32_le base_instance = draw->base_instance;
-        std::memcpy(driver.data() + 0x610, &max_point_size, sizeof(max_point_size));
-        std::memcpy(driver.data() + 0x644, &base_instance, sizeof(base_instance));
-        for (u32 stage = 0; stage < GraphicsStorageBase.size(); ++stage) {
-            const u32 base = GraphicsStorageBase[stage];
-            for (u32 slot = 0; slot < 16; ++slot) {
-                const auto& range = storage_buffers[stage][slot];
-                const u64_le address = range.first;
-                const u32_le size = static_cast<u32>(range.second);
-                std::memcpy(driver.data() + base + slot * 16, &address, sizeof(address));
-                std::memcpy(driver.data() + base + slot * 16 + 8, &size, sizeof(size));
-            }
-        }
-        std::vector<VkDescriptorBufferInfo> infos;
-        infos.reserve(pipeline.uniforms.size());
+        const auto count = pipeline.uniforms.size() + pipeline.storage.size() +
+                           pipeline.textures.size();
+        boost::container::small_vector<DescriptorData, 24> descriptors(count);
         for (const auto& binding : pipeline.uniforms) {
             const auto& bound = uniform_buffers[binding.stage];
             // NVN user uniform slots follow the driver's three internal banks.
             const auto range = binding.bank >= 3 ? bound[binding.bank - 3] : Range{};
             std::span<const u8> literal{binding.literal};
+            BufferRef* cached_upload{};
             if (binding.bank == 0) {
-                literal = driver;
-            } else if (binding.bank == 17) {
-                literal = graphics_constants[0];
-            } else if (binding.bank >= 24) {
-                literal = graphics_constants[binding.bank - 24];
+                const auto [buffer, offset] = UploadDriverConstants(draw->base_instance);
+                descriptors[binding.binding].buffer = {buffer, offset, driver_constants.size()};
+                continue;
+            } else if (binding.bank == 17 || binding.bank >= 24) {
+                const u32 slot = binding.bank == 17 ? 0 : binding.bank - 24;
+                literal = graphics_constants[slot];
+                cached_upload = &graphics_constant_uploads[slot];
             }
             const u64 size = literal.empty() ? range.second : literal.size();
             if (!size || size > 65536) {
@@ -2797,25 +4152,57 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                 NoteSkip("uniform binding has insufficient data");
                 return;
             }
-            const auto buffer = literal.empty() ? UploadRange(submission, range) : Upload(literal);
-            if (!buffer) {
+            BufferRef upload;
+            if (cached_upload) {
+                if (!cached_upload->first) {
+                    *cached_upload = UploadStream(literal);
+                }
+                upload = *cached_upload;
+            } else if (literal.empty()) {
+                auto& memo = uniform_upload_memo[binding.stage % uniform_upload_memo.size()]
+                                                [(binding.bank - 3) % 32];
+                if (memo.generation != upload_generation || memo.range != range) {
+                    const auto ref = UploadRange(submission, range);
+                    memo = {range, ref, upload_generation};
+                }
+                upload = memo.ref;
+            } else {
+                upload = UploadStream(literal);
+            }
+            if (!upload.first) {
                 NoteSkip("uniform buffer range missing at submit");
                 return;
             }
-            infos.push_back({buffer, 0, size});
+            descriptors[binding.binding].buffer = {upload.first, upload.second, size};
         }
-        std::vector<VkDescriptorBufferInfo> storage_infos;
-        storage_infos.reserve(pipeline.storage.size());
-        const auto storage_limits = device.GetPhysical().GetProperties().limits;
+        mark(4);
+        const auto& storage_limits = device_limits;
+        struct FragmentStorage {
+            bool& flag;
+            ~FragmentStorage() {
+                flag = false;
+            }
+        } fragment_storage{storage_for_fragment};
+        static const bool move_storage = std::getenv("EDEN_NX2_NVN_NO_DEVICE_STORAGE") == nullptr;
+        for (const auto& [stage, binding, slot, writable] : pipeline.storage) {
+            if (stage != 1 || !move_storage) {
+                continue;
+            }
+            if (const auto* span = BoundSpan(storage_buffers[stage][slot]);
+                span && span->upload && !span->upload->readback_buffer) {
+                MoveStorageToDevice(*span->upload);
+            }
+        }
         for (const auto& [stage, binding, slot, writable] : pipeline.storage) {
             const auto range = storage_buffers[stage][slot];
+            storage_for_fragment = stage == 1;
             if (trace_images && stage == 2 &&
                 draw_diagnostics.emplace(geometry_program->serial,
                                          slot == 0 ? "geometry storage 0" : "geometry storage 1").second) {
                 LOG_INFO(Render_Vulkan,
                          "NVN 2 geometry program {} storage slot {} at {:#x}, {} bytes, write {}, snapshot {}, mapping {}",
                          geometry_program->serial, slot, range.first, range.second, writable,
-                         submission.buffer_snapshots.contains(range),
+                         submission.HasSnapshot(range),
                          submission.storage_addresses.contains(range));
             }
             if (!range.first || !range.second || range.second > storage_limits.maxStorageBufferRange) {
@@ -2826,9 +4213,11 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             u64 offset{};
             if (writable) {
                 if (const auto [upload, start] = WritableStorage(submission, range); upload) {
-                    buffer = *upload->buffer;
-                    offset = start;
-                    written_storage.emplace_back(upload, offset + range.second);
+                    buffer = upload->buffer;
+                    offset = upload->base + start;
+                    written_storage.emplace_back(upload, start + range.second);
+                    written_intervals.emplace_back(upload, start, start + range.second);
+                    traced_storage = range;
                 }
             } else {
                 std::tie(buffer, offset) = UploadBufferRange(submission, range);
@@ -2837,77 +4226,62 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                 NoteSkip("graphics storage range missing at submit");
                 return;
             }
-            storage_infos.push_back({buffer, offset, range.second});
+            descriptors[binding].buffer = {buffer, offset, range.second};
         }
-        std::vector<VkDescriptorImageInfo> image_infos;
-        image_infos.reserve(pipeline.textures.size());
+        mark(5);
         for (const auto& [stage, binding, descriptor] : pipeline.textures) {
             const auto info = BindTexture(submission, stage, descriptor, targets);
             if (!info) {
                 return;
             }
-            image_infos.push_back(*info);
+            descriptors[binding].image = *info;
         }
-        const auto& logical = device.GetLogical();
-        std::vector<VkDescriptorPoolSize> pool_sizes;
-        if (!infos.empty()) {
-            pool_sizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<u32>(infos.size())});
+        mark(6);
+        const auto matches_buffer = [&](u32 binding) {
+            const auto& a = pipeline.last_descriptors[binding].buffer;
+            const auto& b = descriptors[binding].buffer;
+            return std::tie(a.buffer, a.offset, a.range) == std::tie(b.buffer, b.offset, b.range);
+        };
+        const auto matches_image = [&](u32 binding) {
+            const auto& a = pipeline.last_descriptors[binding].image;
+            const auto& b = descriptors[binding].image;
+            return std::tie(a.sampler, a.imageView, a.imageLayout) ==
+                   std::tie(b.sampler, b.imageView, b.imageLayout);
+        };
+        if (pipeline.push_descriptors) {
+            if (PushBlockEntries - push_used < count) {
+                if (free_push_blocks.empty()) {
+                    push_blocks.push_back(
+                        std::make_unique_for_overwrite<DescriptorData[]>(PushBlockEntries));
+                } else {
+                    push_blocks.push_back(std::move(free_push_blocks.back()));
+                    free_push_blocks.pop_back();
+                }
+                push_used = 0;
+            }
+            DescriptorData* const data = push_blocks.back().get() + push_used;
+            push_used += count;
+            std::memcpy(data, descriptors.data(), count * sizeof(DescriptorData));
+            pushed = data;
+            push_template = *pipeline.update_template;
+        } else if (pipeline.descriptor_submission == replayed_submissions && pipeline.last_set &&
+            std::ranges::all_of(pipeline.uniforms, [&](const auto& b) { return matches_buffer(b.binding); }) &&
+            std::ranges::all_of(pipeline.storage, [&](const auto& b) { return matches_buffer(b.binding); }) &&
+            std::ranges::all_of(pipeline.textures, [&](const auto& b) { return matches_image(std::get<1>(b)); })) {
+            set = pipeline.last_set;
+        } else {
+            set = AllocateSet(*pipeline.set_layout, pipeline.uniforms.size(), pipeline.storage.size(),
+                              pipeline.textures.size(), 0);
+            if (!set) {
+                NoteSkip("descriptor set unavailable");
+                return;
+            }
+            device.GetLogical().UpdateDescriptorSet(set, *pipeline.update_template, descriptors.data());
+            pipeline.last_descriptors.assign(descriptors.begin(), descriptors.end());
+            pipeline.last_set = set;
+            pipeline.descriptor_submission = replayed_submissions;
         }
-        if (!storage_infos.empty()) {
-            pool_sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                  static_cast<u32>(storage_infos.size())});
-        }
-        if (!image_infos.empty()) {
-            pool_sizes.push_back({VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                  static_cast<u32>(image_infos.size())});
-        }
-        auto pool = logical.CreateDescriptorPool({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = 1,
-            .poolSizeCount = static_cast<u32>(pool_sizes.size()),
-            .pPoolSizes = pool_sizes.data(),
-        });
-        const VkDescriptorSetLayout set_layout = *pipeline.set_layout;
-        const auto sets = pool.Allocate({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .descriptorPool = *pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &set_layout,
-        });
-        set = sets[0];
-        std::vector<VkWriteDescriptorSet> writes;
-        for (size_t i = 0; i < infos.size(); ++i) {
-            writes.push_back({
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = set,
-                .dstBinding = pipeline.uniforms[i].binding,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                .pBufferInfo = &infos[i],
-            });
-        }
-        for (size_t i = 0; i < storage_infos.size(); ++i) {
-            writes.push_back({
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = set,
-                .dstBinding = pipeline.storage[i].binding,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &storage_infos[i],
-            });
-        }
-        for (size_t i = 0; i < image_infos.size(); ++i) {
-            writes.push_back({
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = set,
-                .dstBinding = std::get<1>(pipeline.textures[i]),
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .pImageInfo = &image_infos[i],
-            });
-        }
-        logical.UpdateDescriptorSets(writes, {});
-        descriptor_pools.push_back(std::move(pool));
+        mark(7);
     }
 
     VkViewport draw_viewport = viewport;
@@ -2917,7 +4291,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     }
     draw_viewport.minDepth = depth_range[0];
     draw_viewport.maxDepth = depth_range[1];
-    const auto limits = device.GetPhysical().GetProperties().limits;
+    const auto& limits = device_limits;
     const auto& bounds = limits.viewportBoundsRange;
     if (draw_viewport.x < bounds[0] || draw_viewport.y < bounds[0] ||
         draw_viewport.x + draw_viewport.width > bounds[1] ||
@@ -2963,10 +4337,80 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     }
     for (const auto& [upload, size] : written_storage) {
         upload->written_bytes = std::max(upload->written_bytes, size);
+        upload->dirty = true;
+        // Set again once the draw is recorded; a draw that is dropped below writes nothing.
+        upload->write_tick = scheduler.CurrentTick();
+        if (upload->readback_buffer) {
+            upload->readback_stale = true;
+            device_readback_pending = true;
+        }
     }
-    Barrier();
+    if (occlusion_queries == OcclusionQueryCount) {
+        CollectOcclusion();
+    }
+    const VkQueryPool query_pool = count_samples ? *occlusion_pool : VK_NULL_HANDLE;
+    if (query_pool && occlusion_queries == 0) {
+        Record([query_pool](vk::CommandBuffer cmdbuf) {
+            cmdbuf.ResetQueryPool(query_pool, 0, OcclusionQueryCount);
+        });
+    }
+    const bool capture_draw = frame_dump.CapturingSampled() && colors[0] && extent.width >= 1900;
+    const RenderingScope scope{views, depth_attachment_view, color_count, extent.width,
+                               extent.height, layers};
+    u32 fresh_kind{};
+    u32 fresh_slot{8};
+    if (sampled_fresh && fresh_image) {
+        const auto slot = std::ranges::find(targets, fresh_image);
+        fresh_kind = fresh_image == depth ? 1U : slot != targets.end() ? 2U : 4U;
+        fresh_slot = static_cast<u32>(slot - targets.begin());
+    }
+    const Range scope_storage = written_storage.empty() ? Range{} : traced_storage;
+    static const bool old_storage_rule = std::getenv("EDEN_NX2_NVN_ALWAYS_WRITTEN") != nullptr;
+    const bool storage_barrier = old_storage_rule
+                                     ? scope_wrote_storage || !written_storage.empty()
+                                     : storage_fresh;
+    const u32 scope_reason = (rendering_scope && rendering_scope != scope ? 1U : 0U) |
+                             (sampled_fresh ? 2U : 0U) | (storage_barrier ? 4U : 0U) |
+                             (!written_storage.empty() ? 8U : 0U) | (!rendering_scope ? 16U : 0U);
+    if (rendering_scope != scope || sampled_fresh || storage_barrier || capture_draw) {
+        Barrier();
+    }
     std::optional<u32> probe;
-    if (frame_dump.CapturingSampled() && colors[0] && extent.width >= 1900) {
+    if (!rendering_scope) {
+        if (pass_trace_active) {
+            const u64 target = colors[0] ? colors[0]->storage.gpu_address + colors[0]->offset
+                               : depth_texture
+                                     ? depth_texture->storage.gpu_address + depth_texture->offset
+                                     : 0;
+            PassTimestamp({.target = target,
+                           .width = extent.width,
+                           .height = extent.height,
+                           .program = graphics_program->serial,
+                           .reason = scope_reason,
+                           .fresh = fresh_kind,
+                           .fresh_slot = fresh_slot,
+                           .storage = scope_storage.first,
+                           .storage_size = scope_storage.second});
+        }
+        scheduler.Record([scope, extent, attachments, depth_attachment, aspects = raster.depth_aspects](
+                             vk::CommandBuffer cmdbuf) {
+            cmdbuf.BeginRendering({
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea = {{}, extent},
+                .layerCount = scope.layers,
+                .colorAttachmentCount = scope.color_count,
+                .pColorAttachments = attachments.data(),
+                .pDepthAttachment = aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? &depth_attachment : nullptr,
+                .pStencilAttachment = aspects & VK_IMAGE_ASPECT_STENCIL_BIT ? &depth_attachment : nullptr,
+            });
+        });
+        rendering_scope = scope;
+        scope_vertices.fill({});
+        scope_index = {};
+        ++rendering_scopes;
+        ++flush_scopes;
+    }
+    if (capture_draw) {
         const std::array shaders{graphics_program->serial};
         frame_dump.NoteDraw(shaders);
         if (!count_samples) {
@@ -2984,73 +4428,113 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                      draw_viewport.maxDepth);
         }
     }
-    if (occlusion_queries == OcclusionQueryCount) {
-        CollectOcclusion();
+    scope_wrote_storage = !written_storage.empty();
+    for (const auto& [upload, begin, end] : written_intervals) {
+        if (upload->written_barrier != barrier_serial) {
+            upload->written_barrier = barrier_serial;
+            upload->fresh.clear();
+        }
+        // Merge with the intervals it touches.
+        u64 first = begin;
+        u64 last = end;
+        auto it = upload->fresh.upper_bound(begin);
+        if (it != upload->fresh.begin() && std::prev(it)->second >= begin) {
+            --it;
+            first = it->first;
+        }
+        while (it != upload->fresh.end() && it->first <= last) {
+            last = std::max(last, it->second);
+            it = upload->fresh.erase(it);
+        }
+        upload->fresh.emplace(first, last);
     }
-    const VkQueryPool query_pool = count_samples ? *occlusion_pool : VK_NULL_HANDLE;
+    // Only a draw that can write a target makes a later sample of it need a barrier.
+    static const bool always_written = std::getenv("EDEN_NX2_NVN_ALWAYS_WRITTEN") != nullptr;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i] && (always_written || ((pipeline.color_writes >> i) & 1))) {
+            targets[i]->written_barrier = barrier_serial;
+        }
+    }
+    if (depth && (always_written || pipeline.depth_write || pipeline.uses_stencil)) {
+        depth->written_barrier = barrier_serial;
+    }
     const u32 query = count_samples ? occlusion_queries++ : 0;
     const VkQueryControlFlags query_flags = precise_queries ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
-    scheduler.Record([attachments, color_count, depth_attachment, depth_aspects = raster.depth_aspects,
-                      graphics = *pipeline.pipeline, layout = *pipeline.layout,
-                      extent, layers, draw_viewport, draw_scissor, command = *draw, set, index_buffer,
-                      index_offset,
+    const auto graphics = *pipeline.pipeline;
+    const bool bind_pipeline = std::exchange(scope_pipeline, graphics) != graphics;
+    const bool bind_set = set && (bind_pipeline || scope_descriptor_set != set);
+    scope_descriptor_set = set;
+    const auto unchanged = [this](const auto& vertex) {
+        const auto [stream, buffer, offset] = vertex;
+        const BufferRef binding{buffer, offset};
+        return std::exchange(scope_vertices[stream], binding) == binding;
+    };
+    vertices.erase(std::remove_if(vertices.begin(), vertices.end(), unchanged), vertices.end());
+    const auto index_binding = std::tuple{index_buffer, index_offset, draw->index_type};
+    const bool bind_index = index_buffer && std::exchange(scope_index, index_binding) != index_binding;
+    mark(8);
+    scheduler.Record([graphics, bind_pipeline, layout = *pipeline.layout,
+                      extent, draw_viewport, draw_scissor, command = *draw, set, bind_set, pushed,
+                      push_template, index_buffer,
+                      index_offset, bind_index,
                       indirect_buffer, indirect_offset, biased, bias, bias_clamp,
                       query_pool, query, query_flags,
                       blend_color = blend_constants, uses_render_area = pipeline.uses_render_area,
+                      uses_blend_constants = pipeline.uses_blend_constants,
+                      uses_stencil = pipeline.uses_stencil,
                       stages = pipeline.stages,
                       refs = stencil_ref, compare_masks = stencil_compare_mask,
                       write_masks = stencil_write_mask,
                       vertices = std::move(vertices)](
                          vk::CommandBuffer cmdbuf) {
         if (query_pool) {
-            cmdbuf.ResetQueryPool(query_pool, query, 1);
-        }
-        cmdbuf.BeginRendering(VkRenderingInfo{
-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = {{}, extent},
-            .layerCount = layers,
-            .colorAttachmentCount = color_count,
-            .pColorAttachments = attachments.data(),
-            .pDepthAttachment = depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? &depth_attachment : nullptr,
-            .pStencilAttachment = depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT ? &depth_attachment : nullptr,
-        });
-        if (query_pool) {
             cmdbuf.BeginQuery(query_pool, query, query_flags);
         }
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics);
+        if (bind_pipeline) {
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics);
+            using namespace Shader::Backend::SPIRV;
+            constexpr RescalingLayout rescale{.down_factor = std::bit_cast<u32>(1.0f)};
+            cmdbuf.PushConstants(layout, stages, rescale);
+            if (uses_render_area) {
+                const RenderAreaLayout area{{static_cast<float>(extent.width),
+                                             static_cast<float>(extent.height), 0, 0}};
+                cmdbuf.PushConstants(layout, stages, RENDERAREA_LAYOUT_OFFSET, sizeof(area), &area);
+            }
+        }
         cmdbuf.SetViewport(0, {draw_viewport});
         cmdbuf.SetScissor(0, {draw_scissor});
-        cmdbuf.SetBlendConstants(blend_color.data());
+        if (uses_blend_constants) {
+            cmdbuf.SetBlendConstants(blend_color.data());
+        }
         if (biased) {
             cmdbuf.SetDepthBias(bias[1], bias_clamp, bias[0]);
         }
-        for (u32 i = 0; i < 2; ++i) {
-            const VkStencilFaceFlags face = i == 0 ? VK_STENCIL_FACE_FRONT_BIT : VK_STENCIL_FACE_BACK_BIT;
-            cmdbuf.SetStencilReference(face, refs[i]);
-            cmdbuf.SetStencilCompareMask(face, compare_masks[i]);
-            cmdbuf.SetStencilWriteMask(face, write_masks[i]);
+        if (uses_stencil) {
+            for (u32 i = 0; i < 2; ++i) {
+                const VkStencilFaceFlags face =
+                    i == 0 ? VK_STENCIL_FACE_FRONT_BIT : VK_STENCIL_FACE_BACK_BIT;
+                cmdbuf.SetStencilReference(face, refs[i]);
+                cmdbuf.SetStencilCompareMask(face, compare_masks[i]);
+                cmdbuf.SetStencilWriteMask(face, write_masks[i]);
+            }
         }
-        using namespace Shader::Backend::SPIRV;
-        constexpr RescalingLayout rescale{.down_factor = std::bit_cast<u32>(1.0f)};
-        cmdbuf.PushConstants(layout, stages, rescale);
-        if (uses_render_area) {
-            const RenderAreaLayout area{{static_cast<float>(extent.width),
-                                         static_cast<float>(extent.height), 0, 0}};
-            cmdbuf.PushConstants(layout, stages, RENDERAREA_LAYOUT_OFFSET, sizeof(area), &area);
-        }
-        if (set) {
+        if (bind_set) {
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, {set}, {});
         }
-        for (const auto& [stream, buffer] : vertices) {
-            cmdbuf.BindVertexBuffer(stream, buffer, 0);
+        if (pushed) {
+            cmdbuf.PushDescriptorSetWithTemplateKHR(push_template, layout, 0, pushed);
+        }
+        for (const auto& [stream, buffer, buffer_offset] : vertices) {
+            cmdbuf.BindVertexBuffer(stream, buffer, buffer_offset);
+        }
+        if (bind_index) {
+            cmdbuf.BindIndexBuffer(index_buffer, index_offset, command.index_type);
         }
         if (command.indexed_indirect) {
-            cmdbuf.BindIndexBuffer(index_buffer, index_offset, command.index_type);
             cmdbuf.DrawIndexedIndirect(indirect_buffer, indirect_offset, 1, sizeof(VkDrawIndexedIndirectCommand));
         } else if (indirect_buffer) {
             cmdbuf.DrawIndirect(indirect_buffer, indirect_offset, 1, sizeof(VkDrawIndirectCommand));
         } else if (index_buffer) {
-            cmdbuf.BindIndexBuffer(index_buffer, index_offset, command.index_type);
             cmdbuf.DrawIndexed(command.count, command.instances, 0, command.base_vertex,
                                command.base_instance);
         } else {
@@ -3059,12 +4543,17 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         if (query_pool) {
             cmdbuf.EndQuery(query_pool, query);
         }
-        cmdbuf.EndRendering();
     });
+    for (const auto& [upload, size] : written_storage) {
+        // The draw is in the command buffer with this tick.
+        upload->write_tick = scheduler.CurrentTick();
+    }
+    mark(9);
     if (probe) {
         frame_dump.EndProbe(*probe, {.first = draw->first, .elements = draw->count,
                                      .instances = draw->instances,
                                      .color0 = (color_state.channel_mask & 15) != 0});
+        EndRendering();
     }
     if (colors[0]) {
         TraceImage("draw", *colors[0], graphics_program->serial);
@@ -3074,8 +4563,44 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     }
 }
 
+void BananzaNvn2Replay::BindBufferRange(bool storage, u32 stage, u32 slot, Range range) {
+    auto& current = storage ? storage_buffers[stage][slot] : uniform_buffers[stage][slot];
+    driver_storage_dirty |= storage && stage < GraphicsStorageBase.size() && slot < 16 &&
+                            current != range;
+    current = range;
+}
+
+BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadDriverConstants(u32 base_instance) {
+    if (driver_storage_dirty) {
+        for (u32 stage = 0; stage < GraphicsStorageBase.size(); ++stage) {
+            const u32 base = GraphicsStorageBase[stage];
+            for (u32 slot = 0; slot < 16; ++slot) {
+                const auto& range = storage_buffers[stage][slot];
+                const u64_le address = range.first;
+                const u32_le size = static_cast<u32>(range.second);
+                std::memcpy(driver_constants.data() + base + slot * 16, &address, sizeof(address));
+                std::memcpy(driver_constants.data() + base + slot * 16 + 8, &size, sizeof(size));
+            }
+        }
+        driver_storage_dirty = false;
+        driver_upload = {};
+    }
+    if (driver_base_instance != base_instance) {
+        driver_base_instance = base_instance;
+        const u32_le word = base_instance;
+        std::memcpy(driver_constants.data() + 0x644, &word, sizeof(word));
+        driver_upload = {};
+    }
+    if (!driver_upload.first) {
+        driver_upload = UploadStream(driver_constants);
+    }
+    return driver_upload;
+}
+
 void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submission& submission) {
-    for (const auto& op : recording.operations) {
+    for (size_t op_index = 0; op_index < recording.operations.size(); ++op_index) {
+        const auto& op = recording.operations[op_index];
+        Core::BananzaNvn2Commands::PrefetchCalled(recording.operations, op_index);
         if (op.nested) {
             ReplayRecording(*op.nested, submission);
             continue;
@@ -3090,8 +4615,8 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 break;
             }
             const size_t count = op.args[0];
-            if (op.textures.size() != count + 1 || op.args.size() != 2 * count + 3 ||
-                op.payload.size() != 16 * (count + 1)) {
+            if (op.Textures().size() != count + 1 || op.args.size() != 2 * count + 3 ||
+                op.Payload().size() != 16 * (count + 1)) {
                 break;
             }
             const auto attachment = [&](const Texture& texture, std::span<const u8> view,
@@ -3122,15 +4647,15 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 };
             };
             for (size_t i = 0; i < count; ++i) {
-                if (op.textures[i].serial) {
-                    colors[i] = op.textures[i];
-                    color_views[i] = attachment(*colors[i], std::span{op.payload}.subspan(16 * i, 16),
+                if (op.Textures()[i].serial) {
+                    colors[i] = op.Textures()[i];
+                    color_views[i] = attachment(*colors[i], std::span{op.Payload()}.subspan(16 * i, 16),
                                                 op.args[2 + count + i] != 0);
                 }
             }
-            if (const auto& texture = op.textures.back(); texture.serial) {
+            if (const auto& texture = op.Textures().back(); texture.serial) {
                 depth_texture = texture;
-                depth_view = attachment(texture, std::span{op.payload}.last(16), op.args.back() != 0);
+                depth_view = attachment(texture, std::span{op.Payload()}.last(16), op.args.back() != 0);
             }
             break;
         }
@@ -3143,16 +4668,16 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             ClearDepthStencil(op);
             break;
         case ReplayOp::BindDepthStencil:
-            if (op.payload.size() == sizeof(u64)) {
+            if (op.Payload().size() == sizeof(u64)) {
                 u64_le value;
-                std::memcpy(&value, op.payload.data(), sizeof(value));
+                std::memcpy(&value, op.Payload().data(), sizeof(value));
                 raster_state.depth_stencil = value & 0xffffffff000000f7ULL;
             }
             break;
         case ReplayOp::BindPolygon:
-            if (op.payload.size() == sizeof(u32)) {
+            if (op.Payload().size() == sizeof(u32)) {
                 u32_le value;
-                std::memcpy(&value, op.payload.data(), sizeof(value));
+                std::memcpy(&value, op.Payload().data(), sizeof(value));
                 raster_state.polygon = value & 31;
                 // Compact NVN polygon state stores offset enables above the mode fields.
                 const u32 offset_enables = (value >> 15) & 7;
@@ -3169,13 +4694,13 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::SetPolygonOffsetClamp:
-            if (op.payload.size() == sizeof(depth_bias)) {
-                std::memcpy(depth_bias.data(), op.payload.data(), sizeof(depth_bias));
+            if (op.Payload().size() == sizeof(depth_bias)) {
+                std::memcpy(depth_bias.data(), op.Payload().data(), sizeof(depth_bias));
             }
             break;
         case ReplayOp::SetDepthRange:
-            if (op.payload.size() == sizeof(depth_range)) {
-                std::memcpy(depth_range.data(), op.payload.data(), sizeof(depth_range));
+            if (op.Payload().size() == sizeof(depth_range)) {
+                std::memcpy(depth_range.data(), op.Payload().data(), sizeof(depth_range));
             }
             break;
         case ReplayOp::SetStencilRef:
@@ -3212,10 +4737,10 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                     if (!(op.args[1] & bit)) {
                         return;
                     }
-                    if (op.program && std::ranges::any_of(op.program->shaders, [stage](const auto& shader) {
+                    if (op.Program() && std::ranges::any_of(op.Program()->shaders, [stage](const auto& shader) {
                             return shader.stage == stage;
                         })) {
-                        destination = op.program;
+                        destination = op.Program();
                     } else {
                         destination.reset();
                     }
@@ -3228,28 +4753,32 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             break;
         case ReplayOp::BindVertexBuffer:
             if (op.args.size() == 3 && op.args[0] < vertex_buffers.size()) {
-                vertex_buffers[op.args[0]] = {op.args[1], op.args[2]};
+                const u64 slot = op.args[0];
+                const Range range{op.args[1], op.args[2]};
+                if (vertex_buffers[slot] != range) {
+                    vertex_buffers[slot] = range;
+                    vertex_uploads[slot] = {};
+                }
             }
             break;
         case ReplayOp::BindUniformBuffer:
         case ReplayOp::BindStorageBuffer: {
-            auto& ranges = op.replay == ReplayOp::BindUniformBuffer ? uniform_buffers
-                                                                   : storage_buffers;
-            if (op.args.size() == 4 && op.args[0] < ranges.size() && op.args[1] < 32) {
-                ranges[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
+            if (op.args.size() == 4 && op.args[0] < uniform_buffers.size() && op.args[1] < 32) {
+                BindBufferRange(op.replay == ReplayOp::BindStorageBuffer, static_cast<u32>(op.args[0]),
+                                static_cast<u32>(op.args[1]), {op.args[2], op.args[3]});
             }
             break;
         }
         case ReplayOp::BindUniformBuffers:
         case ReplayOp::BindStorageBuffers: {
-            auto& ranges = op.replay == ReplayOp::BindUniformBuffers ? uniform_buffers
-                                                                    : storage_buffers;
-            if (op.args.size() == 3 && op.args[0] < ranges.size() && op.args[1] < 32 &&
-                op.args[2] <= 32 - op.args[1] && op.payload.size() == 16 * op.args[2]) {
+            if (op.args.size() == 3 && op.args[0] < uniform_buffers.size() && op.args[1] < 32 &&
+                op.args[2] <= 32 - op.args[1] && op.Payload().size() == 16 * op.args[2]) {
                 for (size_t i = 0; i < op.args[2]; ++i) {
                     std::array<u64_le, 2> range{};
-                    std::memcpy(range.data(), op.payload.data() + i * 16, 16);
-                    ranges[op.args[0]][op.args[1] + i] = {range[0], range[1]};
+                    std::memcpy(range.data(), op.Payload().data() + i * 16, 16);
+                    BindBufferRange(op.replay == ReplayOp::BindStorageBuffers,
+                                    static_cast<u32>(op.args[0]),
+                                    static_cast<u32>(op.args[1] + i), {range[0], range[1]});
                 }
             }
             break;
@@ -3273,7 +4802,7 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 if (!count || count > handles.size() - first) {
                     break;
                 }
-                std::span<const u8> data = op.payload;
+                std::span<const u8> data = op.Payload();
                 if (op.replay == ReplayOp::BindTexturesDeferred && op.args.size() == 4) {
                     const auto found = submission.deferred_data.find({op.args[3], count * 8});
                     if (found != submission.deferred_data.end()) {
@@ -3300,37 +4829,42 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             auto& constants = op.replay == ReplayOp::PushGraphicsConstants ? graphics_constants
                                                                           : compute_constants;
             if (op.args.size() == 2 && op.args[0] < graphics_constants.size() &&
-                op.args[1] <= 256 && op.payload.size() <= 256 - op.args[1]) {
-                std::ranges::copy(op.payload, constants[op.args[0]].begin() + op.args[1]);
+                op.args[1] <= 256 && op.Payload().size() <= 256 - op.args[1]) {
+                std::ranges::copy(op.Payload(), constants[op.args[0]].begin() + op.args[1]);
+                if (op.replay == ReplayOp::PushGraphicsConstants) {
+                    graphics_constant_uploads[op.args[0]] = {};
+                }
             }
             break;
         }
         case ReplayOp::UpdateUniformBuffer:
-            if (op.args.size() == 4 && !op.payload.empty() && op.payload.size() == op.args[3] &&
+            if (op.args.size() == 4 && !op.Payload().empty() && op.Payload().size() == op.args[3] &&
                 op.args[0] <= std::numeric_limits<u64>::max() - op.args[1] &&
                 op.args[2] <= op.args[1] && op.args[3] <= op.args[1] - op.args[2]) {
                 const u64 address = op.args[0] + op.args[2];
-                const u64 end = address + op.payload.size();
-                buffer_updates.push_back({address, op.payload});
-                std::erase_if(uploaded_ranges, [address, end](const auto& entry) {
+                const u64 end = address + op.Payload().size();
+                AddBufferUpdate(address, op.Payload());
+                erase_if(uploaded_ranges, [address, end](const auto& entry) {
                     const auto [start, size] = entry.first;
                     return start < end && address < start + size;
                 });
+                vertex_uploads.fill({});
+                ForgetUploads(address, end);
             }
             break;
         case ReplayOp::BindBlendState:
-            if (op.payload.size() == sizeof(u64)) {
+            if (op.Payload().size() == sizeof(u64)) {
                 u64_le packed;
-                std::memcpy(&packed, op.payload.data(), sizeof(packed));
+                std::memcpy(&packed, op.Payload().data(), sizeof(packed));
                 color_state.blend[packed & 7] = packed & 0x7f7f7f7f77003f07ULL;
             }
             break;
         case ReplayOp::BindColorState:
         case ReplayOp::BindChannelMask:
         case ReplayOp::SetAlphaRef:
-            if (op.payload.size() >= sizeof(u32)) {
+            if (op.Payload().size() >= sizeof(u32)) {
                 u32_le packed;
-                std::memcpy(&packed, op.payload.data(), sizeof(packed));
+                std::memcpy(&packed, op.Payload().data(), sizeof(packed));
                 if (op.replay == ReplayOp::BindColorState) {
                     color_state.control = packed & 0x0fffff00;
                 } else if (op.replay == ReplayOp::BindChannelMask) {
@@ -3341,27 +4875,27 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::SetBlendColor:
-            if (op.payload.size() == sizeof(blend_constants)) {
-                std::memcpy(blend_constants.data(), op.payload.data(), sizeof(blend_constants));
+            if (op.Payload().size() == sizeof(blend_constants)) {
+                std::memcpy(blend_constants.data(), op.Payload().data(), sizeof(blend_constants));
             }
             break;
         case ReplayOp::StencilCullCriteria:
             break;
         case ReplayOp::BindVertexAttribState:
             if (op.args.size() == 1 && op.args[0] <= vertex_attributes.size() &&
-                op.payload.size() == op.args[0] * 4) {
+                op.Payload().size() == op.args[0] * 4) {
                 vertex_attributes.fill(0);
-                std::memcpy(vertex_attributes.data(), op.payload.data(), op.payload.size());
+                std::memcpy(vertex_attributes.data(), op.Payload().data(), op.Payload().size());
             }
             break;
         case ReplayOp::BindVertexStreamState:
             if (op.args.size() == 1 && op.args[0] <= vertex_strides.size() &&
-                op.payload.size() == op.args[0] * 8) {
+                op.Payload().size() == op.args[0] * 8) {
                 vertex_strides.fill(0);
                 vertex_divisors.fill(0);
                 for (size_t i = 0; i < op.args[0]; ++i) {
-                    std::memcpy(&vertex_strides[i], op.payload.data() + i * 8, 4);
-                    std::memcpy(&vertex_divisors[i], op.payload.data() + i * 8 + 4, 4);
+                    std::memcpy(&vertex_strides[i], op.Payload().data() + i * 8, 4);
+                    std::memcpy(&vertex_divisors[i], op.Payload().data() + i * 8 + 4, 4);
                 }
             }
             break;
@@ -3374,9 +4908,9 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::SetViewports:
-            if (op.args.size() == 2 && op.args[0] == 0 && op.payload.size() >= 4 * sizeof(float)) {
+            if (op.args.size() == 2 && op.args[0] == 0 && op.Payload().size() >= 4 * sizeof(float)) {
                 std::array<float, 4> rect{};
-                std::memcpy(rect.data(), op.payload.data(), sizeof(rect));
+                std::memcpy(rect.data(), op.Payload().data(), sizeof(rect));
                 if (std::ranges::all_of(rect, [](float value) { return std::isfinite(value); })) {
                     viewport = {rect[0], rect[1], rect[2], rect[3], 0.0f, 1.0f};
                 }
@@ -3390,9 +4924,9 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::SetScissors:
-            if (op.args.size() == 2 && op.args[0] == 0 && op.payload.size() >= 4 * sizeof(u32)) {
+            if (op.args.size() == 2 && op.args[0] == 0 && op.Payload().size() >= 4 * sizeof(u32)) {
                 std::array<s32_le, 4> rect{};
-                std::memcpy(rect.data(), op.payload.data(), sizeof(rect));
+                std::memcpy(rect.data(), op.Payload().data(), sizeof(rect));
                 scissor = {{rect[0], rect[1]},
                            {static_cast<u32>(std::max<s32>(0, rect[2])),
                             static_cast<u32>(std::max<s32>(0, rect[3]))}};
@@ -3400,8 +4934,8 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::SetDepthRanges:
-            if (op.args.size() == 2 && op.args[0] == 0 && op.payload.size() >= sizeof(depth_range)) {
-                std::memcpy(depth_range.data(), op.payload.data(), sizeof(depth_range));
+            if (op.args.size() == 2 && op.args[0] == 0 && op.Payload().size() >= sizeof(depth_range)) {
+                std::memcpy(depth_range.data(), op.Payload().data(), sizeof(depth_range));
             }
             break;
         case ReplayOp::Draw:
@@ -3411,11 +4945,24 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
         case ReplayOp::DrawInstanced:
         case ReplayOp::DrawIndirect:
         case ReplayOp::DrawIndexedIndirect:
+        {
+            const auto start = profile_replay ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
             Draw(op, submission);
+            if (profile_replay) {
+                draw_ns += static_cast<u64>((std::chrono::steady_clock::now() - start).count());
+            }
             break;
-        case ReplayOp::Dispatch:
+        }
+        case ReplayOp::Dispatch: {
+            const auto start = profile_replay ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
             Dispatch(op, submission);
+            if (profile_replay) {
+                dispatch_ns += static_cast<u64>((std::chrono::steady_clock::now() - start).count());
+            }
             break;
+        }
         case ReplayOp::SignalEvent:
         case ReplayOp::WaitEvent:
             ReplayEvent(op, submission);
@@ -3437,16 +4984,22 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
 }
 
 void BananzaNvn2Replay::CollectOcclusion() {
-    if (!occlusion_queries) {
-        return;
+    WaitRetireIdle();
+    std::vector<u64> results(occlusion_queries);
+    if (occlusion_queries) {
+        EndRendering();
+        WaitCopies();
+        scheduler.Finish();
+        ++occlusion_flushes;
+        vk::Check(device.GetLogical().GetQueryResults(*occlusion_pool, 0, occlusion_queries,
+                                                      results.size() * sizeof(u64), results.data(),
+                                                      sizeof(u64), VK_QUERY_RESULT_64_BIT));
     }
-    scheduler.Finish();
-    std::array<u64, OcclusionQueryCount> results{};
-    vk::Check(device.GetLogical().GetQueryResults(*occlusion_pool, 0, occlusion_queries,
-                                                  sizeof(results), results.data(), sizeof(u64),
-                                                  VK_QUERY_RESULT_64_BIT));
-    occlusion_samples = std::accumulate(results.begin(), results.begin() + occlusion_queries,
-                                        occlusion_samples);
+    {
+        std::scoped_lock lock{retire_mutex};
+        ApplyCounterEvents(results, counter_events, occlusion_queries);
+    }
+    counter_events.clear();
     occlusion_queries = 0;
 }
 
@@ -3460,10 +5013,9 @@ void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& sub
                     .queryType = VK_QUERY_TYPE_OCCLUSION,
                     .queryCount = OcclusionQueryCount,
                 });
-                precise_queries = device.GetPhysical().GetFeatures().occlusionQueryPrecise;
+                precise_queries = device_features.occlusionQueryPrecise;
             }
-            CollectOcclusion();
-            occlusion_samples = 0;
+            counter_events.push_back({.kind = CounterEvent::Kind::Reset, .query = occlusion_queries});
             count_samples = true;
         }
         return;
@@ -3478,6 +5030,16 @@ void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& sub
     }
     auto& memory = *submission.guest_memory;
     if (op.replay == ReplayOp::SetRenderEnableConditional && type <= 1) {
+        if (std::ranges::any_of(counter_events, [&](const CounterEvent& event) {
+                return event.kind == CounterEvent::Kind::Report && event.gpu_address == op.args[1];
+            })) {
+            // The condition reads a report of this submission.
+            CollectOcclusion();
+        }
+        {
+            std::unique_lock lock{retire_mutex};
+            retire_idle_cv.wait(lock, [&] { return !pending_reports.contains(op.args[1]); });
+        }
         std::array<u64_le, 3> data{};
         if (memory.ReadBlockUnsafe(address->second, data.data(), sizeof(data))) {
             const bool equal = data[0] == data[2];
@@ -3485,17 +5047,26 @@ void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& sub
         }
     } else if (op.replay == ReplayOp::ReportCounter) {
         if (type == SamplesPassed) {
-            CollectOcclusion();
-        } else if (type == 0) {
-            scheduler.Finish();
-        } else if (type != 16) {
+            if (!count_samples) {
+                cumulative_reports = true;
+            }
+            // Written once the queries are read, by the retire thread at the latest.
+            counter_events.push_back({.kind = CounterEvent::Kind::Report,
+                                      .query = occlusion_queries,
+                                      .memory = &memory,
+                                      .guest_address = address->second,
+                                      .gpu_address = op.args[1],
+                                      .submitted_ns = submission.submitted_ns});
+            count_samples = cumulative_reports;
+            return;
+        }
+        if (type != 0 && type != 16) {
             if (unsupported_counters.insert(type).second) {
                 LOG_WARNING(Render_Vulkan, "Bananza NVN 2 counter type {} needs a Vulkan query", type);
             }
             return;
         }
-        const std::array<u64_le, 2> report{type == SamplesPassed ? occlusion_samples : 0,
-                                           submission.submitted_ns};
+        const std::array<u64_le, 2> report{0, submission.submitted_ns};
         memory.WriteBlockUnsafe(address->second, report.data(), sizeof(report));
     }
 }
@@ -3513,7 +5084,59 @@ void BananzaNvn2Replay::ReplayEvent(const Operation& op, const Submission& submi
     if (signal) {
         const auto value = static_cast<u32>(op.args[4]);
         if (op.args[2] != 0) {
-            scheduler.Finish();
+            if (profile_replay) {
+                ++event_signals;
+                last_event_signal = {draws, dispatches};
+            }
+            // The GPU reads only host copies of guest memory, so the guest may see the
+            // event before the GPU gets there unless it reads a result back.
+            static const bool sync_events = std::getenv("EDEN_NX2_NVN_SYNC_EVENTS") != nullptr;
+            const bool dirty = std::ranges::any_of(
+                storage_uploads, [](const auto& entry) { return entry.second.dirty; });
+            if (!sync_events && (!counter_events.empty() ||
+                                 pending_counter_jobs.load(std::memory_order_relaxed) != 0)) {
+                // After a pending report: written in order with it.
+                counter_events.push_back({.kind = CounterEvent::Kind::Signal,
+                                          .query = occlusion_queries,
+                                          .memory = &memory,
+                                          .guest_address = address->second,
+                                          .value = value,
+                                          .add = op.args[1] == 1});
+                return;
+            }
+            if (!sync_events) {
+                memory.Write32(address->second, op.args[1] == 1
+                                                    ? memory.Read32(address->second) + value
+                                                    : value);
+                return;
+            }
+            ++event_signal_waits;
+            const auto start = std::chrono::steady_clock::now();
+            EndRendering();
+            if (dirty) {
+                RecordStorageReadback();
+                Record([](vk::CommandBuffer cmdbuf) {
+                    const VkMemoryBarrier barrier{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_PIPELINE_STAGE_HOST_BIT, 0, barrier);
+                });
+            }
+            if (scheduler.RecordedSinceSubmit()) {
+                WaitCopies();
+                scheduler.Finish();
+            } else {
+                scheduler.Wait(scheduler.CurrentTick() - 1);
+            }
+            event_finish_ns += static_cast<u64>((std::chrono::steady_clock::now() - start).count());
+            if (dirty) {
+                WriteBackStorage(submission);
+            }
+            next_flush_draw = draws + DrawsBeforeFlush;
+            next_replay_flush = std::chrono::steady_clock::now() + ReplayFlushInterval;
         }
         memory.Write32(address->second, op.args[1] == 1 ? memory.Read32(address->second) + value
                                                         : value);
@@ -3529,39 +5152,275 @@ void BananzaNvn2Replay::ReplayEvent(const Operation& op, const Submission& submi
 }
 
 void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& submission) {
+    const auto replay_start = std::chrono::steady_clock::now();
+    struct BusyTime {
+        std::chrono::steady_clock::time_point start;
+        ~BusyTime() {
+            Core::BananzaNvn2Commands::g_replay_busy_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    } busy_time{replay_start};
+    late_copies = submission.late_copies;
+    const u64 draws_before = draws;
+    const std::array slow_before{pipeline_creates, pipeline_create_ns, image_creates,
+                                 texture_uploads, upload_ns, fixed_uploads, fixed_upload_bytes,
+                                 storage_creates, finishes, stream_bytes, hash_ns, device_moves};
+    const u64 tick_before = scheduler.CurrentTick();
+    fixed_check_budget = 256ULL << 10;
+    static const bool import_probe = std::getenv("EDEN_NX2_NVN_IMPORT_PROBE") != nullptr;
+    if (import_probe && import_probes < 2) {
+        const u8* pointer{};
+        u64 size{};
+        for (const auto& shard : submission.buffer_snapshots) {
+            for (const auto& [range, bytes] : shard) {
+                if (!bytes.owned && range.second > size) {
+                    pointer = bytes.data;
+                    size = range.second;
+                }
+            }
+        }
+        if (size >= (256ULL << 10)) {
+            ++import_probes;
+            ProbeHostImport(pointer, size);
+        }
+    }
+    static const bool pass_trace_enabled = std::getenv("EDEN_NX2_NVN_GPU_PASSES") != nullptr;
+    pass_trace = pass_trace_enabled;
+    if (pass_trace && replay_start >= pass_trace_next &&
+        !pass_trace_busy.load(std::memory_order_acquire)) {
+        if (!pass_trace_pool) {
+            pass_trace_pool = device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = PassTraceQueries,
+            });
+        }
+        pass_trace_labels.clear();
+        Record([pool = *pass_trace_pool](vk::CommandBuffer cmdbuf) {
+            cmdbuf.ResetQueryPool(pool, 0, PassTraceQueries);
+        });
+        pass_trace_active = true;
+    }
+    if (profile_replay) {
+        scheduler.trace_submit_times.store(true, std::memory_order_relaxed);
+    }
+    next_flush_draw = draws + DrawsBeforeFlush;
+    next_replay_flush = replay_start + ReplayFlushInterval;
+    flush_scopes = 0;
+    ++replayed_submissions;
+    ReclaimBusyResources();
     origin_lower_left = submission.origin_lower_left;
+    const u64 first_tick = scheduler.CurrentTick();
+    const u64 first_record = scheduler.RecordingSerial();
     CollectStorageSpans(submission);
-    const u64 previous_work = clears + copies + draws + dispatches + texture_uploads;
     for (const auto& recording : submission.recordings) {
         ReplayRecording(*recording, submission);
     }
-    if (clears + copies + draws + dispatches + texture_uploads != previous_work) {
-        if (!storage_uploads.empty()) {
-            scheduler.Record([](vk::CommandBuffer cmdbuf) {
-                const VkMemoryBarrier barrier{
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-                };
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                       VK_PIPELINE_STAGE_HOST_BIT, 0, barrier);
-            });
+    if (last_event_signal) {
+        event_tail_draws += draws - last_event_signal->first;
+        event_tail_dispatches += dispatches - last_event_signal->second;
+        last_event_signal.reset();
+    }
+    EndRendering();
+    const bool wrote_storage = std::ranges::any_of(storage_uploads, [](const auto& entry) {
+        return entry.second.dirty;
+    });
+    if (wrote_storage) {
+        RecordStorageReadback();
+    }
+    if (wrote_storage) {
+        Record([](vk::CommandBuffer cmdbuf) {
+            const VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_HOST_BIT, 0, barrier);
+        });
+    }
+    RetireJob job{.sequence = submission.sequence,
+                  .submission = submission.shared_from_this(),
+                  .queries = occlusion_queries};
+    vk::Buffer query_results;
+    if (occlusion_queries) {
+        if (free_query_results.empty()) {
+            query_results = allocator.CreateBuffer({
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = OcclusionQueryCount * sizeof(u64),
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            }, MemoryUsage::Download);
+        } else {
+            query_results = std::move(free_query_results.back());
+            free_query_results.pop_back();
         }
-        scheduler.Finish();
-        WriteBackStorage(submission);
-        if (!replay_logged) {
-            replay_logged = true;
-            LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay completed {} clears and {} copies",
-                     clears, copies);
+        Record([pool = *occlusion_pool, buffer = *query_results,
+                count = occlusion_queries](vk::CommandBuffer cmdbuf) {
+            cmdbuf.CopyQueryPoolResults(pool, 0, count, buffer, 0, sizeof(u64),
+                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            const VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                                 VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   0, barrier);
+        });
+        occlusion_queries = 0;
+    }
+    if (pass_trace_active) {
+        // Small submissions are not worth a sample; the next one starts over.
+        if (pass_trace_labels.size() >= 32) {
+            job.pass_end_draws = draws;
+            Record([pool = *pass_trace_pool, query = static_cast<u32>(pass_trace_labels.size())](
+                       vk::CommandBuffer cmdbuf) {
+                cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, query);
+            });
+            job.pass_labels = std::move(pass_trace_labels);
+            job.scope_end_sites = std::move(scope_end_sites);
+            pass_trace_busy.store(true, std::memory_order_release);
+            pass_trace_next = replay_start + std::chrono::seconds{5};
+        }
+        pass_trace_labels.clear();
+        scope_end_sites.clear();
+        pass_trace_active = false;
+    }
+    if (scheduler.RecordingSerial() != first_record && scheduler.RecordedSinceSubmit()) {
+        WaitCopies();
+        scheduler.Flush();
+        ++replay_flush_ends;
+    }
+    if (!replay_logged && first_tick != scheduler.CurrentTick()) {
+        replay_logged = true;
+        LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay completed {} clears and {} copies",
+                 clears, copies);
+    }
+    next_flush_draw = std::numeric_limits<u64>::max();
+    uploaded_ranges.clear();
+    vertex_uploads.fill({});
+    ++upload_generation;
+    sampled_bindings.clear();
+    WaitCopies();
+    auto& busy = busy_resources.emplace_back();
+    busy.tick = scheduler.CurrentTick() - 1;
+    busy.sequence = submission.sequence;
+    if (query_results) {
+        busy.query_results.push_back(std::move(query_results));
+    }
+    job.tick = busy.tick;
+    job.query_results = busy.query_results.empty() ? nullptr : &busy.query_results.front();
+    busy.storage.reserve(storage_arenas.size());
+    for (auto& arena : storage_arenas) {
+        busy.storage.emplace_back(arena.capacity, std::move(arena.buffer));
+        if (wrote_storage && submission.guest_memory) {
+            job.written_buffers.push_back(&busy.storage.back().second);
         }
     }
-    uploaded_ranges.clear();
+    storage_arenas.clear();
+    busy.device_storage.reserve(device_arenas.size());
+    for (auto& arena : device_arenas) {
+        busy.device_storage.emplace_back(arena.capacity, std::move(arena.buffer));
+    }
+    device_arenas.clear();
+    device_uploads.clear();
+    for (auto& [range, upload] : storage_uploads) {
+        if (wrote_storage && upload.dirty && submission.guest_memory) {
+            // The spans are rebuilt for the next submission: this one's lists can move.
+            const auto span = storage_spans.lower_bound({range.first, 0});
+            const bool found = span != storage_spans.end() && span->first.first == range.first;
+            // A span in device memory is copied back by the last command buffer.
+            static const bool late = std::getenv("EDEN_NX2_NVN_LATE_WRITEBACK") != nullptr;
+            // A span in device memory is back once the command buffer with its copy ran.
+            // One that moved there after its last write has those bytes in the host buffer
+            // since that write.
+            const u64 done = !upload.readback_buffer ? upload.write_tick
+                             : upload.readback_stale ? 0
+                             : upload.readback_tick  ? upload.readback_tick
+                                                     : upload.write_tick;
+            const u64 tick = late || !done ? job.tick : std::min(done, job.tick);
+            job.writes.push_back({upload.guest_address, range.first, upload.written_bytes,
+                                  upload.readback,
+                                  found ? std::move(span->second.snapshots)
+                                        : std::vector<Range>{},
+                                  tick});
+        }
+    }
     storage_uploads.clear();
+    storage_upload_of.clear();
+    storage_guest_ends.clear();
     buffer_updates.clear();
     reset_indirect_draws.clear();
+    busy.uploads = std::move(uploads);
     uploads.clear();
-    descriptor_pools.clear();
-    samplers.clear();
+    for (auto& chunk : descriptor_chunks) {
+        busy.pools.emplace_back(chunk.reusable, std::move(chunk.pool));
+    }
+    descriptor_chunks.clear();
+    busy.pushed = std::move(push_blocks);
+    push_blocks.clear();
+    push_used = PushBlockEntries;
+    for (const size_t index : active_chunks) {
+        upload_chunks[index].tick = busy.tick;
+        upload_chunks[index].active = false;
+    }
+    active_chunks.clear();
+    job.counters = std::move(counter_events);
+    counter_events.clear();
+    if (!job.submission->guest_memory) {
+        job.writes.clear();
+        job.counters.clear();
+    }
+    {
+        std::scoped_lock lock{retire_mutex};
+        for (const auto& event : job.counters) {
+            if (event.kind == CounterEvent::Kind::Report) {
+                ++pending_reports[event.gpu_address];
+            }
+        }
+        if (!job.counters.empty()) {
+            pending_counter_jobs.fetch_add(1, std::memory_order_relaxed);
+        }
+        job.replay_start_ns = static_cast<u64>(replay_start.time_since_epoch().count());
+        job.push_ns = Core::BananzaNvn2Commands::HostNs();
+        job.first_tick = tick_before;
+        job.draws = draws - draws_before;
+        retire_jobs.push_back(std::move(job));
+    }
+    retire_cv.notify_one();
+    static const bool sync_replay = std::getenv("EDEN_NX2_NVN_SYNC_REPLAY") != nullptr;
+    if (sync_replay) {
+        const auto finish_start = std::chrono::steady_clock::now();
+        WaitRetireIdle();
+        finish_ns += static_cast<u64>((std::chrono::steady_clock::now() - finish_start).count());
+        ++finishes;
+    }
+    ReclaimBusyResources();
+    graphics_constant_uploads.fill({});
+    driver_upload = {};
+    const u64 replay_elapsed =
+        static_cast<u64>((std::chrono::steady_clock::now() - replay_start).count());
+    replay_ns += replay_elapsed;
+    if (profile_replay && replay_elapsed > 13'500'000) {
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 slow replay: seq {} took {:.3f} ms for {} draws: {} pipelines made in "
+                 "{:.3f} ms, {} images made, {} texture uploads in {:.3f} ms, {} ranges with {:.2f} "
+                 "MiB newly kept in VRAM, {} storage buffers made, {} finishes, {:.2f} MiB "
+                 "streamed, {:.3f} ms hashing, {} storage spans moved to device memory",
+                 submission.sequence, replay_elapsed / 1e6, draws - draws_before,
+                 pipeline_creates - slow_before[0], (pipeline_create_ns - slow_before[1]) / 1e6,
+                 image_creates - slow_before[2], texture_uploads - slow_before[3],
+                 (upload_ns - slow_before[4]) / 1e6, fixed_uploads - slow_before[5],
+                 (fixed_upload_bytes - slow_before[6]) / 1048576.0,
+                 storage_creates - slow_before[7], finishes - slow_before[8],
+                 (stream_bytes - slow_before[9]) / 1048576.0, (hash_ns - slow_before[10]) / 1e6,
+                 device_moves - slow_before[11]);
+    }
 }
 
 std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const Texture& texture) {
@@ -3583,6 +5442,54 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
         const auto presents = present_count - last_reported_present;
         LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay: {} draws in {} presents, {} dispatches and {} texture uploads total, {} MiB images",
                  draws - last_reported_draws, presents, dispatches, texture_uploads, image_bytes >> 20);
+        if (profile_replay && presents) {
+            const auto ms = [&](u64 nanoseconds) { return double(nanoseconds) / presents / 1e6; };
+            LOG_INFO(Render_Vulkan, "Bananza NVN 2 replay profile: replay_ms={:.3f} of which finish_ms={:.3f} upload_ms={:.3f}, submissions={:.1f} finishes={:.1f} refetched_MiB={:.2f} (per present)",
+                     ms(replay_ns), ms(finish_ns), ms(upload_ns),
+                     double(replayed_submissions) / presents, double(finishes) / presents,
+                     double(hash_bytes) / presents / 1048576.0);
+            LOG_INFO(Render_Vulkan, "Bananza NVN 2 replay profile: draw_ms={:.3f} dispatch_ms={:.3f}; draw phases decode={:.3f} targets={:.3f} pipeline={:.3f} vertex_index={:.3f} uniforms={:.3f} storage={:.3f} textures={:.3f} descriptors={:.3f} state={:.3f} record={:.3f} (ms per present)",
+                     ms(draw_ns), ms(dispatch_ns), ms(draw_phase_ns[0]), ms(draw_phase_ns[1]),
+                     ms(draw_phase_ns[2]), ms(draw_phase_ns[3]), ms(draw_phase_ns[4]),
+                     ms(draw_phase_ns[5]), ms(draw_phase_ns[6]), ms(draw_phase_ns[7]),
+                     ms(draw_phase_ns[8]), ms(draw_phase_ns[9]));
+        }
+        if (profile_replay && presents) {
+            const double frames = static_cast<double>(presents);
+            LOG_INFO(Render_Vulkan, "Bananza NVN 2 replay profile: stream uploads {:.0f} with {:.2f} MiB, storage buffers {:.0f} new and {:.0f} reused with {:.2f} MiB, occlusion waits {:.1f}, rendering scopes {:.0f}, barriers {:.0f}, replay flushes {:.1f}, event waits {:.3f} ms, {:.1f} signals ({:.1f} waited), {:.0f} draws and {:.0f} dispatches after their submission's last signal, write-back {:.2f} MiB of {:.2f} MiB compared, {:.1f} submissions ended without waiting, {} upload chunks (per present)",
+                     stream_uploads / frames, stream_bytes / frames / 1048576.0,
+                     storage_creates / frames, storage_reuses / frames, storage_bytes / frames / 1048576.0,
+                     occlusion_flushes / frames, rendering_scopes / frames, barriers / frames,
+                     replay_flushes / frames,
+                     event_finish_ns / frames / 1e6, event_signals / frames,
+                     event_signal_waits / frames,
+                     event_tail_draws / frames, event_tail_dispatches / frames,
+                     writeback_bytes.load() / frames / 1048576.0,
+                     writeback_compared.load() / frames / 1048576.0,
+                     replay_flush_ends / frames, upload_chunks.size());
+        LOG_INFO(Render_Vulkan,
+                 "Bananza NVN 2 replay profile: kept in VRAM: {:.0f} ranges reused, {:.0f} uploaded "
+                 "with {:.2f} MiB (per present); {} chunks, {} entries, {} checked against guest "
+                 "memory, {} changed without a flush",
+                 fixed_hits / frames, fixed_uploads / frames, fixed_upload_bytes / frames / 1048576.0,
+                 fixed_chunks.size(), fixed_cache.size(), fixed_checks, fixed_mismatches);
+        LOG_INFO(Render_Vulkan,
+                 "Bananza NVN 2 replay profile: {:.1f} storage spans with {:.1f} KiB in device "
+                 "memory for fragment shaders, {:.1f} of them moved there (per present)",
+                 device_spans / frames, device_span_bytes / frames / 1024.0, device_moves / frames);
+        }
+        fixed_hits = fixed_uploads = fixed_upload_bytes = fixed_checks = 0;
+        device_spans = device_span_bytes = device_moves = 0;
+        stream_uploads = stream_bytes = storage_creates = storage_reuses = storage_bytes = occlusion_flushes = 0;
+        rendering_scopes = barriers = replay_flushes = event_finish_ns = 0;
+        event_signals = event_tail_draws = event_tail_dispatches = 0;
+        writeback_bytes.store(0);
+        writeback_compared.store(0);
+        event_signal_waits = replay_flush_ends = 0;
+        draw_phase_ns = {};
+        draw_ns = dispatch_ns = 0;
+        replay_ns = finish_ns = hash_ns = hash_bytes = upload_ns = 0;
+        replayed_submissions = finishes = 0;
         if (trace_images) {
             for (const auto& [reason, count] : draw_skips) {
                 LOG_INFO(Render_Vulkan, "NVN 2 graphics skipped {} in {} presents: {}", count,
@@ -3759,10 +5666,7 @@ public:
             return std::span{shader.code}.subspan(shader.constant_offset, shader.constant_size);
         }
         if (bank - 3 < uniforms.size()) {
-            const auto data = submission.buffer_snapshots.find(uniforms[bank - 3]);
-            if (data != submission.buffer_snapshots.end()) {
-                return data->second;
-            }
+            return submission.BufferSnapshot(uniforms[bank - 3]);
         }
         return {};
     }
@@ -3976,6 +5880,7 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         return;
     }
     const auto& program = *compute_program;
+    draw_color_writes = ~0U;
     const auto skip = [&](std::string_view reason) {
         ++dispatch_skips[reason];
         if (dispatch_diagnostics.emplace(program.serial, reason).second) {
@@ -3987,7 +5892,7 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         skip("indirect dispatch");
         return;
     }
-    const auto& limits = device.GetPhysical().GetProperties().limits;
+    const auto& limits = device_limits;
     std::array<u32, 3> groups{};
     for (size_t i = 0; i < groups.size(); ++i) {
         if (!op.args[i] || op.args[i] > limits.maxComputeWorkGroupCount[i]) {
@@ -4066,7 +5971,11 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         std::optional<ComputePipeline> compiled;
         environment.missing_texture = false;
         try {
+            const auto create_start = std::chrono::steady_clock::now();
             compiled = CreateComputePipeline(environment);
+            ++pipeline_creates;
+            pipeline_create_ns += static_cast<u64>(
+                (std::chrono::steady_clock::now() - create_start).count());
         } catch (const vk::Exception& e) {
             if (e.GetResult() == VK_ERROR_DEVICE_LOST) {
                 throw;
@@ -4099,13 +6008,13 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
             skip("compute uniform range missing or too large");
             return;
         }
-        const auto buffer = binding.bank >= 3
-                                ? UploadRange(submission, uniform_buffers[stage][binding.bank - 3])
-                                : Upload(bytes);
+        const auto [buffer, buffer_offset] =
+            binding.bank >= 3 ? UploadRange(submission, uniform_buffers[stage][binding.bank - 3])
+                              : UploadStream(bytes);
         if (!buffer) {
             return;
         }
-        uniforms.push_back({buffer, 0, bytes.size()});
+        uniforms.push_back({buffer, buffer_offset, bytes.size()});
     }
     for (const auto& [index, descriptor] : pipeline.storage) {
         auto range = environment.StorageRange(descriptor.cbuf_index, descriptor.cbuf_offset);
@@ -4150,12 +6059,12 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         u64 offset{};
         if (descriptor.is_written) {
             if (const auto [upload, start] = WritableStorage(submission, range); upload) {
-                buffer = *upload->buffer;
-                offset = start;
+                buffer = upload->buffer;
+                offset = upload->base + start;
                 const u64 end = Shader::ResolveStorageWriteExtent(descriptor.write_extent,
                                                                   pipeline.workgroup, groups)
                                     .value_or(range.second);
-                writes_to_buffers.emplace_back(upload, offset + std::min(end, range.second));
+                writes_to_buffers.emplace_back(upload, start + std::min(end, range.second));
             }
         } else {
             std::tie(buffer, offset) = UploadBufferRange(submission, range);
@@ -4165,7 +6074,7 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
                 LOG_WARNING(Render_Vulkan,
                             "NVN 2 compute program {} storage at {:#x}, {} bytes, write {}, snapshot {}, guest mapping {}",
                             program.serial, range.first, range.second, descriptor.is_written,
-                            submission.buffer_snapshots.contains(range),
+                            submission.HasSnapshot(range),
                             submission.storage_addresses.contains(range));
             }
             skip("compute storage buffer range missing");
@@ -4202,29 +6111,12 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
     VkDescriptorSet set{};
     if (pipeline.state.set_layout) {
         const auto& logical = device.GetLogical();
-        std::vector<VkDescriptorPoolSize> sizes;
-        const auto reserve = [&](size_t count, VkDescriptorType type) {
-            if (count) {
-                sizes.push_back({type, static_cast<u32>(count)});
-            }
-        };
-        reserve(uniforms.size(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-        reserve(storage.size(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        reserve(textures.size(), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-        reserve(images_info.size(), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        auto pool = logical.CreateDescriptorPool({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = 1,
-            .poolSizeCount = static_cast<u32>(sizes.size()),
-            .pPoolSizes = sizes.data(),
-        });
-        const VkDescriptorSetLayout set_layout = *pipeline.state.set_layout;
-        set = pool.Allocate({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .descriptorPool = *pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &set_layout,
-        })[0];
+        set = AllocateSet(*pipeline.state.set_layout, uniforms.size(), storage.size(),
+                          textures.size(), images_info.size());
+        if (!set) {
+            skip("descriptor set unavailable");
+            return;
+        }
         std::vector<VkWriteDescriptorSet> writes;
         const auto write_buffers = [&](const auto& infos, VkDescriptorType type) {
             for (const auto& info : infos) {
@@ -4245,10 +6137,9 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         write_images(textures, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         write_images(images_info, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         logical.UpdateDescriptorSets(writes, {});
-        descriptor_pools.push_back(std::move(pool));
     }
     Barrier();
-    scheduler.Record([groups, handle = *pipeline.state.pipeline, pipeline_layout = *pipeline.state.layout,
+    Record([groups, handle = *pipeline.state.pipeline, pipeline_layout = *pipeline.state.layout,
                       set](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, handle);
         if (set) {
@@ -4264,6 +6155,12 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
     }
     for (const auto& [upload, bytes] : writes_to_buffers) {
         upload->written_bytes = std::max(upload->written_bytes, bytes);
+        upload->dirty = true;
+        upload->write_tick = scheduler.CurrentTick();
+        if (upload->readback_buffer) {
+            upload->readback_stale = true;
+            device_readback_pending = true;
+        }
     }
     ++dispatches;
 }

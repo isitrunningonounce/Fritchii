@@ -1128,8 +1128,21 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (Common::Nx2Timeline::Active()) {
             Common::Nx2Timeline::Instant("vkQueueSubmit", {"tick", signal_value});
         }
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const bool timed = trace_submit_times.load(std::memory_order_relaxed);
+        const auto host_ns = [] {
+            return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count());
+        };
+        if (timed) {
+            submit_begin_ns[signal_value % 64].store(host_ns(), std::memory_order_relaxed);
+        }
+        const VkResult submit_result = master_semaphore->SubmitQueue(
+            cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
+        if (timed) {
+            submit_end_ns[signal_value % 64].store(host_ns(), std::memory_order_relaxed);
+        }
+        switch (const VkResult result = submit_result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&

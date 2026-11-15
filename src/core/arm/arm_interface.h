@@ -32,6 +32,7 @@ using WatchpointArray = std::array<Kernel::DebugWatchpoint, Core::Hardware::NUM_
 enum class HaltReason : u64 {
     StepThread = 0x00000001,
     DataAbort = 0x00000004,
+    DeferredThreadSleep = 0x01000000,
     BreakLoop = 0x02000000,
     SupervisorCall = 0x04000000,
     InstructionBreakpoint = 0x08000000,
@@ -61,6 +62,8 @@ public:
 
     // Runs the CPU for one instruction or until an event happens.
     virtual HaltReason StepThread(Kernel::KThread* thread) = 0;
+
+    virtual s64 TakeDeferredSleepNanoseconds() { return 0; }
 
     // Admits a backend-specific mechanism to lock the thread context.
     virtual void LockThread(Kernel::KThread* thread) {}

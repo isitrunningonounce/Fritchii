@@ -52,9 +52,9 @@ public:
     /// Finalize rendering the guest frame and draw into the presentation texture
     virtual void Composite(std::span<const Tegra::FramebufferConfig> layers) = 0;
 
-    virtual void ReplayBananzaNvn2(const Core::BananzaNvn2Commands::Submission& submission) {}
+    virtual void ReplayBananzaNvn2(const Core::BananzaNvn2Commands::Submission& submission);
     virtual void PresentBananzaNvn2(const Core::BananzaNvn2Hle::ResourceTextureInfo& texture,
-                                   const Tegra::FramebufferConfig& config) {}
+                                    const Tegra::FramebufferConfig& config) {}
 
     /// Get the tiled applet layer capture buffer
     virtual std::vector<u8> GetAppletCaptureBuffer() = 0;

@@ -99,6 +99,7 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(EXT, CONDITIONAL_RENDERING, conditional_rendering)                                   \
     EXTENSION(EXT, CONSERVATIVE_RASTERIZATION, conservative_rasterization)                         \
     EXTENSION(EXT, DEPTH_RANGE_UNRESTRICTED, depth_range_unrestricted)                             \
+    EXTENSION(EXT, EXTERNAL_MEMORY_HOST, external_memory_host)                                     \
     EXTENSION(EXT, HDR_METADATA, hdr_metadata)                                                     \
     EXTENSION(EXT, MEMORY_BUDGET, memory_budget)                                                   \
     EXTENSION(EXT, ROBUSTNESS_2, robustness_2)                                                     \

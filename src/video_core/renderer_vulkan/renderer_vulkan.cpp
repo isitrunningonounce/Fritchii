@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fmt/ranges.h>
@@ -26,6 +27,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -290,6 +292,9 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
+    if (bananza_nvn2_replay) {
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
+    }
     scheduler.RegisterOnSubmit([] {});
 #ifdef EGLANTINE_STREAMLINE
     if (Streamline::BananzaFrameGenOwnCopies()) {

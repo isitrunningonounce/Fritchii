@@ -19,6 +19,110 @@ bool Fits(u64 used, u64 added, u64 limit) {
 
 } // Anonymous namespace
 
+Retirement& GetRetirement() {
+    static Retirement retirement;
+    return retirement;
+}
+
+namespace {
+std::mutex snapshot_pool_mutex;
+std::vector<std::unique_ptr<u8[]>> snapshot_pool;
+constexpr size_t MaxPooledSnapshotBlocks = 48;
+} // Anonymous namespace
+
+u8* SnapshotBlocks::Allocate(u64 size) {
+    if (size > BlockBytes / 2) {
+        large.push_back(std::make_unique_for_overwrite<u8[]>(size));
+        return large.back().get();
+    }
+    u64 offset = (used + 63) & ~u64{63};
+    if (offset + size > BlockBytes) {
+        std::unique_ptr<u8[]> block;
+        {
+            std::scoped_lock lock{snapshot_pool_mutex};
+            if (!snapshot_pool.empty()) {
+                block = std::move(snapshot_pool.back());
+                snapshot_pool.pop_back();
+            }
+        }
+        if (!block) {
+            block = std::make_unique_for_overwrite<u8[]>(BlockBytes);
+        }
+        blocks.push_back(std::move(block));
+        offset = 0;
+    }
+    used = offset + size;
+    return blocks.back().get() + offset;
+}
+
+void SnapshotBlocks::Release() {
+    if (!blocks.empty()) {
+        std::scoped_lock lock{snapshot_pool_mutex};
+        for (auto& block : blocks) {
+            if (snapshot_pool.size() < MaxPooledSnapshotBlocks) {
+                snapshot_pool.push_back(std::move(block));
+            }
+        }
+    }
+    blocks.clear();
+    large.clear();
+    used = BlockBytes;
+}
+
+void Retirement::Retire(u64 sequence, bool writes_done) {
+    {
+        std::scoped_lock lock{mutex};
+        if (retired.load(std::memory_order_relaxed) < sequence) {
+            retired.store(sequence, std::memory_order_release);
+        }
+        if (writes_done && written.load(std::memory_order_relaxed) < sequence) {
+            written.store(sequence, std::memory_order_release);
+        }
+    }
+    cv.notify_all();
+}
+
+void Retirement::Wait(u64 sequence) {
+    if (IsRetired(sequence)) {
+        return;
+    }
+    std::unique_lock lock{mutex};
+    cv.wait(lock, [&] { return IsRetired(sequence) || stopped; });
+}
+
+void Retirement::RetireWrites(u64 sequence) {
+    {
+        std::scoped_lock lock{mutex};
+        if (written.load(std::memory_order_relaxed) < sequence) {
+            written.store(sequence, std::memory_order_release);
+        }
+    }
+    cv.notify_all();
+}
+
+void Retirement::WaitWrites(u64 sequence) {
+    if (WritesDone(sequence)) {
+        return;
+    }
+    std::unique_lock lock{mutex};
+    cv.wait(lock, [&] { return WritesDone(sequence) || stopped; });
+}
+
+void Retirement::Start() {
+    std::scoped_lock lock{mutex};
+    stopped = false;
+    retired.store(next.load(std::memory_order_relaxed), std::memory_order_release);
+    written.store(next.load(std::memory_order_relaxed), std::memory_order_release);
+}
+
+void Retirement::Stop() {
+    {
+        std::scoped_lock lock{mutex};
+        stopped = true;
+    }
+    cv.notify_all();
+}
+
 bool Recorder::Initialize(u64 command_buffer) {
     if (command_buffer == 0) {
         return false;
@@ -55,11 +159,15 @@ bool Recorder::SetControlMemory(u64 command_buffer, u64 guest_base, u64 size) {
     }
     const u64 end = guest_base + size;
     if (size != 0) {
-        for (auto handle = live_handles.begin(); handle != live_handles.end();) {
-            if (guest_base < handle->second.control_end && handle->second.control_begin < end) {
-                handle = live_handles.erase(handle);
+        const u64 min_begin = guest_base - std::min(guest_base, max_control_record_bytes);
+        auto record = handles_by_control_begin.lower_bound({min_begin, 0});
+        while (record != handles_by_control_begin.end() && record->first < end) {
+            const auto handle = live_handles.find(record->second);
+            if (guest_base < handle->second.control_end) {
+                live_handles.erase(handle);
+                record = handles_by_control_begin.erase(record);
             } else {
-                ++handle;
+                ++record;
             }
         }
     }
@@ -71,13 +179,14 @@ bool Recorder::SetControlMemory(u64 command_buffer, u64 guest_base, u64 size) {
 }
 
 bool Recorder::Begin(u64 command_buffer) {
-    std::scoped_lock lock{mutex};
+    std::shared_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     if (it == buffers.end() || it->second.state.recording) {
         return false;
     }
     auto& buffer = it->second;
     buffer.operations.clear();
+    buffer.called.clear();
     buffer.command_count = 0;
     buffer.payload_bytes = 0;
     buffer.argument_bytes = 0;
@@ -100,7 +209,7 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
         textures.size() > 9) {
         return false;
     }
-    std::scoped_lock lock{mutex};
+    std::shared_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     if (it == buffers.end() || !it->second.state.recording) {
         return false;
@@ -117,9 +226,12 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
     operation.id = op;
     operation.replay = replay;
     operation.args.assign(args.begin(), args.end());
-    operation.payload.assign(payload.begin(), payload.end());
-    operation.textures.assign(textures.begin(), textures.end());
-    operation.program = std::move(program);
+    if (!payload.empty() || !textures.empty() || program) {
+        operation.extra = std::make_unique<OperationExtra>();
+        operation.extra->payload.assign(payload.begin(), payload.end());
+        operation.extra->textures.assign(textures.begin(), textures.end());
+        operation.extra->program = std::move(program);
+    }
     buffer.operations.push_back(std::move(operation));
     ++buffer.command_count;
     buffer.draw_count += replay >= ReplayOp::Draw && replay <= ReplayOp::DrawIndexedIndirect;
@@ -131,7 +243,7 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
 
 bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u64 command_bytes,
                              bool call) {
-    std::scoped_lock lock{mutex};
+    std::shared_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     if (it == buffers.end() || !it->second.state.recording) {
         return false;
@@ -156,10 +268,11 @@ bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u
         bytes += found->second.recording->payload_bytes;
         depth = std::max(depth, found->second.recording->nesting_depth + 1);
     }
-    buffer.operations.reserve(buffer.operations.size() + handles.size());
     for (const u64 handle : handles) {
         Operation operation;
-        operation.nested = live_handles.at(handle).recording;
+        const auto& recording = live_handles.at(handle).recording;
+        operation.nested = recording.get();
+        buffer.called.push_back(recording);
         buffer.draw_count += operation.nested->draw_count;
         if (call) {
             buffer.called_commands += operation.nested->command_count;
@@ -206,10 +319,13 @@ std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes, u64 gues
     snapshot->copied_commands = buffer.copied_commands;
     snapshot->copied_draws = buffer.copied_draws;
     snapshot->operations = std::move(buffer.operations);
+    snapshot->called = std::move(buffer.called);
     snapshot->command_count = buffer.command_count;
     snapshot->payload_bytes = buffer.payload_bytes;
     snapshot->nesting_depth = buffer.nesting_depth;
     live_handles.emplace(handle, Handle{std::move(snapshot), begin, begin + control_bytes});
+    handles_by_control_begin.emplace(begin, handle);
+    max_control_record_bytes = std::max(max_control_record_bytes, control_bytes);
     if (!guest_handle_offset) {
         ++next_handle;
     }
@@ -219,14 +335,20 @@ std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes, u64 gues
 }
 
 std::optional<State> Recorder::GetState(u64 command_buffer) const {
-    std::scoped_lock lock{mutex};
+    std::shared_lock lock{mutex};
     const auto it = buffers.find(command_buffer);
     return it != buffers.end() ? std::optional{it->second.state} : std::nullopt;
 }
 
 bool Recorder::FinalizeHandle(u64 handle) {
     std::scoped_lock lock{mutex};
-    return live_handles.erase(handle) != 0;
+    const auto found = live_handles.find(handle);
+    if (found == live_handles.end()) {
+        return false;
+    }
+    handles_by_control_begin.erase({found->second.control_begin, handle});
+    live_handles.erase(found);
+    return true;
 }
 
 std::optional<Submission> Recorder::Submit(u64 queue, std::span<const u64> handles) {
@@ -256,7 +378,8 @@ std::optional<Submission> Recorder::Submit(u64 queue, std::span<const u64> handl
     for (const u64 handle : handles) {
         submission.recordings.push_back(live_handles.at(handle).recording);
     }
-    submission.sequence = next_submission++;
+    ++next_submission;
+    submission.sequence = GetRetirement().NextSequence();
     return submission;
 }
 

@@ -54,9 +54,10 @@ bool CountEnabled() {
 }
 
 bool HleEnabled() {
+    // On unless EDEN_NX2_NVN_HLE says otherwise: 0 is the guest SDK, count the call counter.
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_NVN_HLE");
-        return value && std::string_view{value} == "1";
+        return !value || std::string_view{value} == "1";
     }();
     return enabled;
 }

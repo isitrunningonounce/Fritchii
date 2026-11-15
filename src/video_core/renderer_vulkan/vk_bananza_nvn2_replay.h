@@ -3,13 +3,26 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <map>
+#include <source_location>
 #include <optional>
 #include <set>
+#include <stop_token>
+#include <thread>
 #include <string_view>
 #include <tuple>
+#include <cstddef>
+#include <unordered_map>
+#include <vector>
 
+#include <boost/container/flat_map.hpp>
+
+#include "common/container/unordered_set.h"
+#include "common/thread_worker.h"
 #include "core/arm/bananza_nvn2_commands.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
@@ -35,6 +48,7 @@ public:
 
     BananzaNvn2Replay(const Device& device, MemoryAllocator& allocator, Scheduler& scheduler,
                        const PipelineCache& pipeline_cache, FrameDump& frame_dump);
+    ~BananzaNvn2Replay();
     void Replay(const Core::BananzaNvn2Commands::Submission& submission);
     std::optional<Source> PresentSource(const Core::BananzaNvn2Hle::ResourceTextureInfo& texture);
 
@@ -93,7 +107,10 @@ private:
         u64 cpu_hash{};
         u64 cpu_serial{};
         u64 checked_submission{};
+        u64 confirmed_replay_submission{};
         u64 write_version{};
+        // Value of barrier_serial when a draw last wrote the image.
+        u64 written_barrier{};
         u64 allocation_bytes{};
         u64 last_present{};
     };
@@ -103,6 +120,22 @@ private:
         u32 level{};
         u32 layer{};
         u32 layers{1};
+    };
+    using SampledBindingKey = std::tuple<u64, u64, u64>;
+    struct SampledBinding {
+        VkDescriptorImageInfo descriptor;
+        Image* image;
+        const Texture* texture;
+    };
+    struct RenderingScope {
+        std::array<VkImageView, 8> colors;
+        VkImageView depth;
+        u32 color_count;
+        u32 width;
+        u32 height;
+        u32 layers;
+
+        bool operator==(const RenderingScope&) const = default;
     };
     struct FeedbackImage {
         vk::Image image;
@@ -138,8 +171,14 @@ private:
         bool writable;
     };
 
+    union DescriptorData {
+        VkDescriptorBufferInfo buffer;
+        VkDescriptorImageInfo image;
+    };
+
     struct Pipeline {
         vk::DescriptorSetLayout set_layout;
+        vk::DescriptorUpdateTemplate update_template;
         vk::PipelineLayout layout;
         vk::Pipeline pipeline;
         std::vector<UniformBinding> uniforms;
@@ -148,6 +187,16 @@ private:
         std::vector<u32> streams;
         VkShaderStageFlags stages{};
         bool uses_render_area{};
+        bool uses_blend_constants{};
+        bool uses_stencil{};
+        // Colour slots and depth this pipeline can write.
+        u32 color_writes{};
+        bool depth_write{};
+        // The descriptors are pushed with each draw instead of bound as an allocated set.
+        bool push_descriptors{};
+        VkDescriptorSet last_set{};
+        std::vector<DescriptorData> last_descriptors;
+        u64 descriptor_submission{};
     };
 
     struct DrawState {
@@ -184,27 +233,96 @@ private:
         std::array<u32, 3> workgroup;
     };
 
-    struct StorageUpload {
+    // Host memory the spans of one submission are cut from.
+    struct StorageArena {
         vk::Buffer buffer;
+        u64 capacity;
+        u64 used{};
+        u64 flushed{};
+    };
+
+    struct StorageUpload {
+        // The arena's buffer; the span starts at base.
+        VkBuffer buffer;
+        u64 base;
+        u8* mapped;
         u64 guest_address;
+        // Where the write-back reads the span: mapped, or the host region a span in device
+        // memory is copied to (readback_buffer at readback_base).
+        const u8* readback;
+        VkBuffer readback_buffer{};
+        u64 readback_base{};
+        u64 size{};
         u64 written_bytes{};
+        // The scheduler tick of the last command buffer with a write to the span.
+        u64 write_tick{};
+        // Written since the last write-back.
+        bool dirty{};
+        // A span in device memory: written since its bytes were last copied to the host
+        // buffer, and the tick of the command buffer with that copy.
+        bool readback_stale{};
+        u64 readback_tick{};
+        // Offsets draws wrote since the barrier with this serial, merged.
+        u64 written_barrier{};
+        boost::container::small_flat_map<u64, u64, 2> fresh;
     };
 
     struct StorageSpan {
         Range range;
         u64 guest_address;
         std::vector<Range> snapshots;
+        // The span's buffer once a binding needed it.
+        StorageUpload* upload{};
     };
 
     struct BufferUpdate {
         u64 address;
         std::span<const u8> bytes;
     };
+    static constexpr u64 BufferUpdatePageSize = 4096;
+
+    // Host-visible memory shared by the uploads of one submission.
+    struct UploadChunk {
+        vk::Buffer buffer;
+        u64 used{};
+        // Last tick of the submission that used the chunk.
+        u64 tick{};
+        bool active{};
+    };
+
+    // Released by a submission whose commands may still run on the GPU.
+    struct BusyResources {
+        u64 tick;
+        // Retired after the tick: storage and query results are read until then.
+        u64 sequence;
+        // Zero or one buffer; a vector keeps its address when the entry moves.
+        std::vector<vk::Buffer> query_results;
+        std::vector<std::pair<u64, vk::Buffer>> storage;
+        std::vector<std::pair<u64, vk::Buffer>> device_storage;
+        std::vector<std::pair<bool, vk::DescriptorPool>> pools;
+        std::vector<std::unique_ptr<DescriptorData[]>> pushed;
+        std::vector<vk::Buffer> uploads;
+    };
+
+    // Descriptors left in a pool shared by the draws of one submission.
+    struct DescriptorChunk {
+        vk::DescriptorPool pool;
+        u32 sets{};
+        u32 uniforms{};
+        u32 storage{};
+        u32 textures{};
+        u32 images{};
+        bool reusable{};
+    };
+
+    using BufferRef = std::pair<VkBuffer, u64>;
 
     Image* FindImage(const Texture& texture, bool create);
     bool ReserveImageBytes(u64 bytes);
     VkImageView GetAttachmentView(Image& image, const AttachmentView& view);
     void ReplayRecording(const Recording& recording, const Submission& submission);
+    void BindBufferRange(bool storage, u32 stage, u32 slot, Range range);
+    BufferRef UploadDriverConstants(u32 base_instance);
     void ClearColor(const Operation& operation);
     void ClearDepthStencil(const Operation& operation);
     void CopyTexture(const Operation& operation, const Submission& submission);
@@ -213,7 +331,81 @@ private:
     bool ResetIndirectDraws(const DrawState& draw, const Submission& submission);
     void ReplayEvent(const Operation& operation, const Submission& submission);
     void ReplayCounter(const Operation& operation, const Submission& submission);
+    // Counter resets and reports, and the event signals behind them, in recording order.
+    // Queries before an event's query index count toward the next report.
+    struct CounterEvent {
+        enum class Kind : u8 { Reset, Report, Signal } kind;
+        u32 query;
+        Core::Memory::Memory* memory;
+        u64 guest_address;
+        u64 gpu_address;
+        u64 submitted_ns;
+        u32 value;
+        bool add;
+    };
+    // Reads this submission's queries now; earlier submissions are retired first.
     void CollectOcclusion();
+    void ApplyCounterEvents(std::span<const u64> results, std::span<const CounterEvent> events,
+                            u32 queries);
+    void RetireLoop(std::stop_token token);
+    void WaitRetireIdle();
+    void ProbeHostImport(const u8* pointer, u64 size);
+    // Storage buffer fills run on worker threads; WaitCopies() before the GPU can use them.
+    struct CopyJob {
+        u8* dest;
+        const u8* source;
+        u64 size;
+    };
+    std::vector<CopyJob> copy_jobs;
+    u64 copy_job_bytes{};
+    void DispatchCopies();
+    void WaitCopies();
+    u32 import_probes{};
+
+    struct WriteBack {
+        u64 guest_address;
+        u64 base;
+        u64 bytes;
+        const u8* data;
+        std::vector<Range> snapshots;
+        // The GPU is done with the span after this tick.
+        u64 tick{};
+    };
+    // One GPU timestamp of the pass trace: taken when all earlier work has finished.
+    struct PassLabel {
+        u64 target;
+        u32 width;
+        u32 height;
+        u64 program;
+        u64 draws;
+        // 1 targets changed, 2 samples an image written in the scope, 4 and 8 storage writes,
+        // 16 the scope had been ended by other work, 32 before a flush, 64 after a flush.
+        u32 reason;
+        // What the draw sampled that the scope had written: 1 depth, 2 a colour target, 4 other.
+        u32 fresh;
+        u32 fresh_slot;
+        u64 storage;
+        u64 storage_size;
+    };
+    struct RetireJob {
+        u64 tick;
+        u64 sequence;
+        std::shared_ptr<const Submission> submission;
+        std::vector<WriteBack> writes;
+        // The arenas the writes read from.
+        std::vector<const vk::Buffer*> written_buffers;
+        std::vector<CounterEvent> counters;
+        u32 queries;
+        const vk::Buffer* query_results;
+        u64 replay_start_ns;
+        u64 push_ns;
+        u64 first_tick;
+        u64 draws;
+        std::vector<PassLabel> pass_labels;
+        std::map<u32, u32> scope_end_sites;
+        u64 pass_end_draws;
+    };
+    void ReportPassTimes(const RetireJob& job);
     void Dispatch(const Operation& operation, const Submission& submission);
     std::optional<ComputePipeline> CreateComputePipeline(ComputeEnvironment& environment);
     std::optional<VkDescriptorImageInfo> BindStorageImage(
@@ -222,12 +414,22 @@ private:
     std::optional<DrawState> DecodeDraw(const Operation& operation) const;
     std::optional<Pipeline> CreatePipeline(const ColorFormats& formats, u32 color_count,
                                            VkPrimitiveTopology topology, const RasterState& raster);
-    VkBuffer UploadRange(const Submission& submission, Range range);
-    VkBuffer Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage = 0);
+    BufferRef UploadRange(const Submission& submission, Range range);
+    VkBuffer Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage = 0,
+                    std::optional<u64> patch_address = std::nullopt);
+    BufferRef UploadStream(std::span<const u8> bytes,
+                           std::optional<u64> patch_address = std::nullopt);
+    VkDescriptorSet AllocateSet(VkDescriptorSetLayout layout, size_t uniforms, size_t storage,
+                                size_t textures, size_t images);
+    VkFormatFeatureFlags2 FormatFeatures(VkFormat format);
     std::map<Range, StorageUpload>::iterator FindStorageRange(Range range);
     void CollectStorageSpans(const Submission& submission);
+    void AddBufferUpdate(u64 address, std::span<const u8> bytes);
+    void ApplyBufferUpdates(u64 address, std::span<u8> bytes) const;
+    bool HasBufferUpdates(Range range) const;
     std::pair<VkBuffer, u64> UploadBufferRange(const Submission& submission, Range range);
     std::pair<StorageUpload*, u64> WritableStorage(const Submission& submission, Range range);
+    std::pair<StorageUpload*, u64> CreateStorageUpload(const Submission& submission, Range range);
     void WriteBackStorage(const Submission& submission);
     std::optional<VkDescriptorImageInfo> BindTexture(const Submission& submission, u32 stage,
                                                     const Shader::TextureDescriptor& descriptor,
@@ -241,7 +443,13 @@ private:
     void TraceImage(std::string_view operation, const Texture& texture, u64 detail = 0);
     VkRect2D ScissorFor(VkExtent2D extent) const;
     void Initialize(Image& image);
-    void Barrier();
+    void Barrier(std::source_location location = std::source_location::current());
+    UploadChunk& NextUploadChunk();
+    void ReclaimBusyResources();
+    void EndRendering();
+    // Draws record directly. Other replay commands end the active rendering scope.
+    template <typename T>
+    void Record(T&& command, std::source_location location = std::source_location::current());
 
     const Device& device;
     MemoryAllocator& allocator;
@@ -249,6 +457,12 @@ private:
     const PipelineCache& pipeline_cache;
     FrameDump& frame_dump;
     std::map<ImageKey, Image> images;
+    // The images found last, in front of the map.
+    struct ImageMemo {
+        ImageKey key{};
+        Image* image{};
+    };
+    std::array<ImageMemo, 1024> image_memo{};
     std::map<const Image*, FeedbackImage> feedback_images;
     std::map<const Image*, DepthComparisonImage> depth_comparison_images;
     std::array<std::optional<Texture>, 8> colors;
@@ -259,11 +473,13 @@ private:
     std::array<u32, 32> vertex_strides{};
     std::array<u32, 32> vertex_divisors{};
     std::array<Range, 32> vertex_buffers{};
+    std::array<BufferRef, 32> vertex_uploads{};
     std::array<std::array<Range, 32>, 6> uniform_buffers{};
     std::array<std::array<Range, 32>, 6> storage_buffers{};
     std::array<std::array<u64, 64>, 6> texture_handles{};
     std::array<std::array<u64, 32>, 6> image_handles{};
     std::array<std::array<u8, 256>, 8> graphics_constants{};
+    std::array<BufferRef, 8> graphics_constant_uploads{};
     std::array<std::array<u8, 256>, 8> compute_constants{};
     ColorState color_state{};
     RasterState raster_state{};
@@ -286,18 +502,105 @@ private:
     bool render_enabled{true};
     bool origin_lower_left{};
     std::map<PipelineKey, std::optional<Pipeline>> pipelines;
+    decltype(pipelines)::iterator last_pipeline = pipelines.end();
     std::map<u64, std::vector<ComputePipeline>> compute_pipelines;
-    std::map<Range, VkBuffer> uploaded_ranges;
+    Common::unordered_map<Range, BufferRef> uploaded_ranges;
+    // Ranges kept in VRAM between submissions, by host address and size.
+    struct FixedEntry {
+        BufferRef buffer;
+        u64 pool;
+        u64 stamp;
+        u64 hash;
+    };
+    struct FixedChunk {
+        vk::Buffer buffer;
+        u64 used{};
+    };
+    Common::unordered_map<Range, FixedEntry> fixed_cache;
+    std::vector<FixedChunk> fixed_chunks;
+    u64 fixed_hits{};
+    u64 fixed_uploads{};
+    u64 fixed_upload_bytes{};
+    u64 fixed_checks{};
+    u64 fixed_mismatches{};
+    u64 fixed_check_budget{};
+    BufferRef FixedUpload(std::span<const u8> bytes, u64 pool, u64 stamp);
     std::map<Range, StorageUpload> storage_uploads;
+    // Counts the events after which a range may resolve to another buffer than before.
+    u64 upload_generation{1};
+    // What each uniform slot bound last, so a slot that repeats a range skips the lookups.
+    struct UploadMemo {
+        Range range{};
+        BufferRef ref{};
+        u64 generation{};
+    };
+    std::array<std::array<UploadMemo, 32>, 8> uniform_upload_memo{};
+    // Drops the slots whose last range overlaps [begin, end): the others resolve as before.
+    void ForgetUploads(u64 begin, u64 end) {
+        for (auto& stage : uniform_upload_memo) {
+            for (auto& memo : stage) {
+                if (memo.range.first < end && begin < memo.range.first + memo.range.second) {
+                    memo.generation = 0;
+                }
+            }
+        }
+    }
+    // The same uploads by their exact range, for the lookup every bound range makes.
+    Common::unordered_map<Range, StorageUpload*> storage_upload_of;
+    std::vector<StorageArena> storage_arenas;
+    // Device memory for spans a fragment shader binds first, and those spans.
+    std::vector<StorageArena> device_arenas;
+    std::vector<StorageUpload*> device_uploads;
+    std::map<u64, std::vector<vk::Buffer>> free_device_storage;
+    u64 free_device_bytes{};
+    bool storage_for_fragment{};
+    u64 device_spans{};
+    u64 device_span_bytes{};
+    u64 device_moves{};
+    void RecordStorageReadback(bool flush = false);
+    // The submission's large copies; the fill jobs wait for them.
+    std::shared_ptr<Core::BananzaNvn2Commands::Submission::CopyState> late_copies;
+    // A span in device memory was written and not copied back yet.
+    bool device_readback_pending{};
+    std::pair<VkBuffer, u64> AllocateDeviceStorage(u64 aligned, u8*& mapped);
+    void MoveStorageToDevice(StorageUpload& upload);
+    // Every storage range of the submission to its span; used while no two spans overlap.
+    Common::unordered_map<Range, StorageSpan*> storage_span_of;
+    bool storage_spans_disjoint{};
+    bool storage_guest_disjoint{};
+    void NoteStorageRead(const StorageUpload& upload, u64 offset, u64 size);
+    StorageSpan* BoundSpan(Range range);
     std::map<Range, StorageSpan> storage_spans;
+    std::map<u64, u64> storage_guest_ends;
+    std::map<u64, std::vector<vk::Buffer>> free_storage_buffers;
+    u64 free_storage_bytes{};
     vk::Buffer unbound_storage;
     std::map<VkImageViewType, UnboundTexture> unbound_textures;
     vk::Sampler unbound_texture_sampler;
-    std::vector<BufferUpdate> buffer_updates;
-    std::set<u64> reset_indirect_draws;
+    std::map<u64, std::vector<BufferUpdate>> buffer_updates;
+    Common::unordered_set<u64> reset_indirect_draws;
     std::vector<vk::Buffer> uploads;
-    std::vector<vk::DescriptorPool> descriptor_pools;
-    std::vector<vk::Sampler> samplers;
+    std::vector<vk::DescriptorPool> free_descriptor_pools;
+    std::vector<UploadChunk> upload_chunks;
+    std::vector<size_t> active_chunks;
+    std::vector<BusyResources> busy_resources;
+    u64 replay_flush_ends{};
+    u64 upload_alignment{};
+    std::vector<DescriptorChunk> descriptor_chunks;
+    // The data of pushed descriptors, read when the draw's commands are recorded.
+    static constexpr size_t PushBlockEntries = 16384;
+    std::vector<std::unique_ptr<DescriptorData[]>> push_blocks;
+    std::vector<std::unique_ptr<DescriptorData[]>> free_push_blocks;
+    size_t push_used{PushBlockEntries};
+    std::map<std::array<u32, 17>, vk::Sampler> sampler_cache;
+    Common::unordered_map<SampledBindingKey, SampledBinding> sampled_bindings;
+    std::unordered_map<VkFormat, VkFormatFeatureFlags2> format_features;
+    VkPhysicalDeviceLimits device_limits{};
+    VkPhysicalDeviceFeatures device_features{};
+    std::array<u8, 0x1000> driver_constants{};
+    u32 driver_base_instance{};
+    BufferRef driver_upload{};
+    bool driver_storage_dirty{true};
     u64 image_bytes{};
     u64 clears{};
     u64 copies{};
@@ -306,6 +609,23 @@ private:
     u64 texture_uploads{};
     u64 last_reported_draws{};
     u64 last_reported_present{};
+    // Replay thread time since the last report, in nanoseconds.
+    u64 replay_ns{};
+    u64 finish_ns{};
+    u64 hash_ns{};
+    u64 hash_bytes{};
+    u64 upload_ns{};
+    // Totals for the slow-replay line.
+    u64 pipeline_creates{};
+    u64 pipeline_create_ns{};
+    u64 image_creates{};
+    u64 replayed_submissions{};
+    u64 finishes{};
+    // Draw phases: decode, targets, pipeline, vertex and index data, uniforms, storage,
+    // textures, descriptor set, state, record.
+    std::array<u64, 10> draw_phase_ns{};
+    u64 draw_ns{};
+    u64 dispatch_ns{};
     std::chrono::steady_clock::time_point next_replay_report{
         std::chrono::steady_clock::now() + std::chrono::seconds{10}};
     u64 present_count{};
@@ -314,21 +634,84 @@ private:
     std::map<std::string_view, u64> dispatch_skips;
     std::set<u64> missing_event_waits;
     std::set<u64> unsupported_counters;
-    static constexpr u32 OcclusionQueryCount = 256;
+    static constexpr u32 OcclusionQueryCount = 4096;
     vk::QueryPool occlusion_pool;
+    static constexpr u32 PassTraceQueries = 8192;
+    bool pass_trace{};
+    bool pass_trace_active{};
+    vk::QueryPool pass_trace_pool;
+    std::vector<PassLabel> pass_trace_labels;
+    std::atomic<bool> pass_trace_busy{};
+    std::chrono::steady_clock::time_point pass_trace_next{};
+    void PassTimestamp(PassLabel label, bool top = false);
+    const Image* fresh_image{};
+    // A binding of this draw overlaps storage a draw wrote since the last barrier.
+    bool storage_fresh{};
+    // Colour slots the current draw's pipeline writes.
+    u32 draw_color_writes{~0U};
+    std::map<u32, u32> scope_end_sites;
+    Range traced_storage{};
     u32 occlusion_queries{};
-    u64 occlusion_samples{};
+    std::vector<CounterEvent> counter_events;
+    std::vector<vk::Buffer> free_query_results;
     bool count_samples{};
+    // The game reported twice without a reset in between: keep counting after a report.
+    bool cumulative_reports{};
+    u64 occlusion_flushes{};
+    std::optional<RenderingScope> rendering_scope;
+    VkPipeline scope_pipeline{};
+    VkDescriptorSet scope_descriptor_set{};
+    std::array<BufferRef, 32> scope_vertices{};
+    std::tuple<VkBuffer, u64, VkIndexType> scope_index{};
+    bool scope_wrote_storage{};
+    u64 rendering_scopes{};
+    u64 next_flush_draw{~u64{}};
+    u64 replay_flushes{};
+    std::chrono::steady_clock::time_point next_replay_flush{};
+    // Rendering scopes begun since the last flush.
+    u32 flush_scopes{};
+    u64 barrier_serial{1};
+    bool sampled_fresh{};
+    u64 barriers{};
+    u64 event_finish_ns{};
+    std::atomic<u64> writeback_bytes{};
+    u64 event_signal_waits{};
+    std::atomic<u64> writeback_compared{};
+    u64 event_signals{};
+    u64 event_tail_draws{};
+    u64 event_tail_dispatches{};
+    std::optional<std::pair<u64, u64>> last_event_signal;
+    u64 storage_bytes{};
+    u64 storage_creates{};
+    u64 storage_reuses{};
+    u64 stream_bytes{};
+    u64 stream_uploads{};
     bool precise_queries{};
     std::set<std::tuple<u32, u32, u32>> unsupported_color_formats;
     std::set<std::tuple<std::string_view, GPUVAddr, u64>> traced_images;
     std::set<std::tuple<GPUVAddr, u32, u32>> captured_inputs;
     bool trace_images{};
+    bool profile_replay{};
     bool replay_logged{};
     bool missing_draw_logged{};
     std::set<std::pair<u64, std::string_view>> dispatch_diagnostics;
     bool missing_source_logged{};
     bool image_budget_logged{};
+
+    // Retire thread state, under retire_mutex. Declared last so the thread stops first.
+    std::mutex retire_mutex;
+    std::condition_variable_any retire_cv;
+    std::condition_variable retire_idle_cv;
+    std::deque<RetireJob> retire_jobs;
+    bool retire_running{};
+    // Samples since the last counter reset, as of the last applied query.
+    u64 counted_samples{};
+    // Reports of queued jobs, by GPU address, that a conditional render may read.
+    std::unordered_map<u64, u32> pending_reports;
+    std::atomic<u32> pending_counter_jobs{};
+    Common::ThreadWorker copy_workers{3, "NvnFill"};
+    Common::ThreadWorker retire_workers{3, "NvnWriteBack"};
+    std::jthread retire_thread;
 };
 
 } // namespace Vulkan

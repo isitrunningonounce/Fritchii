@@ -9,6 +9,7 @@
 #include "common/logging.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/arm/bananza_nvn2_commands.h"
 #include "video_core/renderer_base.h"
 
 namespace VideoCore {
@@ -20,6 +21,10 @@ RendererBase::RendererBase(Core::Frontend::EmuWindow& window_,
 }
 
 RendererBase::~RendererBase() = default;
+
+void RendererBase::ReplayBananzaNvn2(const Core::BananzaNvn2Commands::Submission& submission) {
+    Core::BananzaNvn2Commands::GetRetirement().Retire(submission.sequence);
+}
 
 void RendererBase::RefreshBaseSettings() {
     UpdateCurrentFramebufferLayout();

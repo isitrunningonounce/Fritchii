@@ -52,7 +52,7 @@ public:
     void Composite(std::span<const Tegra::FramebufferConfig> framebuffers) override;
     void ReplayBananzaNvn2(const Core::BananzaNvn2Commands::Submission& submission) override;
     void PresentBananzaNvn2(const Core::BananzaNvn2Hle::ResourceTextureInfo& texture,
-                           const Tegra::FramebufferConfig& config) override;
+                            const Tegra::FramebufferConfig& config) override;
 
     std::vector<u8> GetAppletCaptureBuffer() override;
 

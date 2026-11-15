@@ -2651,6 +2651,7 @@ private:
     void QueryDisplayHdrStatus(HLERequestContext& ctx) {
         const auto output = HostHdrOutput();
         m_told_hdr = output.enabled;
+        Common::DisplayHdrMonitor::Instance().SetGuestToldHdr(output.enabled);
         TipcReplyWords(ctx, {output.enabled ? 2U : 1U, 0, output.peak_luminance});
     }
 

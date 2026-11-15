@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <atomic>
 #include <memory>
 #include "common/container/unordered_map.h"
@@ -62,6 +64,7 @@ public:
     u64 GetCNTPCT() override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
+    void DispatchNvn2FromJit(size_t index, size_t integer_count, size_t float_count);
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
@@ -74,6 +77,7 @@ public:
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
     u64 m_nvn2_thread_id{};
+    std::chrono::steady_clock::time_point m_present_deadline{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;
@@ -91,6 +95,7 @@ public:
 
     HaltReason RunThread(Kernel::KThread* thread) override;
     HaltReason StepThread(Kernel::KThread* thread) override;
+    s64 TakeDeferredSleepNanoseconds() override;
 
     void GetContext(Kernel::Svc::ThreadContext& ctx) const override;
     void SetContext(const Kernel::Svc::ThreadContext& ctx) override;

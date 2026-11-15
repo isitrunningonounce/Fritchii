@@ -60,8 +60,7 @@ constexpr u32 PageAlignSize(u32 size) {
 
 void SetUpBananzaNvn2(Core::System& system, Kernel::KProcess& process, const NSOHeader& header,
                       std::span<const u8> image, VAddr base, bool debugger_enabled) {
-    const char* value = std::getenv("EDEN_NX2_NVN_HLE");
-    if (!value || process.GetProgramId() != Settings::DonkeyKongBananzaProgramId) {
+    if (process.GetProgramId() != Settings::DonkeyKongBananzaProgramId) {
         return;
     }
     const bool hle = Core::BananzaNvn2Trace::HleEnabled();

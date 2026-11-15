@@ -627,7 +627,8 @@ static void A64GetSetElimination(IR::Block& block) {
             if (ReadsFromCPSR(opcode) || WritesToCPSR(opcode)) {
                 nzcv_info = {};
             }
-            if (ReadsFromCoreRegister(opcode) || WritesToCoreRegister(opcode)) {
+            if (ReadsFromCoreRegister(opcode) || WritesToCoreRegister(opcode) ||
+                opcode == IR::Opcode::CallHostFunction) {
                 reg_info = {};
                 vec_info = {};
                 sp_info = {};

@@ -7,15 +7,19 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "common/reader_mutex.h"
 #include "common/common_types.h"
+#include "common/thread_worker.h"
 #include "core/arm/bananza_nvn2_commands.h"
 #include "core/arm/bananza_nvn2_resources.h"
+#include "core/hle/service/nx2_present_pacer.h"
 
 namespace Core {
 class System;
@@ -55,26 +59,34 @@ public:
     bool IsCallbackReturn(u64 pc) const;
     u64 CallbackReturn() const;
     bool UsesGuestStateHelper(size_t index) const;
+    std::optional<std::pair<size_t, size_t>> DirectCallArguments(size_t index) const;
     bool ReturnsFloat(size_t index) const;
     bool ProfilesCalls() const;
-    void ProfileCall(size_t index, std::string_view name, u64 nanoseconds, bool continuation);
+    void ProfileCall(size_t index, std::string_view name, u64 nanoseconds, bool continuation,
+                     u64 thread);
     std::optional<GuestCallback> BeginCallback(u64 thread, size_t procedure, const GuestCall& call,
                                                u64 link);
     std::optional<CallbackContinuation> EndCallback(u64 thread);
     u64 Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& memory, size_t index,
-                 const GuestCall& call);
+                 const GuestCall& call, std::chrono::steady_clock::time_point* present_deadline = nullptr);
     void Finish();
 
 private:
     enum class Handler : u8 { Resource, Device, Pool, Buffer, Queue, Window, SyncEvent, Command,
-                              GetProcAddress, GetTextureHandle };
+                              GetProcAddress, GetTextureHandle, GetPoolFlags, GetBufferAddress,
+                              MapBuffer };
     struct Procedure {
         std::string_view name;
         Handler handler{};
         bool guest_helper{};
         bool float_return{};
         bool begins_recording{};
+        // Touches only its own command buffer, so it records without the session mutex.
+        bool per_buffer_command{};
         bool ends_recording{};
+        bool appends_handles{};
+        bool calls_handles{};
+        bool binds_deferred_textures{};
         const void* scalar_command{};
         const void* state_binding{};
     };
@@ -92,6 +104,9 @@ private:
         u64 size{};
         u64 gpu_address{};
         u32 flags{};
+        u64 serial{};
+        // Newest FlushMappedRange over each 64 KiB of the pool; empty until the first flush.
+        mutable std::vector<u64> flush_stamps;
     };
 
     struct Buffer {
@@ -112,6 +127,8 @@ private:
         u64 primary{};
         u64 flush_threshold{};
         u64 fence{};
+        u64 sequence{};
+        u64 submit_host_ns{};
         u64 texture_pool{};
         u64 sampler_pool{};
         u64 copy_row_stride{};
@@ -120,6 +137,9 @@ private:
         std::array<std::array<std::pair<u64, u64>, 32>, 6> storage_ranges{};
         std::array<std::array<u64, 64>, 6> texture_handles{};
         std::array<std::array<u64, 32>, 6> image_handles{};
+        // Serials of the bound render targets, colors then depth.
+        std::array<u64, 9> target_serials{};
+        bool targets_noted{};
         bool resets_indirect_draws{};
         u32 flags{};
         bool rejected_submit{};
@@ -130,6 +150,8 @@ private:
     struct Sync {
         u64 device{};
         u64 fence{};
+        u64 sequence{};
+        u64 submit_host_ns{};
         SyncStatus status{};
     };
 
@@ -167,6 +189,18 @@ private:
         bool control_callback{true};
     };
 
+    struct TextureCheck {
+        u64 hash{};
+        u64 present{};
+        u64 map_generation{};
+        // Pool serial and newest flush over the texture when it was hashed; 0 without the flush rule.
+        u64 flush_key{};
+    };
+    struct TextureCopyStat {
+        u64 count{};
+        u64 bytes{};
+    };
+
     struct MissingCall {
         u64 calls{};
         u64 reported{};
@@ -197,11 +231,50 @@ private:
         std::string_view name;
         u64 calls{};
         u64 nanoseconds{};
+        u64 lock_wait{};
+    };
+
+    struct ThreadStats {
+        u64 calls{};
+        u64 nanoseconds{};
+    };
+
+    // Written under the session mutex.
+    struct SubmitStats {
+        u64 submits{};
+        u64 waits{};
+        u64 scan_ns{};
+        u64 texture_ns{};
+        u64 copy_wait_ns{};
+        u64 wait_ns{};
+        u64 buffer_bytes{};
+        u64 texture_bytes{};
+        u64 buffer_ranges{};
+        u64 textures{};
+        u64 overlap_waits{};
+        u64 overlap_wait_ns{};
+        u64 present_waits{};
+        u64 present_wait_ns{};
+        u64 referenced_bytes{};
+        u64 referenced_ranges{};
+        u64 texture_hashes{};
+        u64 texture_hash_bytes{};
+        u64 texture_flush_skips{};
+        u64 fixed_bytes{};
+        u64 fixed_ranges{};
+        std::map<u32, u64> referenced_by_flags;
+        u64 sync_waits{};
+        u64 sync_timeouts{};
+        u64 sync_age_ns{};
+        u64 sync_fence_ns{};
+        u64 sync_retire_ns{};
     };
 
     struct CallProfile {
         std::mutex mutex;
         std::array<CallStats, 726> entries;
+        std::map<u64, ThreadStats> threads;
+        SubmitStats submit;
         u64 presents{};
     };
 
@@ -212,18 +285,25 @@ private:
     std::optional<u64> HandleBuffer(Memory::Memory& memory, std::string_view name,
                                     const GuestCall& call);
     std::optional<u64> HandleQueue(Memory::Memory& memory, std::string_view name,
-                                   const GuestCall& call);
+                                  const GuestCall& call, std::unique_lock<std::mutex>& lock,
+                                  std::chrono::steady_clock::time_point* present_deadline);
     std::optional<u64> HandleWindow(Memory::Memory& memory, std::string_view name,
                                     const GuestCall& call);
     std::optional<u64> HandleSyncEvent(Memory::Memory& memory, std::string_view name,
-                                       const GuestCall& call);
+                                       const GuestCall& call, std::unique_lock<std::mutex>& lock);
     bool MapVirtual(Memory::Memory& memory, const GuestCall& call);
     std::optional<ResourcePoolInfo> GetPool(u64 address) const;
-    std::optional<u64> ResolveGpuRange(u64 address, u64 size) const;
+    std::optional<u64> ResolveGpuRange(u64 address, u64 size,
+                                       const Pool** backing = nullptr) const;
+    // The pool that backs a GPU address: the physical pool behind a virtual one.
+    const Pool* BackingPool(u64 address) const;
     void SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Submission& submission,
                            Queue& queue);
+    // Waits for the pending submissions that may write back into [guest, guest + size).
+    void WaitForPendingWrites(u64 guest, u64 size, const char* reason);
     std::optional<u64> HandleCommands(Memory::Memory& memory, size_t index,
                                       std::string_view name, const GuestCall& call);
+    std::optional<bool> RecordCommand(Memory::Memory& memory, size_t index, const GuestCall& call);
     std::optional<u64> HandleCommandPayload(Memory::Memory& memory, size_t index,
                                             std::string_view name, const GuestCall& call);
     void UpdateCommandCursor(Memory::Memory& memory, u64 address, const CommandBuffer& object);
@@ -240,10 +320,45 @@ private:
     const u64 callback_return;
     std::vector<Procedure> procedures;
     System& system;
+    // Copies of bound buffer ranges made while a submit scans its commands.
+    // When the game thread began the frame it is working on (the end of its last pacing wait).
+    std::chrono::steady_clock::time_point perf_frame_begin{};
+    Common::ThreadWorker copy_workers{8, "NvnCopy"};
+    // Copies that may finish after the replay of their submission has started.
+    Common::ThreadWorker late_copy_workers{4, "NvnLate"};
     std::mutex mutex;
+    Common::ReaderMutex pool_buffer_mutex;
+    // Guards resources and events against per-buffer commands that run without the session
+    // mutex. Writers also hold the session mutex.
+    Common::ReaderMutex resource_mutex;
+    std::mutex missing_mutex;
+    // If a call also needs session state, acquire the session mutex first.
+    // Shared for recording into one command buffer, exclusive for everything else.
+    Common::ReaderMutex command_mutex;
+    u64 pending_storage_fence{};
+    // Guest ranges a submission may write back once its replay ends, start to end, disjoint.
+    struct PendingWrites {
+        u64 fence;
+        u64 sequence;
+        std::map<u64, u64> ranges;
+    };
+    std::vector<PendingWrites> pending_writes;
+    std::vector<u64> present_fences;
+    u32 logged_overlaps{};
+    Service::Nx2PresentPacer present_pacer;
+    std::chrono::nanoseconds present_period{};
     std::unordered_map<u64, Device> devices;
     std::unordered_map<u64, Pool> pools;
     std::map<u64, u64> gpu_pools;
+    // The pools with CPU storage by GPU address, for the submit scan; rebuilt when stale.
+    struct PoolSpan {
+        u64 begin;
+        u64 size;
+        u64 storage;
+        const Pool* pool;
+    };
+    std::vector<PoolSpan> pool_spans;
+    bool pool_spans_stale{true};
     std::unordered_map<u64, VirtualPage> virtual_pages;
     std::unordered_map<u64, Buffer> buffers;
     std::unordered_map<u64, Queue> queue_builders;
@@ -257,6 +372,24 @@ private:
     std::unordered_map<u64, std::vector<CallbackContinuation>> callback_continuations;
     BananzaNvn2Commands::Recorder recorder;
     Resources resources;
+    // Textures an earlier submission drew, cleared or copied into: their bytes come from replay.
+    std::unordered_set<u64> gpu_written_textures;
+    // Hash of each CPU-filled texture when it was last sent, and the frame it was checked in.
+    std::unordered_map<u64, TextureCheck> texture_checks;
+    using TextureReplayKey = std::tuple<u64, u32, u32, u32, u32, u32, u32, u32, u64>;
+    std::map<TextureReplayKey, std::shared_ptr<BananzaNvn2Commands::TextureReplayState>> texture_replay_states;
+    std::map<u64, TextureCopyStat> texture_copy_stats;
+    std::vector<u8> texture_scratch;
+    // The textures the last submit hashed: the next one starts their hashes ahead.
+    struct HashedTexture {
+        u64 serial;
+        u64 guest;
+        u64 size;
+    };
+    std::vector<HashedTexture> hashed_textures;
+    u64 present_serial{1};
+    // Counts nvnMemoryPoolMapVirtual calls: the way a pool without CPU access gets new bytes.
+    u64 virtual_map_generation{};
     std::map<std::string, MissingCall, std::less<>> missing;
     std::optional<RecordingStats> recording_stats;
     std::optional<CallProfile> call_profile;
@@ -265,6 +398,11 @@ private:
     std::chrono::steady_clock::time_point next_report =
         std::chrono::steady_clock::now() + std::chrono::seconds{10};
     u64 next_gpu_address = 0x1000000000ULL;
+    u64 pool_serial{};
+    u64 flush_generation{1};
+    // Guest ranges the GPU has written: their bytes change without a flush.
+    std::map<u64, u64> gpu_written_guest;
+    void NoteFlush(const Pool& pool, u64 offset, u64 size);
     u64 accepted_submissions{};
     u64 accepted_commands{};
     u64 rejected_submissions{};

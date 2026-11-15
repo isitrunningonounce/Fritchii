@@ -40,6 +40,13 @@ using namespace Common::Literals;
 
 #if defined(_M_X64) || defined(__x86_64__)
 namespace {
+constexpr u32 Arm64Return = 0xD65F03C0;
+
+void DispatchNvn2FromJit(u64 callback, u64 index, u64 counts) {
+    auto& cpu = *reinterpret_cast<DynarmicCallbacks64*>(callback);
+    cpu.DispatchNvn2FromJit(index, counts & 0xff, counts >> 8);
+}
+
 void CountNvn2Call(u64 callback, u64 index, u64 arg1) {
     auto& cpu = *reinterpret_cast<DynarmicCallbacks64*>(callback);
     cpu.m_process->GetBananzaNvn2Trace()->Count(index, cpu.m_nvn2_thread_id, arg1);
@@ -50,6 +57,14 @@ void InstrumentNvn2(Dynarmic::A64::UserCallbacks& callbacks, Dynarmic::A64::IREm
     auto& cpu = static_cast<DynarmicCallbacks64&>(callbacks);
     if (const auto* trace = cpu.m_process->GetBananzaNvn2Trace()) {
         if (const auto index = trace->Find(pc)) {
+            if (const auto* hle = cpu.m_process->GetBananzaNvn2Hle()) {
+                if (const auto counts = hle->DirectCallArguments(*index)) {
+                    ir.CallHostFunction(DispatchNvn2FromJit, ir.Imm64(reinterpret_cast<u64>(&cpu)),
+                                        ir.Imm64(*index),
+                                        ir.Imm64(counts->first | (counts->second << 8)));
+                }
+                return;
+            }
             ir.CallHostFunction(CountNvn2Call, ir.Imm64(reinterpret_cast<u64>(&cpu)),
                                 ir.Imm64(*index), ir.GetX(Dynarmic::A64::Reg::R1));
         }
@@ -106,6 +121,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         }
         if (const auto index = procs.Find(vaddr);
             index && !hle->UsesGuestStateHelper(*index)) {
+#if defined(_M_X64) || defined(__x86_64__)
+            if (hle->DirectCallArguments(*index)) {
+                return Arm64Return;
+            }
+#endif
             return LichiiHooks::Brk;
         }
     }
@@ -188,6 +208,30 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
     m_parent.m_jit->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
 }
 
+void DynarmicCallbacks64::DispatchNvn2FromJit(size_t index, size_t integer_count,
+                                              size_t float_count) {
+    auto& jit = *m_parent.m_jit;
+    auto& hle = *m_process->GetBananzaNvn2Hle();
+    const auto& procs = *m_process->GetBananzaNvn2Trace();
+    const bool profile = hle.ProfilesCalls();
+    const auto start = profile ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    BananzaNvn2Hle::GuestCall call{};
+    for (size_t i = 0; i < integer_count; ++i) {
+        call.x[i] = jit.GetRegister(i);
+    }
+    for (size_t i = 0; i < float_count; ++i) {
+        call.v[i] = jit.GetVector(i)[0];
+    }
+    jit.SetRegister(0, hle.Dispatch(procs, m_memory, index, call));
+    if (profile) {
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        hle.ProfileCall(index, procs.Name(index),
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+                        false, m_nvn2_thread_id);
+    }
+}
+
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
     if (auto* hle = m_process->GetBananzaNvn2Hle();
         hle && exception == Dynarmic::A64::Exception::Breakpoint) {
@@ -201,12 +245,13 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
                 const auto elapsed = std::chrono::steady_clock::now() - start;
                 hle->ProfileCall(index, procs.Name(index),
                                  std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
-                                 continuation);
+                                 continuation, m_nvn2_thread_id);
             }
         };
         const auto return_to_guest = [&](size_t index, const BananzaNvn2Hle::GuestCall& call,
                                          u64 link) {
-            const u64 result = hle->Dispatch(procs, m_memory, index, call);
+            std::chrono::steady_clock::time_point deadline{};
+            const u64 result = hle->Dispatch(procs, m_memory, index, call, &deadline);
             if (hle->ReturnsFloat(index)) {
                 jit.SetVector(0, {result, 0});
             } else {
@@ -214,6 +259,10 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
             }
             jit.SetRegister(30, link);
             jit.SetPC(link);
+            if (deadline > std::chrono::steady_clock::now()) {
+                m_present_deadline = deadline;
+                jit.HaltExecution(DeferredThreadSleep);
+            }
         };
         if (hle->IsBootstrap(pc)) {
             const u64 name = jit.GetRegister(0);
@@ -472,7 +521,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.callbacks = std::addressof(*m_cb);
 #if defined(_M_X64) || defined(__x86_64__)
     if (m_cb->m_process->GetProgramId() == Settings::DonkeyKongBananzaProgramId &&
-        BananzaNvn2Trace::CountEnabled()) {
+        (BananzaNvn2Trace::CountEnabled() || BananzaNvn2Trace::HleEnabled())) {
         config.pre_instruction = InstrumentNvn2;
     }
 #endif
@@ -727,6 +776,12 @@ HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
     }
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Step());
+}
+
+s64 ArmDynarmic64::TakeDeferredSleepNanoseconds() {
+    const auto deadline = std::exchange(m_cb->m_present_deadline, {});
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
 }
 
 u32 ArmDynarmic64::GetSvcNumber() const {
