@@ -922,19 +922,64 @@ void BananzaNvn2Replay::DispatchCopies() {
     }
 }
 
+void BananzaNvn2Replay::PrunePendingWrites() {
+    auto& retirement = Core::BananzaNvn2Commands::GetRetirement();
+    std::erase_if(pending_writebacks, [&](const PendingWriteback& pending) {
+        return retirement.WritesDone(pending.sequence);
+    });
+    if (pending_unknown_writes && retirement.WritesDone(pending_unknown_writes)) {
+        pending_unknown_writes = 0;
+    }
+}
+
+bool BananzaNvn2Replay::CarryGuestWrites(const u8* data, u64 size,
+                                         std::vector<CarriedWrite>& copies) {
+    if (pending_writebacks.empty() && !pending_unknown_writes) {
+        return true;
+    }
+    PrunePendingWrites();
+    if (pending_unknown_writes) {
+        return false;
+    }
+    // In the order of their submissions: a later write lands on an earlier one.
+    for (const PendingWriteback& pending : pending_writebacks) {
+        if (pending.begin >= data + size || data >= pending.end) {
+            continue;
+        }
+        const auto busy =
+            std::ranges::find(busy_resources, pending.sequence, &BusyResources::sequence);
+        if (!pending.buffer || busy == busy_resources.end()) {
+            copies.clear();
+            return false;
+        }
+        auto intervals = pending.written;
+        std::ranges::sort(intervals);
+        const u8* done = data;
+        for (const auto& [first, last] : intervals) {
+            const u8* const begin = std::max(done, pending.begin + first);
+            const u8* const end = std::min({data + size, pending.begin + last, pending.end});
+            if (begin < end) {
+                copies.push_back({pending.buffer,
+                                  pending.base + static_cast<u64>(begin - pending.begin),
+                                  static_cast<u64>(begin - data),
+                                  static_cast<u64>(end - begin)});
+                done = end;
+            }
+        }
+        busy->held = true;
+        if (pending.kept) {
+            evicted_kept.push_back(pending.kept);
+        }
+    }
+    return true;
+}
+
 bool BananzaNvn2Replay::AwaitGuestWrites(const u8* data, u64 size) {
     if (pending_writebacks.empty() && !pending_unknown_writes) {
         return false;
     }
     auto& retirement = Core::BananzaNvn2Commands::GetRetirement();
-    const auto prune = [&] {
-        std::erase_if(pending_writebacks, [&](const PendingWriteback& pending) {
-            return retirement.WritesDone(pending.sequence);
-        });
-        if (pending_unknown_writes && retirement.WritesDone(pending_unknown_writes)) {
-            pending_unknown_writes = 0;
-        }
-    };
+    const auto prune = [&] { PrunePendingWrites(); };
     prune();
     u64 sequence = pending_unknown_writes;
     for (const PendingWriteback& pending : pending_writebacks) {
@@ -1934,7 +1979,7 @@ void BananzaNvn2Replay::ReclaimBusyResources() {
     constexpr size_t MaxFreeDescriptorPools = 12;
     auto& retirement = Core::BananzaNvn2Commands::GetRetirement();
     std::erase_if(busy_resources, [&](BusyResources& busy) {
-        if (!scheduler.IsFree(busy.tick) || !retirement.IsRetired(busy.sequence)) {
+        if (busy.held || !scheduler.IsFree(busy.tick) || !retirement.IsRetired(busy.sequence)) {
             return false;
         }
         for (auto& buffer : busy.query_results) {
@@ -2593,7 +2638,8 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStora
                 .size = capacity,
                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             }, MemoryUsage::Download);
             ++storage_creates;
@@ -2642,8 +2688,16 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStora
         kept_filled_bytes += span.range.second;
         kept_fills.emplace_back(kept, span.range.second);
     }
+    std::vector<CarriedWrite> carried;
     if (span.host && !reused) {
-        if (AwaitGuestWrites(span.host, span.range.second)) {
+        // What earlier submissions' GPU work wrote to these bytes and is not back in guest
+        // memory is copied from their buffers below: after a write-back guest memory holds
+        // just that in the intervals a shader could write. Bytes the replay changes itself
+        // go on top of the fill, so such a span waits.
+        static const bool carry = std::getenv("EDEN_NX2_NVN_NO_CARRIED_WRITES") == nullptr;
+        if ((!carry || HasBufferUpdates(span.range) ||
+             !CarryGuestWrites(span.host, span.range.second, carried)) &&
+            AwaitGuestWrites(span.host, span.range.second)) {
             ++wait_spans[not_kept];
             wait_span_bytes[not_kept] += span.range.second;
             if (wait_span_notes < 24) {
@@ -2698,6 +2752,22 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStora
                                   span.range.second});
     if (in_device) {
         device_uploads.push_back(&upload.first->second);
+    }
+    if (!carried.empty()) {
+        ++carried_spans;
+        for (const CarriedWrite& copy : carried) {
+            carried_bytes += copy.size;
+        }
+        Barrier();
+        Record([target = bound_buffer, bound_base,
+                copies = std::move(carried)](vk::CommandBuffer cmdbuf) {
+            for (const CarriedWrite& copy : copies) {
+                cmdbuf.CopyBuffer(copy.source, target,
+                                  VkBufferCopy{copy.source_offset, bound_base + copy.offset,
+                                               copy.size});
+            }
+        });
+        Barrier();
     }
     if (reused && HasBufferUpdates(span.range)) {
         // What the replay changed in these bytes before the span was made (indirect resets)
@@ -6066,6 +6136,12 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     auto& busy = busy_resources.emplace_back();
     busy.tick = scheduler.CurrentTick() - 1;
     busy.sequence = submission.sequence;
+    for (BusyResources& earlier : busy_resources) {
+        if (earlier.held) {
+            earlier.held = false;
+            earlier.tick = std::max(earlier.tick, busy.tick);
+        }
+    }
     if (query_results) {
         busy.query_results.push_back(std::move(query_results));
     }
@@ -6114,7 +6190,7 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
                                   found ? std::move(span->second.snapshots)
                                         : std::vector<Range>{},
                                   tick, found ? span->second.host : nullptr,
-                                  std::move(upload.written)});
+                                  std::move(upload.written), upload.buffer, upload.base});
         }
     }
     storage_uploads.clear();
@@ -6144,8 +6220,16 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     }
     for (const WriteBack& write : job.writes) {
         if (write.before) {
+            BananzaNvn2KeptStorage::Buffer kept;
+            for (const auto& buffer : job.kept) {
+                if (**buffer == write.buffer) {
+                    kept = buffer;
+                    break;
+                }
+            }
             pending_writebacks.push_back({write.before, write.before + write.bytes,
-                                          submission.sequence});
+                                          submission.sequence, write.buffer, write.buffer_base,
+                                          write.written, std::move(kept)});
         } else {
             pending_unknown_writes = submission.sequence;
         }
@@ -6233,6 +6317,14 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
                      compute_list->Size(), compute_ahead.size(), compute_ahead_built,
                      compute_ahead_dropped, compute_dispatch_built);
             reported_compute_ahead = compute_ahead_built + compute_dispatch_built;
+        }
+        if (carried_spans) {
+            const double frames = std::max<double>(1.0, static_cast<double>(presents));
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 carried writes per present: {:.2f} spans took {:.1f} KiB of earlier "
+                     "GPU writes from their buffers",
+                     carried_spans / frames, carried_bytes / frames / 1024.0);
+            carried_spans = carried_bytes = 0;
         }
         if (wait_spans[0] + wait_spans[1] + wait_spans[2] != 0) {
             const double frames = std::max<double>(1.0, static_cast<double>(presents));

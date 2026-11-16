@@ -332,6 +332,8 @@ private:
     // Released by a submission whose commands may still run on the GPU.
     struct BusyResources {
         u64 tick;
+        // The replay under way copies from the storage: it stays until that replay's tick.
+        bool held{};
         // Retired after the tick: storage and query results are read until then.
         u64 sequence;
         // Zero or one buffer; a vector keeps its address when the entry moves.
@@ -404,6 +406,18 @@ private:
     /// Before guest memory is read: waits for the write-back of earlier submissions over it.
     /// True when it had to wait.
     bool AwaitGuestWrites(const u8* data, u64 size);
+    // Bytes an earlier submission's GPU work wrote, where it left them, for a span at `offset`.
+    struct CarriedWrite {
+        VkBuffer source;
+        u64 source_offset;
+        u64 offset;
+        u64 size;
+    };
+    /// In place of AwaitGuestWrites for a span filled from these guest bytes: the writes of
+    /// earlier submissions that are not back in guest memory, as copies from their buffers.
+    /// False when one of them cannot be copied; the caller waits then.
+    bool CarryGuestWrites(const u8* data, u64 size, std::vector<CarriedWrite>& copies);
+    void PrunePendingWrites();
     /// A snapshot's bytes; one that is guest memory itself is waited for first.
     std::span<const u8> ReadSnapshot(const Submission& submission, Range range);
     u32 import_probes{};
@@ -420,6 +434,9 @@ private:
         const u8* before{};
         // With `before`: the intervals a shader could write; only they are compared.
         std::vector<std::pair<u64, u64>> written;
+        // Where the GPU leaves the span.
+        VkBuffer buffer{};
+        u64 buffer_base{};
     };
     // One GPU timestamp of the pass trace: taken when all earlier work has finished.
     struct PassLabel {
@@ -866,6 +883,12 @@ private:
         const u8* begin;
         const u8* end;
         u64 sequence;
+        // Where the GPU leaves the range and the offsets in it a shader could write.
+        VkBuffer buffer{};
+        u64 base{};
+        std::vector<std::pair<u64, u64>> written;
+        // The buffer when it is a kept one.
+        BananzaNvn2KeptStorage::Buffer kept;
     };
     std::vector<PendingWriteback> pending_writebacks;
     u64 pending_unknown_writes{};
@@ -879,6 +902,9 @@ private:
     std::array<u64, 3> wait_spans{};
     std::array<u64, 3> wait_span_bytes{};
     u32 wait_span_notes{};
+    // Spans that took earlier GPU writes from their buffers instead, and those bytes.
+    u64 carried_spans{};
+    u64 carried_bytes{};
     u64 stream_bytes{};
     u64 stream_uploads{};
     bool precise_queries{};
