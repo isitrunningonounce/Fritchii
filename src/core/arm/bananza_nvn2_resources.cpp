@@ -15,6 +15,7 @@
 #include <utility>
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/logging.h"
 #include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_resources.h"
@@ -889,6 +890,11 @@ std::optional<std::vector<Resources::Shader>> Resources::ReadShaders(
     return result;
 }
 
+std::vector<std::shared_ptr<const ResourceProgramInfo>> Resources::TakeNewPrograms() {
+    std::scoped_lock lock{new_programs_mutex};
+    return std::exchange(new_programs, {});
+}
+
 std::shared_ptr<const ResourceProgramInfo> Resources::StageProgram(
     Memory::Memory& memory, const Program& program, const GpuAddressLookup& resolve_gpu) {
     const auto reject = [&](std::string_view reason) -> std::shared_ptr<const ResourceProgramInfo> {
@@ -992,6 +998,23 @@ std::shared_ptr<const ResourceProgramInfo> Resources::StageProgram(
         return reject("incompatible compute, mesh or conventional graphics stages");
     }
     snapshot->serial = next_serial++;
+    u64 hash{};
+    for (const auto& shader : snapshot->shaders) {
+        const std::array<u32, 5> shape{shader.stage, shader.code_size, shader.header_size,
+                                       shader.constant_offset, shader.constant_size};
+        const auto mix = [&hash](const void* data, size_t size) {
+            hash = hash * 0x9E3779B97F4A7C15ULL +
+                   Common::CityHash64(static_cast<const char*>(data), size);
+        };
+        mix(shape.data(), sizeof(shape));
+        mix(shader.control.data(), shader.control.size());
+        mix(shader.code.data(), shader.code.size());
+    }
+    snapshot->content_hash = hash ? hash : 1;
+    {
+        std::scoped_lock lock{new_programs_mutex};
+        new_programs.push_back(snapshot);
+    }
     if (!reported_shader_staging) {
         LOG_INFO(Core_ARM, "Bananza NVN 2 HLE: storing immutable native shader inputs; "
                            "programs remain non-executable until a replay backend is connected");

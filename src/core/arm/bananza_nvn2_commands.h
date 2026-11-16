@@ -440,6 +440,8 @@ struct Submission : std::enable_shared_from_this<Submission> {
     u64 after_writes{};
     bool depth_minus_one_to_one{};
     bool origin_lower_left{};
+    // The shader programs the game made since the submission before.
+    std::vector<std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo>> new_programs;
     std::vector<u64> handles;
     std::vector<std::shared_ptr<const Recording>> recordings;
     // For each of the recordings: the operations in the order they run, the called

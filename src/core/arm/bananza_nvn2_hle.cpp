@@ -3044,6 +3044,7 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
         if (submission) {
             submission->submitted_ns = static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count());
             submission->host_submit_ns = BananzaNvn2Commands::HostNs();
+            submission->new_programs = resources.TakeNewPrograms();
             if (const auto device = devices.find(queue->second.device); device != devices.end()) {
                 submission->depth_minus_one_to_one = device->second.depth_mode == 0;
                 submission->origin_lower_left = device->second.origin == 0;

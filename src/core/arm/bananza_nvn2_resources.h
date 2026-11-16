@@ -5,6 +5,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -57,6 +58,9 @@ struct ResourceProgramInfo {
     static constexpr bool Executable = false;
     u64 device{};
     u64 serial{};
+    // Of the shaders' stages, sizes, controls and code: the same for the same program in
+    // every run. Never zero.
+    u64 content_hash{};
     std::vector<ResourceShaderInfo> shaders;
     bool resets_indirect_draws{};
 };
@@ -98,6 +102,8 @@ public:
     bool HasTexture(u64 device, u64 texture) const;
     std::optional<ResourceTextureInfo> GetTexture(u64 texture) const;
     std::shared_ptr<const ResourceProgramInfo> GetProgram(u64 program) const;
+    /// The programs made since the last call, for the replay to prepare for.
+    std::vector<std::shared_ptr<const ResourceProgramInfo>> TakeNewPrograms();
     const std::unordered_map<u32, ResourceTextureDescriptor>* GetTexturePool(u64 pool) const;
     const std::unordered_map<u32, ResourceSamplerInfo>* GetSamplerPool(u64 pool) const;
 
@@ -173,6 +179,8 @@ private:
     std::unordered_map<u64, DescriptorPool> texture_pools;
     std::unordered_map<u64, DescriptorPool> sampler_pools;
     std::unordered_map<u64, Program> program_builders;
+    std::mutex new_programs_mutex;
+    std::vector<std::shared_ptr<const ResourceProgramInfo>> new_programs;
     std::unordered_map<u64, Program> programs;
     u64 next_serial{1};
     bool reported_shader_staging{};

@@ -29,6 +29,8 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_async_builder.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_kept_storage.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_pipeline_list.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_run_stats.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/shader_environment.h"
@@ -66,26 +68,11 @@ private:
     using Program = Core::BananzaNvn2Hle::ResourceProgramInfo;
     using Range = std::pair<u64, u64>;
     using ImageKey = std::tuple<GPUVAddr, u32, u32, u32, u32, u32, u32, u32>;
-    using ColorFormats = std::array<VkFormat, 8>;
-    struct ColorState {
-        std::array<u64, 8> blend{};
-        u32 control{0x08030000};
-        u32 channel_mask{0xffffffff};
-        u32 alpha_ref{};
-        auto operator<=>(const ColorState&) const = default;
-    };
-    struct RasterState {
-        u64 depth_stencil{0x1118111800000022ULL};
-        u32 polygon{0x14};
-        VkFormat depth_format{};
-        VkImageAspectFlags depth_aspects{};
-        bool negative_one_to_one{};
-        bool origin_lower_left{};
-        bool depth_clamp{};
-        bool discard{};
-        bool depth_bias{};
-        auto operator<=>(const RasterState&) const = default;
-    };
+    using ColorFormats = BananzaNvn2ColorFormats;
+    using ColorState = BananzaNvn2ColorState;
+    using RasterState = BananzaNvn2RasterState;
+    // The three numbers are the content hashes of the graphics, fragment and geometry
+    // programs (zero for none): the same programs make the same pipeline in every run.
     using PipelineKey = std::tuple<u64, u64, u64, ColorFormats, VkPrimitiveTopology, std::array<u32, 32>,
                                    std::array<u32, 32>, std::array<u32, 32>, ColorState, RasterState>;
 
@@ -215,7 +202,8 @@ private:
         std::array<u32, 32> vertex_strides;
         std::array<u32, 32> vertex_divisors;
         ColorState color_state;
-        std::array<std::optional<Texture>, 8> colors;
+        // The guest format of each bound colour texture, PipelineList::NoColor for none.
+        std::array<u32, 8> color_formats;
         ColorFormats formats;
         u32 color_count;
         VkPrimitiveTopology topology;
@@ -471,6 +459,11 @@ private:
         const Submission& submission, u64 handle, const Shader::ImageDescriptor& binding,
         Image*& image);
     std::optional<DrawState> DecodeDraw(const Operation& operation) const;
+    /// A program the game made: the listed pipelines it completes go to the workers.
+    void NoteProgram(const std::shared_ptr<const Program>& program);
+    void BuildAhead(const BananzaNvn2PipelineList::Entry& entry);
+    /// Takes the pipelines the workers have finished.
+    void CollectPipelines();
     std::optional<Pipeline> CreatePipeline(const PipelineInputs& inputs,
                                            std::vector<std::string_view>& skips) const;
     BuiltPipeline BuildPipeline(const PipelineInputs& inputs) const;
@@ -700,6 +693,17 @@ private:
     u64 pipeline_creates{};
     // Pipelines a worker is building, and the draws left out meanwhile.
     std::set<const std::optional<Pipeline>*> building_pipelines;
+    // The pipelines of earlier runs, and those of them the workers are building now. A draw
+    // that needs one of these builds it itself and the worker's is dropped.
+    std::optional<BananzaNvn2PipelineList> pipeline_list;
+    std::set<const std::optional<Pipeline>*> ahead_pipelines;
+    // The programs the list names that the game has made, by content hash.
+    std::unordered_map<u64, std::shared_ptr<const Program>> listed_programs;
+    u64 ahead_queued{};
+    u64 ahead_built{};
+    u64 ahead_dropped{};
+    u64 draw_built{};
+    u64 reported_ahead{};
     u64 worker_pipelines{};
     u64 pipeline_wait_draws{};
     u64 reported_pipeline_wait_draws{};

@@ -17,6 +17,7 @@
 #include "common/alignment.h"
 #include "common/logging.h"
 #include "common/cityhash.h"
+#include "common/fs/path_util.h"
 #include "common/swap.h"
 #include "core/arm/bananza_nvn2_commands.h"
 #include "core/memory.h"
@@ -342,6 +343,12 @@ BananzaNvn2Replay::BananzaNvn2Replay(const Device& device_, MemoryAllocator& all
                                       device_limits.minStorageBufferOffsetAlignment, 64});
     constexpr float max_point_size = 2047.0f;
     std::memcpy(driver_constants.data() + 0x610, &max_point_size, sizeof(max_point_size));
+    if (std::getenv("EDEN_NX2_NVN_NO_AHEAD_PIPELINES") == nullptr) {
+        const auto& properties = device.GetPhysical().GetProperties();
+        pipeline_list.emplace(Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                                  "bananza-nvn2-pipelines.bin",
+                              properties.vendorID, properties.deviceID);
+    }
     Core::BananzaNvn2Commands::GetRetirement().Start();
     retire_thread = std::jthread([this](std::stop_token token) { RetireLoop(token); });
 }
@@ -3540,6 +3547,56 @@ std::optional<BananzaNvn2Replay::DrawState> BananzaNvn2Replay::DecodeDraw(
     return state;
 }
 
+void BananzaNvn2Replay::NoteProgram(const std::shared_ptr<const Program>& program) {
+    if (!pipeline_list || !pipeline_list->Uses(program->content_hash)) {
+        return;
+    }
+    listed_programs.insert_or_assign(program->content_hash, program);
+    pipeline_list->ForProgram(
+        program->content_hash, [this](u64 hash) { return listed_programs.contains(hash); },
+        [this](const BananzaNvn2PipelineList::Entry& entry) { BuildAhead(entry); });
+}
+
+void BananzaNvn2Replay::BuildAhead(const BananzaNvn2PipelineList::Entry& entry) {
+    const PipelineKey key{entry.programs[0], entry.programs[1], entry.programs[2],
+                          entry.formats, entry.topology, entry.vertex_attributes,
+                          entry.vertex_strides, entry.vertex_divisors, entry.color_state,
+                          entry.raster};
+    const auto [slot, inserted] = pipelines.try_emplace(key);
+    if (!inserted) {
+        return;
+    }
+    const auto program = [this](u64 hash) {
+        return hash ? listed_programs.at(hash) : std::shared_ptr<const Program>{};
+    };
+    PipelineInputs inputs{program(entry.programs[0]), program(entry.programs[1]),
+                          program(entry.programs[2]), entry.vertex_attributes,
+                          entry.vertex_strides, entry.vertex_divisors, entry.color_state,
+                          entry.color_formats, entry.formats, entry.color_count, entry.topology,
+                          entry.raster};
+    ahead_pipelines.insert(&slot->second);
+    ++ahead_queued;
+    pipeline_builder.Queue(&slot->second, [this, inputs = std::move(inputs)] {
+        return BuildPipeline(inputs);
+    });
+}
+
+void BananzaNvn2Replay::CollectPipelines() {
+    pipeline_builder.Collect([this](std::optional<Pipeline>* slot, BuiltPipeline&& built) {
+        if (building_pipelines.erase(slot)) {
+            ++worker_pipelines;
+            TakePipeline(*slot, built);
+        } else if (ahead_pipelines.erase(slot)) {
+            // No draw waits for it, so its skip reasons are not a draw's.
+            *slot = std::move(built.pipeline);
+            ++ahead_built;
+        } else {
+            // A draw needed it first and built its own.
+            ++ahead_dropped;
+        }
+    });
+}
+
 BananzaNvn2Replay::BuiltPipeline BananzaNvn2Replay::BuildPipeline(
     const PipelineInputs& inputs) const {
     BuiltPipeline built;
@@ -3573,7 +3630,7 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
     const auto& vertex_strides = inputs.vertex_strides;
     const auto& vertex_divisors = inputs.vertex_divisors;
     const auto& color_state = inputs.color_state;
-    const auto& colors = inputs.colors;
+    const auto& color_formats = inputs.color_formats;
     const auto& formats = inputs.formats;
     const u32 color_count = inputs.color_count;
     const auto topology = inputs.topology;
@@ -3634,10 +3691,10 @@ std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
         }
     }
     for (u32 i = 0; i < formats.size(); ++i) {
-        if (colors[i]) {
-            const auto format = FindColorFormat(colors[i]->description.format);
+        if (color_formats[i] != BananzaNvn2PipelineList::NoColor) {
+            const auto format = FindColorFormat(color_formats[i]);
             if (format && VideoCore::Surface::IsPixelFormatInteger(format->surface)) {
-                runtime.color_output_types[i] = attribute_type(colors[i]->description.format);
+                runtime.color_output_types[i] = attribute_type(color_formats[i]);
             }
         }
     }
@@ -4457,17 +4514,37 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     const bool biased = raster.depth_bias;
     const auto bias = depth_bias;
     const float bias_clamp = device_features.depthBiasClamp ? bias[2] : 0.0f;
-    const PipelineKey key{graphics_program->serial, fragment_program ? fragment_program->serial : 0,
-                          geometry_program ? geometry_program->serial : 0,
+    const PipelineKey key{graphics_program->content_hash,
+                          fragment_program ? fragment_program->content_hash : 0,
+                          geometry_program ? geometry_program->content_hash : 0,
                           formats, topology, vertex_attributes,
                           vertex_strides, vertex_divisors, color_state, raster};
     if (last_pipeline == pipelines.end() || last_pipeline->first != key) {
         const auto [entry, inserted] = pipelines.try_emplace(key);
-        if (inserted) {
+        if (!inserted && ahead_pipelines.contains(&entry->second)) {
+            CollectPipelines();
+        }
+        // One a worker has not finished is built here: its draw is not left out, and the
+        // worker's pipeline is dropped when it comes.
+        const bool unfinished = !inserted && ahead_pipelines.erase(&entry->second) != 0;
+        if (inserted || unfinished) {
             run_stats.DrawCut(BananzaNvn2RunStats::Cut::PipelineCreate);
+            std::array<u32, 8> color_formats;
+            for (size_t slot = 0; slot < colors.size(); ++slot) {
+                color_formats[slot] = colors[slot] ? colors[slot]->description.format
+                                                   : BananzaNvn2PipelineList::NoColor;
+            }
             PipelineInputs inputs{graphics_program, fragment_program, geometry_program,
                                   vertex_attributes, vertex_strides, vertex_divisors,
-                                  color_state, colors, formats, color_count, topology, raster};
+                                  color_state, color_formats, formats, color_count, topology,
+                                  raster};
+            ++draw_built;
+            if (pipeline_list && inserted) {
+                pipeline_list->Add({{std::get<0>(key), std::get<1>(key), std::get<2>(key)},
+                                    formats, color_formats, color_count, topology,
+                                    vertex_attributes, vertex_strides, vertex_divisors,
+                                    color_state, raster});
+            }
             // Built here by default. With EDEN_NX2_NVN_ASYNC_PIPELINES=1 a worker builds it
             // and the draw is left out meanwhile (a few vertices without indices, a screen
             // pass or a UI quad, are still built here): that made the level's intro black,
@@ -5746,11 +5823,10 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     next_replay_flush = replay_start + ReplayFlushInterval;
     flush_scopes = 0;
     ++replayed_submissions;
-    pipeline_builder.Collect([this](std::optional<Pipeline>* slot, BuiltPipeline&& built) {
-        building_pipelines.erase(slot);
-        ++worker_pipelines;
-        TakePipeline(*slot, built);
-    });
+    for (const auto& program : submission.new_programs) {
+        NoteProgram(program);
+    }
+    CollectPipelines();
     ReclaimBusyResources();
     origin_lower_left = submission.origin_lower_left;
     const u64 first_tick = scheduler.CurrentTick();
@@ -6002,6 +6078,14 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
         const auto presents = present_count - last_reported_present;
         LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay: {} draws in {} presents, {} dispatches and {} texture uploads total, {} MiB images",
                  draws - last_reported_draws, presents, dispatches, texture_uploads, image_bytes >> 20);
+        if (pipeline_list && ahead_queued + draw_built != reported_ahead) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 pipelines ahead: {} on the list, {} given to the workers, {} built "
+                     "by them, {} still to build, {} a draw built first; {} built by draws in all",
+                     pipeline_list->Size(), ahead_queued, ahead_built, ahead_pipelines.size(),
+                     ahead_dropped, draw_built);
+            reported_ahead = ahead_queued + draw_built;
+        }
         if (pipeline_wait_draws != reported_pipeline_wait_draws) {
             LOG_INFO(Render_Vulkan,
                      "NVN 2 pipelines: {} built by workers so far, {} being built, {} draws left "
