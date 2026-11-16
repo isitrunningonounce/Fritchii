@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
+#include "common/jit_symbols.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -546,6 +547,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             std::nullopt;
         config.fastmem_address_space_bits = std::uint32_t(address_space_bits);
         config.silently_mirror_fastmem = false;
+        Common::JitSymbols::SetGuestBase(page_table->fastmem_arena);
 
         config.fastmem_exclusive_access = config.fastmem_pointer != std::nullopt;
         config.recompile_on_exclusive_fastmem_failure = true;

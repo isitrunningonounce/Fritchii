@@ -12,6 +12,7 @@ the top call paths. Other modules show as module+offset, code outside any module
 """
 
 import argparse
+import bisect
 import collections
 import html
 import json
@@ -23,6 +24,8 @@ import sys
 KIND_SAMPLE = 1
 KIND_THREAD = 2
 KIND_MODULE = 3
+KIND_JIT_BLOCK = 4
+KIND_GUEST_STACK = 5
 KIND_END = 0xFF
 
 
@@ -33,6 +36,8 @@ class SampleFile:
         self.modules = []  # (base, size, path)
         self.threads = {}  # tag -> name
         self.samples = []  # (tag, qpc, frames innermost first)
+        self.jit_blocks = []  # (host start, host end, name), with EDEN_NX2_JIT_SYMBOLS=1
+        self.guest_stacks = {}  # sample index -> guest x30 and frame record return addresses
         self.complete = False
 
 
@@ -61,6 +66,16 @@ def parse(data):
                 path = data[offset + 14:offset + 14 + length].decode("utf-8", "replace")
                 offset += 14 + length
                 result.modules.append((base, size, path))
+            elif kind == KIND_JIT_BLOCK:
+                start, end, length = struct.unpack_from("<QQH", data, offset)
+                name = data[offset + 18:offset + 18 + length].decode("utf-8", "replace")
+                offset += 18 + length
+                result.jit_blocks.append((start, end, name))
+            elif kind == KIND_GUEST_STACK:
+                _tag, depth = struct.unpack_from("<BB", data, offset)
+                chain = list(struct.unpack_from("<%dQ" % depth, data, offset + 2))
+                offset += 2 + 8 * depth
+                result.guest_stacks[len(result.samples) - 1] = chain
             elif kind == KIND_END:
                 result.complete = True
                 break
@@ -130,6 +145,15 @@ def symbolize_samples(sample_file, exe_name, symbolizer):
     """Returns (thread name, stack outermost first) per sample, inline frames expanded."""
     keys = []
     rvas = set()
+    blocks = sorted(sample_file.jit_blocks)
+    block_starts = [block[0] for block in blocks]
+
+    def jit_label(address):
+        index = bisect.bisect_right(block_starts, address) - 1
+        if index >= 0 and address < blocks[index][1]:
+            return blocks[index][2]
+        return "[jit]"
+
     for tag, _qpc, frames in sample_file.samples:
         sample_keys = []
         for depth, address in enumerate(frames):
@@ -137,7 +161,7 @@ def symbolize_samples(sample_file, exe_name, symbolizer):
             lookup = address if depth == 0 else address - 1
             base, path = find_module(sample_file.modules, lookup)
             if base is None:
-                sample_keys.append(("label", "[jit]"))
+                sample_keys.append(("label", jit_label(lookup)))
             elif is_exe(path, exe_name):
                 sample_keys.append(("rva", lookup - base))
                 rvas.add(lookup - base)
