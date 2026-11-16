@@ -499,14 +499,28 @@ void BananzaNvn2Replay::RetireLoop(std::stop_token token) {
         }
         // What the game can see of the submission: its event signals and counters, then the
         // sync. The caller holds retire_mutex.
-        const auto finish = [&] {
-            std::span<const u64> results;
-            if (job.query_results) {
-                job.query_results->Invalidate();
-                results = {reinterpret_cast<const u64*>(job.query_results->Mapped().data()),
-                           job.queries};
+        // Where the count stands after the submission's last reset or report.
+        u32 last_position = 0;
+        for (const CounterEvent& event : job.counters) {
+            if (event.kind != CounterEvent::Kind::Signal) {
+                last_position = event.query;
             }
-            ApplyCounterEvents(results, job.counters, job.queries);
+        }
+        const auto query_results = [&]() -> std::span<const u64> {
+            if (!job.query_results) {
+                return {};
+            }
+            job.query_results->Invalidate();
+            return {reinterpret_cast<const u64*>(job.query_results->Mapped().data()), job.queries};
+        };
+        // partial: only the queries the reports count are back; the ones after the last
+        // report are added once the GPU has finished.
+        const auto finish = [&](bool partial = false) {
+            std::span<const u64> results = query_results();
+            if (partial) {
+                results = results.first(std::min<size_t>(results.size(), job.reported));
+            }
+            ApplyCounterEvents(results, job.counters, partial ? last_position : job.queries);
             for (const auto& event : job.counters) {
                 if (event.kind == CounterEvent::Kind::Report) {
                     if (const auto it = pending_reports.find(event.gpu_address);
@@ -526,15 +540,34 @@ void BananzaNvn2Replay::RetireLoop(std::stop_token token) {
         // stay pending for the next scan that reads them (Retirement::WritesDone).
         static const bool early_sync = std::getenv("EDEN_NX2_NVN_EARLY_SYNC") != nullptr;
         const bool writes_done = compared_writes == job.writes.size();
-        const bool early = !late_retire && (writes_done || early_sync) && !job.query_results &&
-                           std::ranges::all_of(job.counters, [](const CounterEvent& event) {
-                               return event.kind == CounterEvent::Kind::Signal;
-                           });
+        const bool only_signals =
+            std::ranges::all_of(job.counters, [](const CounterEvent& event) {
+                return event.kind == CounterEvent::Kind::Signal;
+            });
+        // Reports whose queries an earlier command buffer copied: the game gets them, and the
+        // submission retires, while the GPU draws the passes after them.
+        static const bool report_retire = std::getenv("EDEN_NX2_NVN_NO_EARLY_REPORTS") == nullptr;
+        const bool reports_early = report_retire && !late_retire && writes_done &&
+                                   !only_signals && job.early_reports &&
+                                   job.report_tick < job.tick;
+        const bool early = reports_early || (!late_retire && (writes_done || early_sync) &&
+                                             !job.query_results && only_signals);
+        static std::atomic<u64> report_retires{};
+        static std::atomic<u64> report_lead_ns{};
+        static std::atomic<u64> late_reports{};
+        late_reports.fetch_add(!only_signals && !reports_early, std::memory_order_relaxed);
         u64 retired_ns{};
         if (early) {
+            if (reports_early && job.report_tick) {
+                scheduler.GetMasterSemaphore().Wait(job.report_tick);
+            }
             lock.lock();
-            finish();
+            finish(reports_early);
             lock.unlock();
+            if (reports_early) {
+                // A draw that waits for one of these reports.
+                retire_idle_cv.notify_all();
+            }
             Core::BananzaNvn2Commands::GetRetirement().Retire(job.sequence, writes_done);
             retired_ns = Core::BananzaNvn2Commands::HostNs();
         }
@@ -574,9 +607,29 @@ void BananzaNvn2Replay::RetireLoop(std::stop_token token) {
                      late_changed.exchange(0, std::memory_order_relaxed),
                      late_counters.exchange(0, std::memory_order_relaxed),
                      late_queries.exchange(0, std::memory_order_relaxed));
+            const u64 retires = report_retires.exchange(0, std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 retire: {} of them retired at their last report, {:.2f} ms before "
+                     "the GPU finished them on average; {} had a report in their last command "
+                     "buffer or a range still out",
+                     retires,
+                     retires ? report_lead_ns.exchange(0, std::memory_order_relaxed) / 1e6 / retires
+                             : 0.0,
+                     late_reports.exchange(0, std::memory_order_relaxed));
         }
         scheduler.GetMasterSemaphore().Wait(job.tick);
         const u64 gpu_done_ns = Core::BananzaNvn2Commands::HostNs();
+        if (reports_early) {
+            report_retires.fetch_add(1, std::memory_order_relaxed);
+            report_lead_ns.fetch_add(gpu_done_ns > retired_ns ? gpu_done_ns - retired_ns : 0,
+                                     std::memory_order_relaxed);
+            // The queries after the last report count toward the next submission's.
+            const std::span<const u64> results = query_results();
+            std::scoped_lock count_lock{retire_mutex};
+            for (size_t query = last_position; query < results.size(); ++query) {
+                counted_samples += results[query];
+            }
+        }
         if (!job.pass_labels.empty()) {
             ReportPassTimes(job);
             pass_trace_busy.store(false, std::memory_order_release);
@@ -1123,6 +1176,7 @@ void BananzaNvn2Replay::RecordStorageReadback(bool flush) {
     });
     if (flush && !frame_dump.CapturingSampled()) {
         // The copy's command buffer ends here, so its tick does not wait for later passes.
+        RecordReportedQueries();
         PassTimestamp({.reason = 32});
         WaitCopies();
         scheduler.Flush();
@@ -1132,6 +1186,52 @@ void BananzaNvn2Replay::RecordStorageReadback(bool flush) {
         next_flush_draw = draws + DrawsBeforeFlush;
         next_replay_flush = std::chrono::steady_clock::now() + ReplayFlushInterval;
     }
+}
+
+namespace {
+void CopyQueryResults(vk::CommandBuffer cmdbuf, VkQueryPool pool, u32 first, u32 count,
+                      VkBuffer buffer) {
+    cmdbuf.CopyQueryPoolResults(pool, first, count, buffer, first * sizeof(u64), sizeof(u64),
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    const VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                         VK_ACCESS_MEMORY_WRITE_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                           barrier);
+}
+} // Anonymous namespace
+
+vk::Buffer BananzaNvn2Replay::TakeQueryBuffer() {
+    if (free_query_results.empty()) {
+        return allocator.CreateBuffer({
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = OcclusionQueryCount * sizeof(u64),
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        }, MemoryUsage::Download);
+    }
+    vk::Buffer buffer = std::move(free_query_results.back());
+    free_query_results.pop_back();
+    return buffer;
+}
+
+void BananzaNvn2Replay::RecordReportedQueries() {
+    if (reported_queries <= copied_queries) {
+        return;
+    }
+    if (!query_copy) {
+        query_copy = TakeQueryBuffer();
+    }
+    Record([pool = *occlusion_pool, buffer = *query_copy, first = copied_queries,
+            count = reported_queries - copied_queries](vk::CommandBuffer cmdbuf) {
+        CopyQueryResults(cmdbuf, pool, first, count, buffer);
+    });
+    copied_queries = reported_queries;
+    report_tick = scheduler.CurrentTick();
 }
 
 void BananzaNvn2Replay::WaitRetireIdle() {
@@ -1444,6 +1544,7 @@ void BananzaNvn2Replay::Barrier(std::source_location location) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_replay_flush ||
             (many_scopes && now + (ReplayFlushInterval - ScopeFlushInterval) >= next_replay_flush)) {
+            RecordReportedQueries();
             PassTimestamp({.reason = 32});
             WaitCopies();
             scheduler.Flush();
@@ -5760,6 +5861,8 @@ void BananzaNvn2Replay::CollectOcclusion() {
     }
     counter_events.clear();
     occlusion_queries = 0;
+    reported_queries = copied_queries = 0;
+    report_tick = 0;
 }
 
 void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& submission) {
@@ -5816,6 +5919,7 @@ void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& sub
                                       .guest_address = address->second,
                                       .gpu_address = op.args[1],
                                       .submitted_ns = submission.submitted_ns});
+            reported_queries = occlusion_queries;
             count_samples = cumulative_reports;
             return;
         }
@@ -6070,35 +6174,25 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     RetireJob job{.sequence = submission.sequence,
                   .submission = submission.shared_from_this(),
                   .queries = occlusion_queries};
+    // Reports whose queries an earlier command buffer copied are back before this
+    // submission's last one has run.
+    job.early_reports = reported_queries <= copied_queries;
+    job.report_tick = reported_queries ? report_tick : 0;
+    job.reported = reported_queries;
     vk::Buffer query_results;
     if (occlusion_queries) {
-        if (free_query_results.empty()) {
-            query_results = allocator.CreateBuffer({
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .size = OcclusionQueryCount * sizeof(u64),
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            }, MemoryUsage::Download);
-        } else {
-            query_results = std::move(free_query_results.back());
-            free_query_results.pop_back();
+        query_results = query_copy ? std::move(query_copy) : TakeQueryBuffer();
+        query_copy = vk::Buffer{};
+        if (copied_queries < occlusion_queries) {
+            Record([pool = *occlusion_pool, buffer = *query_results, first = copied_queries,
+                    count = occlusion_queries - copied_queries](vk::CommandBuffer cmdbuf) {
+                CopyQueryResults(cmdbuf, pool, first, count, buffer);
+            });
         }
-        Record([pool = *occlusion_pool, buffer = *query_results,
-                count = occlusion_queries](vk::CommandBuffer cmdbuf) {
-            cmdbuf.CopyQueryPoolResults(pool, 0, count, buffer, 0, sizeof(u64),
-                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-            const VkMemoryBarrier barrier{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
-                                 VK_ACCESS_MEMORY_WRITE_BIT,
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   0, barrier);
-        });
         occlusion_queries = 0;
     }
+    reported_queries = copied_queries = 0;
+    report_tick = 0;
     if (pass_trace_active) {
         // Small submissions are not worth a sample; the next one starts over.
         if (pass_trace_labels.size() >= 32) {

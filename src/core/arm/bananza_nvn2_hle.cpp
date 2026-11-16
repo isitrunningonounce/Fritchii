@@ -3403,9 +3403,11 @@ std::optional<u64> Session::HandleSyncEvent(Memory::Memory& memory, std::string_
         const u64 sequence = waited.sequence;
         auto& retirement = BananzaNvn2Commands::GetRetirement();
         // What a sync waits for, EDEN_NX2_NVN_SYNC:
-        // unset: the GPU has finished the submission and its results are back, as the game
-        //   asks. A game that culls with what the GPU wrote draws everything while those
-        //   results reach it late, and then stays late (r174).
+        // unset: the submission's results are back (it is retired): the ranges the GPU wrote,
+        //   its counter reports and event signals. A game that culls with what the GPU wrote
+        //   draws everything while those reach it late, and then stays late. The GPU may
+        //   still draw the passes after the last result (r175).
+        // "full": also the GPU thread has finished the submission's replay (r174).
         // "ahead": what was submitted before the present before the last one is finished. The
         //   game prepares and submits a frame while the one before is replayed; it can find
         //   counters and ranges the GPU wrote a frame later (r156 to r173).
@@ -3414,11 +3416,11 @@ std::optional<u64> Session::HandleSyncEvent(Memory::Memory& memory, std::string_
         static const int sync_mode = [] {
             const char* const value = std::getenv("EDEN_NX2_NVN_SYNC");
             const std::string_view mode{value ? value : ""};
-            return mode == "ahead" ? 2 : mode == "replay" ? 1 : 0;
+            return mode == "ahead" ? 2 : mode == "replay" ? 1 : mode == "full" ? 0 : 3;
         }();
         const bool early = sync_mode != 0 && submit_lane;
         const bool at_replay_end = early && sync_mode == 1;
-        const u64 finished = early ? std::min(sequence, earlier_mark) : sequence;
+        const u64 finished = early && sync_mode != 3 ? std::min(sequence, earlier_mark) : sequence;
         const bool reached = at_replay_end ? retirement.IsReplayed(sequence)
                              : early       ? true
                                            : system.GPU().CurrentSyncRequestFence() >= fence;

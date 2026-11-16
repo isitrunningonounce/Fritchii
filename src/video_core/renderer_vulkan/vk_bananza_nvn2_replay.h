@@ -466,6 +466,11 @@ private:
         std::vector<CounterEvent> counters;
         u32 queries;
         const vk::Buffer* query_results;
+        // Every report's queries were copied by the command buffer with this tick or an
+        // earlier one; `reported` is the last report's query index.
+        bool early_reports{};
+        u64 report_tick{};
+        u32 reported{};
         u64 replay_start_ns;
         u64 push_ns;
         u64 first_tick;
@@ -833,6 +838,16 @@ private:
     std::map<u32, u32> scope_end_sites;
     Range traced_storage{};
     u32 occlusion_queries{};
+    // Of them: counted by the submission's last report so far, and copied to query_copy by
+    // a command buffer up to report_tick.
+    u32 reported_queries{};
+    u32 copied_queries{};
+    u64 report_tick{};
+    vk::Buffer query_copy;
+    /// Before a command buffer is flushed: copies the queries the reports so far need, so
+    /// that their results are back when that command buffer has run.
+    void RecordReportedQueries();
+    vk::Buffer TakeQueryBuffer();
     std::vector<CounterEvent> counter_events;
     std::vector<vk::Buffer> free_query_results;
     bool count_samples{};
