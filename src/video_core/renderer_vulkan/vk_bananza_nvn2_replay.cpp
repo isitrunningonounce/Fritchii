@@ -2527,8 +2527,12 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
     // A range the GPU never writes is in no storage upload: UploadRange has it in VRAM.
     static const bool fixed_cache_on = std::getenv("EDEN_NX2_NVN_NO_FIXED_CACHE") == nullptr;
     BoundRange bound;
+    // The range's snapshot when this call has looked it up: UploadRange need not again.
+    const Submission::BufferBytes* snapshot{};
+    bool looked_up{};
     if (const auto [known, fresh] = bound_ranges.try_emplace(range); fresh) {
-        const auto* const snapshot = fixed_cache_on ? submission.FindSnapshot(range) : nullptr;
+        snapshot = fixed_cache_on ? submission.FindSnapshot(range) : nullptr;
+        looked_up = fixed_cache_on;
         bound.fixed = snapshot && snapshot->fixed_pool;
         bound.span = bound.fixed ? nullptr : BoundSpan(range);
         known->second = bound;
@@ -2551,7 +2555,7 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
         if (const auto [upload, offset] = CreateStorageUpload(submission, range); upload) {
             return {upload->buffer, upload->base + offset};
         }
-        return UploadRange(submission, range);
+        return UploadRange(submission, range, snapshot, looked_up);
     }
     if (const auto storage = FindStorageRange(range); storage != storage_uploads.end()) {
         return {storage->second.buffer,
@@ -2560,7 +2564,7 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
     if (const auto [upload, offset] = CreateStorageUpload(submission, range); upload) {
         return {upload->buffer, upload->base + offset};
     }
-    return UploadRange(submission, range);
+    return UploadRange(submission, range, snapshot, looked_up);
 }
 
 void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {

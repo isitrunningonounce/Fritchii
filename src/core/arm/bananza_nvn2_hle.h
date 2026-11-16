@@ -360,7 +360,8 @@ private:
     struct PendingWrites {
         u64 fence;
         u64 sequence;
-        std::map<u64, u64> ranges;
+        // Start and end of each, in order and apart: the list is copied for every scan.
+        std::vector<std::pair<u64, u64>> ranges;
     };
     std::vector<PendingWrites> pending_writes;
     std::vector<u64> present_fences;

@@ -1059,6 +1059,16 @@ bool Overlaps(const std::map<u64, u64>& ranges, u64 start, u64 end) {
     return (it != ranges.end() && it->first < end) ||
            (it != ranges.begin() && std::prev(it)->second > start);
 }
+
+// The same for ranges kept in order in a vector.
+bool Overlaps(std::span<const std::pair<u64, u64>> ranges, u64 start, u64 end) {
+    if (ranges.empty() || end <= ranges.front().first) {
+        return false;
+    }
+    const auto it = std::ranges::upper_bound(ranges, start, {}, &std::pair<u64, u64>::first);
+    return (it != ranges.end() && it->first < end) ||
+           (it != ranges.begin() && std::prev(it)->second > start);
+}
 } // Anonymous namespace
 
 void Session::WaitForPendingWrites(u64 guest, u64 size, const char* reason) {
@@ -1962,11 +1972,22 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index) {
             const BananzaNvn2Commands::ScanEntry& entry = entries[entry_index];
 #if defined(_M_X64) || defined(__x86_64__)
-            // The called recordings are small and scattered: start loading the next one.
+            // The called recordings are small and scattered: start loading the one four
+            // steps on, and the entries of the one two steps on, whose own bytes that load
+            // has brought in by now.
+            if (entry_index + 4 < entries.size() &&
+                entries[entry_index + 4].kind == ScanKind::Call) {
+                const auto* const ahead = reinterpret_cast<const BananzaNvn2Commands::Recording*>(
+                    entries[entry_index + 4].a);
+                _mm_prefetch(reinterpret_cast<const char*>(ahead), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&ahead->scan), _MM_HINT_T0);
+            }
             if (entry_index + 2 < entries.size() &&
                 entries[entry_index + 2].kind == ScanKind::Call) {
-                _mm_prefetch(reinterpret_cast<const char*>(entries[entry_index + 2].a),
-                             _MM_HINT_T0);
+                const auto* const next = reinterpret_cast<const BananzaNvn2Commands::Recording*>(
+                    entries[entry_index + 2].a);
+                _mm_prefetch(reinterpret_cast<const char*>(next->scan.data()), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(next->scan.data()) + 64, _MM_HINT_T0);
             }
 #endif
             switch (entry.kind) {
@@ -2733,7 +2754,7 @@ void Session::FinishSubmit(Memory::Memory& memory, Queue& queue,
     }
     const bool may_write_storage = !submission.storage_addresses.empty() ||
                                    !submission.indirect_reset_addresses.empty();
-    std::map<u64, u64> writes;
+    std::vector<std::pair<u64, u64>> writes;
     const u64 sequence = submission.sequence;
     submission.host_queued_ns = BananzaNvn2Commands::HostNs();
     if (may_write_storage && !SyncSubmits()) {
@@ -2754,7 +2775,7 @@ void Session::FinishSubmit(Memory::Memory& memory, Queue& queue,
             for (++i; i < spans.size() && spans[i].first <= end; ++i) {
                 end = std::max(end, spans[i].second);
             }
-            writes.emplace_hint(writes.end(), start, end);
+            writes.emplace_back(start, end);
         }
     }
     const auto late_copies = submission.late_copies;
