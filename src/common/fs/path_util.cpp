@@ -20,6 +20,7 @@
 #include "common/logging.h"
 
 #ifdef _WIN32
+#include <cstdlib> // _wgetenv
 #include <shlobj.h> // Used in GetExeDirectory()
 #else
 #include <cstdlib>     // Used in Get(Home/Data)Directory()
@@ -112,10 +113,17 @@ public:
         fs::path eden_path_cache;
         fs::path eden_path_config;
 #ifdef _WIN32
-        // User directory takes priority over global %AppData% directory
-        eden_path = GetExeDirectory() / PORTABLE_DIR;
-        if (!Exists(eden_path) || !IsDir(eden_path)) {
-            eden_path = GetAppDataRoamingDirectory() / EDEN_DIR;
+        // EDEN_USER_DIR=<folder>: that folder is the user directory, before the two below
+        // (test runs that must not touch the player's saves, settings and caches).
+        const wchar_t* const user_override = _wgetenv(L"EDEN_USER_DIR");
+        if (user_override != nullptr && IsDir(fs::path{user_override})) {
+            eden_path = fs::path{user_override};
+        } else {
+            // User directory takes priority over global %AppData% directory
+            eden_path = GetExeDirectory() / PORTABLE_DIR;
+            if (!Exists(eden_path) || !IsDir(eden_path)) {
+                eden_path = GetAppDataRoamingDirectory() / EDEN_DIR;
+            }
         }
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
