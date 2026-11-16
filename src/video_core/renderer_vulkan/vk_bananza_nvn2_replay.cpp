@@ -667,6 +667,26 @@ void BananzaNvn2Replay::RetireLoop(std::stop_token token) {
                      at(job.replay_start_ns), at(job.push_ns), job.first_tick, job.tick,
                      job.tick >= job.first_tick ? at(first_begin) : 0.0, at(last_begin),
                      at(last_end), at(dequeued_ns), at(gpu_done_ns), at(retired_ns));
+            if (job.draws > 1000) {
+                // When each result's command buffer went to the GPU: what the game could
+                // have at that time.
+                std::string writes;
+                for (const WriteBack& write : job.writes) {
+                    writes += fmt::format(" {} bytes at {:#x} tick +{} at +{:.3f};", write.bytes,
+                                          write.guest_address, write.tick - job.first_tick,
+                                          at(scheduler.SubmitTimes(write.tick).second));
+                }
+                const auto reports = std::ranges::count_if(job.counters, [](const auto& event) {
+                    return event.kind == CounterEvent::Kind::Report;
+                });
+                LOG_INFO(Render_Vulkan,
+                         "NVN 2 timeline: seq {} results: {} ranges written:{} {} reports over {} "
+                         "of {} queries, the last one's copied by tick +{} at +{:.3f} (early: {})",
+                         job.sequence, job.writes.size(), writes, reports, job.reported,
+                         job.queries, job.report_tick ? job.report_tick - job.first_tick : 0,
+                         job.report_tick ? at(scheduler.SubmitTimes(job.report_tick).second) : 0.0,
+                         reports_early);
+            }
         }
     }
 }
