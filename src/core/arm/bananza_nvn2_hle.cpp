@@ -251,10 +251,23 @@ u64 CommandBytes(std::string_view name, const GuestCall& call) {
 
 } // Anonymous namespace
 
+namespace {
+bool SyncSubmits();
+} // Anonymous namespace
+
+Session::~Session() {
+    BananzaNvn2Commands::GetRetirement().SetDrain({});
+}
+
 Session::Session(System& system_, const BananzaNvn2Trace::Session& trace, u64 bootstrap_,
                  u64 internal_bootstrap_, u64 callback_return_)
     : bootstrap{bootstrap_}, internal_bootstrap{internal_bootstrap_},
       callback_return{callback_return_}, procedures(trace.Size()), system{system_} {
+    // EDEN_NX2_NVN_SYNC_SCAN=1: the scan runs inside the game's submit call, as before.
+    if (std::getenv("EDEN_NX2_NVN_SYNC_SCAN") == nullptr && !SyncSubmits()) {
+        submit_lane = std::make_unique<SubmitLane>();
+        BananzaNvn2Commands::GetRetirement().SetDrain([this] { submit_lane->Wait(); });
+    }
     for (size_t index = 0; index < procedures.size(); ++index) {
         const auto name = trace.Name(index);
         auto& procedure = procedures[index];
@@ -415,11 +428,12 @@ std::optional<GuestCallback> Session::BeginCallback(u64 thread, size_t procedure
     if (!beginning && !ending && !command_bytes) {
         return std::nullopt;
     }
-    std::shared_lock lock{command_mutex};
     const u64 address = call.x[0];
-    const auto buffer = command_buffers.find(address);
+    auto& shard = CommandShardOf(address);
+    std::shared_lock lock{shard.mutex};
+    const auto buffer = shard.buffers.find(address);
     const auto state = recorder.GetState(address);
-    if (buffer == command_buffers.end() || !state || !buffer->second.callback) {
+    if (buffer == shard.buffers.end() || !state || !buffer->second.callback) {
         return std::nullopt;
     }
     if (command_bytes) {
@@ -437,7 +451,7 @@ std::optional<GuestCallback> Session::BeginCallback(u64 thread, size_t procedure
     const u64 callback = buffer->second.callback;
     const u64 callback_data = buffer->second.callback_data;
     lock.unlock();
-    std::unique_lock exclusive{command_mutex};
+    std::unique_lock exclusive{callback_mutex};
     auto& continuations = callback_continuations[thread];
     if (continuations.size() >= 8) {
         exclusive.unlock();
@@ -458,7 +472,7 @@ std::optional<GuestCallback> Session::BeginCallback(u64 thread, size_t procedure
 }
 
 std::optional<CallbackContinuation> Session::EndCallback(u64 thread) {
-    std::scoped_lock lock{command_mutex};
+    std::scoped_lock lock{callback_mutex};
     const auto it = callback_continuations.find(thread);
     if (it == callback_continuations.end()) {
         return std::nullopt;
@@ -470,6 +484,10 @@ std::optional<CallbackContinuation> Session::EndCallback(u64 thread) {
     }
     return continuation;
 }
+
+namespace {
+bool WaitInvalidate();
+} // Anonymous namespace
 
 u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& memory, size_t index,
                       const GuestCall& call,
@@ -510,7 +528,7 @@ u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& me
         procedure.state_binding) {
         const auto start = call_profile ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-        std::shared_lock lock{command_mutex};
+        std::shared_lock lock{CommandShardOf(x[0]).mutex};
         if (call_profile) {
             profile_lock_wait += ElapsedNs(start);
         }
@@ -530,7 +548,7 @@ u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& me
     if (handler == Handler::Command && procedure.per_buffer_command && !recording_stats) {
         const auto start = call_profile ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-        std::shared_lock lock{command_mutex};
+        std::shared_lock lock{CommandShardOf(x[0]).mutex};
         std::shared_lock resource_lock{resource_mutex};
         std::shared_lock pool_lock{pool_buffer_mutex};
         if (call_profile) {
@@ -543,14 +561,86 @@ u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& me
         return 0;
     }
     if (handler == Handler::Command && !recording_stats) {
-        // Initialize and Finalize: the set of command buffers changes, nothing else of the
-        // session, so they do not wait for a submit that holds the session lock.
-        std::scoped_lock command_lock{command_mutex};
+        // Initialize and Finalize: the command buffers of one part change, nothing else of
+        // the session, so they do not wait for a submit that holds the session lock.
+        std::scoped_lock command_lock{CommandShardOf(x[0]).mutex};
         if (const auto result = HandleCommands(memory, index, name, call)) {
             return *result;
         }
         NoteMissing(name);
         return 0;
+    }
+    // Calls that touch only the buffer table, or nothing: they do not wait for a submit that
+    // holds the session lock (the game's worker threads make about 80 of them a frame while
+    // the camera moves).
+    if (handler == Handler::Buffer && name == "nvnBufferFinalize") {
+        std::unique_lock buffer_lock{pool_buffer_mutex};
+        buffers.erase(x[0]);
+        return 0;
+    }
+    if (handler == Handler::Buffer && name == "nvnBufferInitialize") {
+        return InitializeBuffer(memory, call);
+    }
+    if ((handler == Handler::Buffer || handler == Handler::Pool) && !WaitInvalidate() &&
+        (name == "nvnBufferInvalidateMappedRange" ||
+         name == "nvnMemoryPoolInvalidateMappedRange")) {
+        return 0;
+    }
+    if (submit_lane) {
+        if (handler == Handler::Queue && name == "nvnQueuePresentTexture") {
+            return PresentAsync(call, present_deadline);
+        }
+        // A fence names the last submission, which is known when its submit returns; a call
+        // with an unknown queue or sync goes on to be reported below.
+        if (handler == Handler::Queue && name == "nvnQueueFenceSync" && FenceSyncAsync(call)) {
+            return 0;
+        }
+        // A flush only stamps pages for a later scan: noted here, applied under the session
+        // lock by whoever takes it next. The game makes dozens a frame while the camera
+        // turns, from the threads that work on the next frame while the scan runs.
+        if (handler == Handler::Pool && name == "nvnMemoryPoolFlushMappedRange") {
+            std::scoped_lock flush_lock{flush_mutex};
+            pending_flushes.push_back({x[0], x[1], x[2]});
+            flushes_pending.store(true, std::memory_order_release);
+            return 0;
+        }
+        if (handler == Handler::Buffer && name == "nvnBufferFlushMappedRange") {
+            std::shared_lock buffer_lock{pool_buffer_mutex};
+            if (const auto buffer = buffers.find(x[0]);
+                buffer != buffers.end() && Fits(x[1], x[2], buffer->second.size)) {
+                std::scoped_lock flush_lock{flush_mutex};
+                pending_flushes.push_back({buffer->second.pool, buffer->second.offset + x[1], x[2]});
+                flushes_pending.store(true, std::memory_order_release);
+                return 0;
+            }
+        }
+        // The game acquires the next image right after it presents one.
+        if (handler == Handler::Window && name == "nvnWindowAcquireTexture" &&
+            AcquireAsync(memory, call)) {
+            return 0;
+        }
+        if (handler == Handler::Queue &&
+            (name == "nvnQueueFlush" || name == "nvnQueueSetDebugLabel")) {
+            std::scoped_lock frame_lock{frame_mutex};
+            if (queues.contains(x[0])) {
+                return 0;
+            }
+        }
+        // These read or change what a submit leaves or what its scan reads (pending GPU
+        // writes, pools and textures, the queue's sequence): after the scans queued before.
+        if (handler == Handler::Pool || handler == Handler::Buffer ||
+            handler == Handler::Resource || handler == Handler::Queue ||
+            (handler == Handler::SyncEvent && name.starts_with("nvnSync"))) {
+            static const bool no_sync_wait = std::getenv("EDEN_NX2_NVN_NO_SYNC_WAIT") != nullptr;
+            if (!(no_sync_wait && name == "nvnSyncWait")) {
+                const auto lane_start = call_profile ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
+                submit_lane->Wait();
+                if (call_profile) {
+                    profile_lock_wait += ElapsedNs(lane_start);
+                }
+            }
+        }
     }
     const auto lock_start = call_profile ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
@@ -558,6 +648,7 @@ u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& me
     if (call_profile) {
         profile_lock_wait += ElapsedNs(lock_start);
     }
+    ApplyPendingFlushes();
     if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
         ReportMissing(false);
         ReportRecordingStats();
@@ -575,17 +666,25 @@ u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& me
     case Handler::Buffer:
         result = HandleBuffer(memory, name, call);
         break;
-    case Handler::Queue:
+    case Handler::Queue: {
+        // The set of queues changes: not while a present reads it.
+        std::unique_lock frame_lock{frame_mutex, std::defer_lock};
+        if (name == "nvnQueueInitialize" || name == "nvnQueueFinalize") {
+            frame_lock.lock();
+        }
         result = HandleQueue(memory, name, call, lock, present_deadline);
         break;
-    case Handler::Window:
+    }
+    case Handler::Window: {
+        std::scoped_lock frame_lock{frame_mutex};
         result = HandleWindow(memory, name, call);
         break;
+    }
     case Handler::SyncEvent:
         result = HandleSyncEvent(memory, name, call, lock);
         break;
     case Handler::Command: {
-        std::scoped_lock command_lock{command_mutex};
+        std::scoped_lock command_lock{CommandShardOf(x[0]).mutex};
         result = HandleCommands(memory, index, name, call);
         break;
     }
@@ -796,6 +895,25 @@ std::optional<ResourcePoolInfo> Session::GetPool(u64 address) const {
     }
     const auto& pool = it->second;
     return ResourcePoolInfo{pool.device, pool.storage, pool.size, pool.gpu_address, pool.flags};
+}
+
+void Session::ApplyPendingFlushes() {
+    if (!flushes_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<PendingFlush> flushes;
+    {
+        std::scoped_lock flush_lock{flush_mutex};
+        flushes.swap(pending_flushes);
+        flushes_pending.store(false, std::memory_order_release);
+    }
+    for (const PendingFlush& flush : flushes) {
+        if (const auto pool = pools.find(flush.pool);
+            pool != pools.end() && pool->second.storage &&
+            Fits(flush.offset, flush.size, pool->second.size)) {
+            NoteFlush(pool->second, flush.offset, flush.size);
+        }
+    }
 }
 
 void Session::NoteFlush(const Pool& pool, u64 offset, u64 size) {
@@ -1119,10 +1237,21 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         u64 referenced_ranges{};
         u64 fixed_bytes{};
         std::vector<FixedCandidate> fixed;
-        std::vector<std::pair<Range, u64>> storage;
+        struct Storage {
+            Range range;
+            Submission::StorageAddress address;
+        };
+        std::vector<Storage> storage;
+        // The staged uniform ranges: pool serial, pool storage, pool size, begin and end in
+        // the pool.
+        std::vector<std::array<u64, 5>> pages;
+        // Those ranges as runs with their staging blocks, made by the thread of the shard.
+        std::vector<Submission::MirrorPage> runs;
         std::vector<Request> later;
         // Large copies, made after the tables are complete.
         std::vector<LateCopy> late;
+        // The newest submission that may still write a range passed by reference.
+        u64 after_writes{};
     };
     constexpr u32 CpuUncached = 2;
     constexpr u32 CpuCached = 4;
@@ -1150,6 +1279,25 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             return Overlaps(pending.ranges, guest, guest + size);
         });
     };
+    // A range the replay reads from guest memory is waited for there (Submission::after_writes),
+    // not by the scan: the scan of a frame runs while the GPU finishes the frame before.
+    // EDEN_NX2_NVN_SCAN_WAITS=1 waits here as before r155.
+    static const bool scan_waits = std::getenv("EDEN_NX2_NVN_SCAN_WAITS") != nullptr;
+    const auto note_pending = [&](ScanContext& context, u64 guest, u64 size) {
+        for (const PendingWrites& pending : *pending_view) {
+            if (pending.sequence > context.after_writes &&
+                Overlaps(pending.ranges, guest, guest + size)) {
+                context.after_writes = pending.sequence;
+            }
+        }
+    };
+    static const bool reference_storage = std::getenv("EDEN_NX2_NVN_COPY_STORAGE") == nullptr;
+    // Uniform ranges go to their pool's mirror as merged runs (r133); on by default since
+    // r150, EDEN_NX2_NVN_NO_STAGED_UNIFORMS=1 copies each range as before.
+    static const bool stage_uniforms =
+        std::getenv("EDEN_NX2_NVN_NO_STAGED_UNIFORMS") == nullptr;
+    // kind: 0 a copy, 1 storage of a graphics stage, 3 storage of a dispatch, 4 a uniform
+    // range (a copy unless its pages can be staged for the pool's mirror).
     const auto copy_range = [&](ScanContext& context, u64 address, u64 size, u32 kind) {
         if (!size || size > MaxRange || !Fits(buffer_bytes.load(), size, MaxBufferBytes)) {
             return;
@@ -1162,8 +1310,80 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         const Pool* pool{};
         const auto guest = resolve(context, address, size, &pool);
         const u8* const source = guest ? memory.GetSpan(*guest, size) : nullptr;
-        if (!context.whole && (!source || pending_overlap(*guest, size))) {
+        const bool referenced = !scan_waits && reference_storage && (kind == 1 || kind == 3) &&
+                                source && !owned;
+        if (!scan_waits && kind == 4 && source && !owned) {
+            const u64 before = context.after_writes;
+            context.after_writes = 0;
+            note_pending(context, *guest, size);
+            const bool pending = context.after_writes != 0;
+            context.after_writes = std::max(context.after_writes, before);
+            if (pending) {
+                // GPU work of an earlier submission may still write the range: the replay
+                // reads it from guest memory once those writes are back.
+                if (found == snapshots.end()) {
+                    snapshots.emplace(key, Submission::BufferBytes{source, false});
+                }
+                return;
+            }
+        }
+        if (!context.whole && (!source || (!referenced && pending_overlap(*guest, size)))) {
             context.later.push_back({address, size, kind});
+            return;
+        }
+        // The range's bytes as the table has them now, for the storage table.
+        const auto stored_as = [&](const Submission::BufferBytes& bytes) {
+            return Submission::StorageAddress{*guest, bytes.data, bytes.owned, bytes.late};
+        };
+        std::optional<Submission::StorageAddress> stored;
+        if (found != snapshots.end() && guest) {
+            stored = stored_as(found->second);
+        }
+        // A uniform range is not copied by itself: the pages it lies on go to the replay's
+        // mirror of its pool once per submission, and the entry says where it is in the pool.
+        if (stage_uniforms && kind == 4 && source && !owned && pool && pool->storage &&
+            size <= 65536 && *guest >= pool->storage &&
+            Fits(*guest - pool->storage, size, pool->size)) {
+            if (context.whole) {
+                WaitForPendingWrites(*guest, size, "uniform");
+                note_dirty(*guest, size, source, pool, 0);
+            }
+            const u64 offset = *guest - pool->storage;
+            auto& entry = found != snapshots.end()
+                              ? found->second
+                              : snapshots.emplace(key, Submission::BufferBytes{source, false})
+                                    .first->second;
+            entry.staged_pool = pool->serial;
+            entry.fixed_offset = offset;
+            entry.fixed_pool_guest = pool->storage;
+            entry.fixed_pool_size = pool->size;
+            const std::array<u64, 5> wanted{pool->serial, pool->storage, pool->size, offset,
+                                            offset + size};
+            if (context.pages.empty() || context.pages.back() != wanted) {
+                context.pages.push_back(wanted);
+            }
+            return;
+        }
+        // Storage is read by the replay from guest memory, as vertex data is: the game keeps
+        // it until the sync, and what the GPU wrote before is back (waited for above or here).
+        if (reference_storage && (kind == 1 || kind == 3) && source && !owned) {
+            if (referenced) {
+                note_pending(context, *guest, size);
+            } else if (context.whole) {
+                WaitForPendingWrites(*guest, size, "storage");
+            }
+            if (context.whole) {
+                note_dirty(*guest, size, source, pool, 1);
+            }
+            if (!stored) {
+                stored = stored_as(
+                    snapshots.emplace(key, Submission::BufferBytes{source, false}).first->second);
+                context.referenced_bytes += size;
+                ++context.referenced_ranges;
+            }
+            if (kind == 1) {
+                context.storage.push_back({key, *stored});
+            }
             return;
         }
         bool copied = owned;
@@ -1201,11 +1421,13 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                                                        : snapshots.try_emplace(key).first->second;
                 entry = {data, true};
                 entry.late = late;
+                if (guest) {
+                    stored = stored_as(entry);
+                }
             }
         }
-        if (kind == 1 && (copied || found != snapshots.end()) && guest &&
-            (source || ValidRange(memory, *guest, size))) {
-            context.storage.emplace_back(key, *guest);
+        if (kind == 1 && stored && guest && (source || ValidRange(memory, *guest, size))) {
+            context.storage.push_back({key, *stored});
         }
     };
     // Vertex and index data: the replay reads guest memory, as the GPU does at execution.
@@ -1226,8 +1448,13 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             copy_range(context, address, size, 0);
             return;
         }
-        if (context.whole) {
-            WaitForPendingWrites(*guest, size, "snapshot");
+        if (!scan_waits) {
+            note_pending(context, *guest, size);
+            if (context.whole) {
+                note_dirty(*guest, size, source, pool, 1);
+            }
+        } else if (context.whole) {
+            WaitForPendingWrites(*guest, size, "vertices");
             note_dirty(*guest, size, source, pool, 1);
         } else if (pending_overlap(*guest, size)) {
             context.later.push_back({address, size, 2});
@@ -1247,6 +1474,11 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             }
             bytes.fixed_pool = pool->serial;
             bytes.fixed_stamp = stamp;
+            if (*guest >= pool->storage && Fits(*guest - pool->storage, size, pool->size)) {
+                bytes.fixed_offset = *guest - pool->storage;
+                bytes.fixed_pool_guest = pool->storage;
+                bytes.fixed_pool_size = pool->size;
+            }
             context.fixed.push_back({key, *guest});
             context.fixed_bytes += size;
         }
@@ -1260,8 +1492,8 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     u64& referenced_bytes = main_context.referenced_bytes;
     u64& referenced_ranges = main_context.referenced_ranges;
     const auto note_storage = [&](ScanContext& context) {
-        for (const auto& [range, guest] : context.storage) {
-            batch.storage_addresses.emplace(range, guest);
+        for (const auto& [range, address] : context.storage) {
+            batch.storage_addresses.emplace(range, address);
         }
         context.storage.clear();
     };
@@ -1269,22 +1501,46 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     static const bool serial_scan = std::getenv("EDEN_NX2_NVN_SERIAL_SCAN") != nullptr;
     bool deferring = !serial_scan && !dirty_stats && !SerialCopies();
     // Kept between submits (one at a time, under the session lock): no new pages every frame.
-    static std::vector<Request> request_storage;
+    static std::array<std::vector<Request>, Submission::SnapshotShards> request_storage;
     auto& requests = request_storage;
-    requests.clear();
-    if (deferring) {
-        requests.reserve(32768);
+    for (auto& list : requests) {
+        list.clear();
+        if (deferring) {
+            list.reserve(8192);
+        }
     }
+    size_t request_count{};
+    // The last requests by address: one that repeats address, size and kind adds nothing.
+    static std::array<Request, 2048> recent_requests;
+    if (deferring) {
+        recent_requests.fill({});
+    }
+    const auto add_request = [&](u64 address, u64 size, u32 kind) {
+        Request& recent = recent_requests[(address * 0x9E3779B97F4A7C15ULL) >> 53];
+        if (recent.address == address && recent.size == size && recent.kind == kind && size) {
+            return;
+        }
+        recent = {address, size, kind};
+        requests[Submission::SnapshotShard({address, size})].push_back(recent);
+        ++request_count;
+    };
     const auto snapshot = [&](u64 address, u64 size) {
         if (deferring) {
-            requests.push_back({address, size, 0});
+            add_request(address, size, 0);
         } else {
             copy_range(main_context, address, size, 0);
         }
     };
+    const auto snapshot_uniform = [&](u64 address, u64 size) {
+        if (deferring) {
+            add_request(address, size, 4);
+        } else {
+            copy_range(main_context, address, size, 4);
+        }
+    };
     const auto reference = [&](u64 address, u64 size) {
         if (deferring) {
-            requests.push_back({address, size, 2});
+            add_request(address, size, 2);
         } else {
             reference_range(main_context, address, size);
         }
@@ -1319,9 +1575,13 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     bool storage_pending = true;
     bool descriptors_pending = true;
     std::vector<u64> written_textures;
+    // Reads of ranges the frame before may still write, made when the rest of the scan is
+    // done: the lists of indirect reset draws and the arguments of indexed indirect draws.
+    std::vector<Range> reset_lists;
+    std::vector<std::tuple<u64, u64, u64>> wanted_slices;
     const auto snapshot_graphics_storage = [&](std::pair<u64, u64> range) {
         if (deferring) {
-            requests.push_back({range.first, range.second, 1});
+            add_request(range.first, range.second, 1);
             return;
         }
         copy_range(main_context, range.first, range.second, 1);
@@ -1342,314 +1602,385 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             }
         }
     };
-    const auto scan = [&](auto&& self, const BananzaNvn2Commands::Recording& recording) -> void {
-        for (size_t op_index = 0; op_index < recording.operations.size(); ++op_index) {
-            const auto& op = recording.operations[op_index];
-            BananzaNvn2Commands::PrefetchCalled(recording.operations, op_index);
-            if (op.replay == ReplayOp::CopyTexture && op.Textures().size() == 2) {
-                sampled_textures.push_back(&op.Textures()[0]);
-                written_textures.push_back(op.Textures()[1].serial);
-            } else if (op.replay == ReplayOp::CopyBufferToTexture && op.Textures().size() == 1) {
-                written_textures.push_back(op.Textures()[0].serial);
-            } else if (op.replay == ReplayOp::SetRenderTargets) {
-                queue.target_serials = {};
-                for (size_t i = 0; i < op.Textures().size() && i < queue.target_serials.size(); ++i) {
-                    queue.target_serials[i] = op.Textures()[i].serial;
-                }
-                queue.targets_noted = false;
-            } else if (op.replay >= ReplayOp::ClearColor && op.replay <= ReplayOp::ClearDepthStencil) {
-                note_targets();
+    // What a draw or dispatch finds bound from before: collected at the first one.
+    const auto flush_buffers = [&] {
+        if (!buffers_pending) {
+            return;
+        }
+        buffers_pending = false;
+        for (const auto& [address, size] : queue.vertex_ranges) {
+            reference(address, size);
+        }
+        for (u32 stage = 0; stage < 3; ++stage) {
+            for (const auto& range : queue.storage_ranges[stage]) {
+                snapshot_graphics_storage(range);
             }
-            if (op.nested) {
-                self(self, *op.nested);
-            } else if ((op.replay == ReplayOp::SignalEvent || op.replay == ReplayOp::WaitEvent) &&
-                       !op.args.empty() && !batch.event_addresses.contains(op.args[0])) {
-                if (const auto address = ResolveGpuRange(op.args[0], sizeof(u32));
-                    address && ValidRange(memory, *address, sizeof(u32))) {
-                    batch.event_addresses.emplace(op.args[0], *address);
+        }
+        for (const auto& stage : queue.uniform_ranges) {
+            for (const auto& [address, size] : stage) {
+                snapshot_uniform(address, size);
+            }
+        }
+    };
+    const auto flush_descriptors = [&] {
+        if (!descriptors_pending) {
+            return;
+        }
+        descriptors_pending = false;
+        for (const auto& stage : queue.texture_handles) {
+            for (const u64 handle : stage) {
+                if (handle) {
+                    descriptor(handle);
                 }
-            } else if ((op.replay == ReplayOp::ReportCounter ||
-                        op.replay == ReplayOp::SetRenderEnableConditional) && op.args.size() == 2) {
-                const u64 size = op.replay == ReplayOp::ReportCounter ? 16 : 24;
-                const u64 gpu_address = op.args[1];
-                if (const auto address = ResolveGpuRange(gpu_address, size);
-                    address && ValidRange(memory, *address, size)) {
-                    batch.event_addresses.emplace(gpu_address, *address);
+            }
+        }
+        for (const auto& stage : queue.image_handles) {
+            for (const u64 handle : stage) {
+                if (handle) {
+                    descriptor(handle);
                 }
-            } else if (op.replay == ReplayOp::SetTexturePool && op.args.size() == 1) {
-                queue.texture_pool = op.args[0];
-                descriptors_pending = true;
-            } else if (op.replay == ReplayOp::BindProgram && op.args.size() == 2 && (op.args[1] & 1)) {
-                queue.resets_indirect_draws = op.Program() && op.Program()->resets_indirect_draws;
-            } else if (op.replay == ReplayOp::SetSamplerPool && op.args.size() == 1) {
-                queue.sampler_pool = op.args[0];
-                descriptors_pending = true;
-            } else if (op.replay == ReplayOp::SetCopyRowStride && op.args.size() == 1) {
-                queue.copy_row_stride = op.args[0];
-            } else if (op.replay == ReplayOp::CopyBufferToTexture && op.Textures().size() == 1 &&
-                       op.args.size() == 3 && op.Payload().size() == 40) {
-                const auto block = GetTextureFormatBlock(op.Textures()[0].description.format);
-                std::array<u32_le, 6> region{};
-                std::memcpy(region.data(), op.Payload().data() + 16, 24);
-                if (block && region[3] && region[4] && region[5] && region[3] <= 16384 &&
-                    region[4] <= 16384 && region[5] <= 2048) {
-                    const u64 bytes = (u64{region[3]} + block->width - 1) / block->width *
-                                      block->bytes;
-                    const u64 rows = (u64{region[4]} + block->height - 1) / block->height;
-                    const u64 stride = queue.copy_row_stride ? queue.copy_row_stride : bytes;
-                    if (stride >= bytes && stride <= MaxRange / (rows * region[5])) {
-                        snapshot(op.args[0], stride * (rows * region[5] - 1) + bytes);
+            }
+        }
+    };
+    // One operation that is not a call of another recording.
+    const auto scan_op = [&](const BananzaNvn2Commands::Operation& op) {
+        if (op.replay == ReplayOp::CopyTexture && op.Textures().size() == 2) {
+            sampled_textures.push_back(&op.Textures()[0]);
+            written_textures.push_back(op.Textures()[1].serial);
+        } else if (op.replay == ReplayOp::CopyBufferToTexture && op.Textures().size() == 1) {
+            written_textures.push_back(op.Textures()[0].serial);
+        } else if (op.replay == ReplayOp::SetRenderTargets) {
+            queue.target_serials = {};
+            for (size_t i = 0; i < op.Textures().size() && i < queue.target_serials.size(); ++i) {
+                queue.target_serials[i] = op.Textures()[i].serial;
+            }
+            queue.targets_noted = false;
+        } else if (op.replay >= ReplayOp::ClearColor && op.replay <= ReplayOp::ClearDepthStencil) {
+            note_targets();
+        }
+        if ((op.replay == ReplayOp::SignalEvent || op.replay == ReplayOp::WaitEvent) &&
+                   !op.args.empty() && !batch.event_addresses.contains(op.args[0])) {
+            if (const auto address = ResolveGpuRange(op.args[0], sizeof(u32));
+                address && ValidRange(memory, *address, sizeof(u32))) {
+                batch.event_addresses.emplace(op.args[0], *address);
+            }
+        } else if ((op.replay == ReplayOp::ReportCounter ||
+                    op.replay == ReplayOp::SetRenderEnableConditional) && op.args.size() == 2) {
+            const u64 size = op.replay == ReplayOp::ReportCounter ? 16 : 24;
+            const u64 gpu_address = op.args[1];
+            if (const auto address = ResolveGpuRange(gpu_address, size);
+                address && ValidRange(memory, *address, size)) {
+                batch.event_addresses.emplace(gpu_address, *address);
+            }
+        } else if (op.replay == ReplayOp::SetTexturePool && op.args.size() == 1) {
+            queue.texture_pool = op.args[0];
+            descriptors_pending = true;
+        } else if (op.replay == ReplayOp::BindProgram && op.args.size() == 2 && (op.args[1] & 1)) {
+            queue.resets_indirect_draws = op.Program() && op.Program()->resets_indirect_draws;
+        } else if (op.replay == ReplayOp::SetSamplerPool && op.args.size() == 1) {
+            queue.sampler_pool = op.args[0];
+            descriptors_pending = true;
+        } else if (op.replay == ReplayOp::SetCopyRowStride && op.args.size() == 1) {
+            queue.copy_row_stride = op.args[0];
+        } else if (op.replay == ReplayOp::CopyBufferToTexture && op.Textures().size() == 1 &&
+                   op.args.size() == 3 && op.Payload().size() == 40) {
+            const auto block = GetTextureFormatBlock(op.Textures()[0].description.format);
+            std::array<u32_le, 6> region{};
+            std::memcpy(region.data(), op.Payload().data() + 16, 24);
+            if (block && region[3] && region[4] && region[5] && region[3] <= 16384 &&
+                region[4] <= 16384 && region[5] <= 2048) {
+                const u64 bytes = (u64{region[3]} + block->width - 1) / block->width *
+                                  block->bytes;
+                const u64 rows = (u64{region[4]} + block->height - 1) / block->height;
+                const u64 stride = queue.copy_row_stride ? queue.copy_row_stride : bytes;
+                if (stride >= bytes && stride <= MaxRange / (rows * region[5])) {
+                    snapshot(op.args[0], stride * (rows * region[5] - 1) + bytes);
+                }
+            }
+        } else if (op.replay == ReplayOp::BindTexture && op.args.size() == 3) {
+            if (op.args[0] < queue.texture_handles.size() && op.args[1] < 64) {
+                queue.texture_handles[op.args[0]][op.args[1]] = op.args[2];
+                bound_handle(op.args[2]);
+            }
+        } else if (op.replay == ReplayOp::BindImage && op.args.size() == 3) {
+            if (op.args[0] < queue.image_handles.size() && op.args[1] < 32) {
+                queue.image_handles[op.args[0]][op.args[1]] = op.args[2];
+                bound_handle(op.args[2]);
+            }
+        } else if (op.replay == ReplayOp::BindTextures && op.args.size() == 3) {
+            for (size_t offset = 0; offset + 8 <= op.Payload().size(); offset += 8) {
+                u64_le handle;
+                std::memcpy(&handle, op.Payload().data() + offset, 8);
+                const u64 slot = op.args[1] + offset / 8;
+                if (op.args[0] < queue.texture_handles.size() && slot < 64) {
+                    queue.texture_handles[op.args[0]][slot] = handle;
+                    bound_handle(handle);
+                }
+            }
+        } else if (op.replay == ReplayOp::BindVertexBuffer && op.args.size() == 3) {
+            if (op.args[0] < queue.vertex_ranges.size()) {
+                queue.vertex_ranges[op.args[0]] = {op.args[1], op.args[2]};
+                if (!buffers_pending) {
+                    reference(op.args[1], op.args[2]);
+                }
+            }
+        } else if ((op.replay == ReplayOp::BindUniformBuffer ||
+                    op.replay == ReplayOp::BindStorageBuffer) && op.args.size() == 4) {
+            const bool uniform = op.replay == ReplayOp::BindUniformBuffer;
+            auto& ranges = uniform ? queue.uniform_ranges : queue.storage_ranges;
+            if (op.args[0] < ranges.size() && op.args[1] < 32) {
+                ranges[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
+                storage_pending |= op.args[0] == 5;
+                if (!buffers_pending && uniform) {
+                    snapshot_uniform(op.args[2], op.args[3]);
+                } else if (!buffers_pending && op.args[0] < 3) {
+                    snapshot_graphics_storage({op.args[2], op.args[3]});
+                }
+            }
+        } else if ((op.replay == ReplayOp::BindUniformBuffers ||
+                    op.replay == ReplayOp::BindStorageBuffers) && op.args.size() == 3) {
+            storage_pending |= op.args[0] == 5;
+            const bool uniform = op.replay == ReplayOp::BindUniformBuffers;
+            auto& ranges = uniform ? queue.uniform_ranges : queue.storage_ranges;
+            for (size_t offset = 0; offset + 16 <= op.Payload().size(); offset += 16) {
+                std::array<u64_le, 2> range{};
+                std::memcpy(range.data(), op.Payload().data() + offset, 16);
+                const u64 slot = op.args[1] + offset / 16;
+                if (op.args[0] < ranges.size() && slot < 32) {
+                    ranges[op.args[0]][slot] = {range[0], range[1]};
+                    if (buffers_pending) {
+                        continue;
+                    }
+                    if (uniform) {
+                        snapshot_uniform(range[0], range[1]);
+                    } else if (op.args[0] < 3) {
+                        snapshot_graphics_storage({range[0], range[1]});
                     }
                 }
-            } else if (op.replay == ReplayOp::BindTexture && op.args.size() == 3) {
-                if (op.args[0] < queue.texture_handles.size() && op.args[1] < 64) {
-                    queue.texture_handles[op.args[0]][op.args[1]] = op.args[2];
-                    bound_handle(op.args[2]);
+            }
+        } else if (op.replay == ReplayOp::BindTexturesDeferred && op.args.size() == 4) {
+            const u64 size = op.args[2] * sizeof(u64);
+            const auto key = std::pair{op.args[3], size};
+            if (size && Fits(buffer_bytes.load(), size, MaxBufferBytes) && !batch.deferred_data.contains(key) &&
+                ValidRange(memory, key.first, key.second)) {
+                WaitForPendingWrites(key.first, key.second, "deferred textures");
+                std::vector<u8> data(size);
+                if (memory.ReadBlockUnsafe(key.first, data.data(), size)) {
+                    batch.deferred_data.emplace(key, std::move(data));
+                    buffer_bytes += size;
                 }
-            } else if (op.replay == ReplayOp::BindImage && op.args.size() == 3) {
-                if (op.args[0] < queue.image_handles.size() && op.args[1] < 32) {
-                    queue.image_handles[op.args[0]][op.args[1]] = op.args[2];
-                    bound_handle(op.args[2]);
-                }
-            } else if (op.replay == ReplayOp::BindTextures && op.args.size() == 3) {
-                for (size_t offset = 0; offset + 8 <= op.Payload().size(); offset += 8) {
+            }
+            if (const auto it = batch.deferred_data.find(key); it != batch.deferred_data.end()) {
+                for (size_t offset = 0; offset + 8 <= it->second.size(); offset += 8) {
                     u64_le handle;
-                    std::memcpy(&handle, op.Payload().data() + offset, 8);
+                    std::memcpy(&handle, it->second.data() + offset, 8);
                     const u64 slot = op.args[1] + offset / 8;
                     if (op.args[0] < queue.texture_handles.size() && slot < 64) {
                         queue.texture_handles[op.args[0]][slot] = handle;
                         bound_handle(handle);
                     }
                 }
-            } else if (op.replay == ReplayOp::BindVertexBuffer && op.args.size() == 3) {
-                if (op.args[0] < queue.vertex_ranges.size()) {
-                    queue.vertex_ranges[op.args[0]] = {op.args[1], op.args[2]};
-                    if (!buffers_pending) {
-                        reference(op.args[1], op.args[2]);
-                    }
-                }
-            } else if ((op.replay == ReplayOp::BindUniformBuffer ||
-                        op.replay == ReplayOp::BindStorageBuffer) && op.args.size() == 4) {
-                const bool uniform = op.replay == ReplayOp::BindUniformBuffer;
-                auto& ranges = uniform ? queue.uniform_ranges : queue.storage_ranges;
-                if (op.args[0] < ranges.size() && op.args[1] < 32) {
-                    ranges[op.args[0]][op.args[1]] = {op.args[2], op.args[3]};
-                    storage_pending |= op.args[0] == 5;
-                    if (!buffers_pending && uniform) {
-                        snapshot(op.args[2], op.args[3]);
-                    } else if (!buffers_pending && op.args[0] < 3) {
-                        snapshot_graphics_storage({op.args[2], op.args[3]});
-                    }
-                }
-            } else if ((op.replay == ReplayOp::BindUniformBuffers ||
-                        op.replay == ReplayOp::BindStorageBuffers) && op.args.size() == 3) {
-                storage_pending |= op.args[0] == 5;
-                const bool uniform = op.replay == ReplayOp::BindUniformBuffers;
-                auto& ranges = uniform ? queue.uniform_ranges : queue.storage_ranges;
-                for (size_t offset = 0; offset + 16 <= op.Payload().size(); offset += 16) {
-                    std::array<u64_le, 2> range{};
-                    std::memcpy(range.data(), op.Payload().data() + offset, 16);
-                    const u64 slot = op.args[1] + offset / 16;
-                    if (op.args[0] < ranges.size() && slot < 32) {
-                        ranges[op.args[0]][slot] = {range[0], range[1]};
-                        if (buffers_pending) {
-                            continue;
-                        }
-                        if (uniform) {
-                            snapshot(range[0], range[1]);
-                        } else if (op.args[0] < 3) {
-                            snapshot_graphics_storage({range[0], range[1]});
-                        }
-                    }
-                }
-            } else if (op.replay == ReplayOp::BindTexturesDeferred && op.args.size() == 4) {
-                const u64 size = op.args[2] * sizeof(u64);
-                const auto key = std::pair{op.args[3], size};
-                if (size && Fits(buffer_bytes.load(), size, MaxBufferBytes) && !batch.deferred_data.contains(key) &&
-                    ValidRange(memory, key.first, key.second)) {
-                    WaitForPendingWrites(key.first, key.second, "deferred textures");
-                    std::vector<u8> data(size);
-                    if (memory.ReadBlockUnsafe(key.first, data.data(), size)) {
-                        batch.deferred_data.emplace(key, std::move(data));
-                        buffer_bytes += size;
-                    }
-                }
-                if (const auto it = batch.deferred_data.find(key); it != batch.deferred_data.end()) {
-                    for (size_t offset = 0; offset + 8 <= it->second.size(); offset += 8) {
-                        u64_le handle;
-                        std::memcpy(&handle, it->second.data() + offset, 8);
-                        const u64 slot = op.args[1] + offset / 8;
-                        if (op.args[0] < queue.texture_handles.size() && slot < 64) {
-                            queue.texture_handles[op.args[0]][slot] = handle;
-                            bound_handle(handle);
-                        }
-                    }
-                }
-            } else if ((op.replay == ReplayOp::DrawIndexed ||
-                        op.replay == ReplayOp::DrawIndexedBaseVertex ||
-                        op.replay == ReplayOp::DrawIndexedInstanced) && op.args.size() >= 4 &&
-                       op.args[1] <= 2 && op.args[2] <= MaxRange / 4) {
-                reference(op.args[3], op.args[2] << op.args[1]);
             }
-            if (op.replay == ReplayOp::DrawIndirect && op.args.size() == 2) {
-                indirect_arg_requests.emplace(op.args[1], 4 * sizeof(u32));
-            } else if (op.replay == ReplayOp::DrawIndexedIndirect && op.args.size() == 4 &&
-                       op.args[1] <= 2) {
-                const u64 address = op.args[2];
-                indirect_arg_requests.emplace(op.args[3], 5 * sizeof(u32));
-                const auto key = std::tuple{op.args[3], address, op.args[1]};
-                if (!batch.indirect_index_slices.contains(key)) {
-                    std::array<u32_le, 5> words{};
-                    const bool read = read_gpu(op.args[3], {reinterpret_cast<u8*>(words.data()),
-                                                            sizeof(words)});
-                    const u64 start = u64{words[2]} << op.args[1];
-                    const u64 bytes = u64{words[0]} << op.args[1];
-                    const bool valid = read && bytes && words[1] && bytes <= MaxRange &&
-                                       address <= std::numeric_limits<u64>::max() - start;
-                    batch.indirect_index_slices.try_emplace(key, valid ? address + start : 0,
-                                                           valid ? bytes : 0);
-                }
-                if (!indirect_index_requests.contains(address)) {
-                    constexpr u64 wanted = 16ULL << 10;
-                    const auto pool = gpu_pools.upper_bound(address);
-                    if (pool != gpu_pools.begin()) {
-                        const auto& storage = pools.at(std::prev(pool)->second);
-                        const u64 offset = address - storage.gpu_address;
-                        if (offset < storage.size) {
-                            u64 available = std::min(wanted, storage.size - offset);
-                            if (storage.flags & VirtualPool) {
-                                available = std::min(available,
-                                                     PoolAlignment - address % PoolAlignment);
-                            }
-                            indirect_index_requests.try_emplace(address, available);
+        } else if ((op.replay == ReplayOp::DrawIndexed ||
+                    op.replay == ReplayOp::DrawIndexedBaseVertex ||
+                    op.replay == ReplayOp::DrawIndexedInstanced) && op.args.size() >= 4 &&
+                   op.args[1] <= 2 && op.args[2] <= MaxRange / 4) {
+            reference(op.args[3], op.args[2] << op.args[1]);
+        }
+        if (op.replay == ReplayOp::DrawIndirect && op.args.size() == 2) {
+            indirect_arg_requests.emplace(op.args[1], 4 * sizeof(u32));
+        } else if (op.replay == ReplayOp::DrawIndexedIndirect && op.args.size() == 4 &&
+                   op.args[1] <= 2) {
+            const u64 address = op.args[2];
+            indirect_arg_requests.emplace(op.args[3], 5 * sizeof(u32));
+            wanted_slices.emplace_back(op.args[3], address, op.args[1]);
+            if (!indirect_index_requests.contains(address)) {
+                constexpr u64 wanted = 16ULL << 10;
+                const auto pool = gpu_pools.upper_bound(address);
+                if (pool != gpu_pools.begin()) {
+                    const auto& storage = pools.at(std::prev(pool)->second);
+                    const u64 offset = address - storage.gpu_address;
+                    if (offset < storage.size) {
+                        u64 available = std::min(wanted, storage.size - offset);
+                        if (storage.flags & VirtualPool) {
+                            available = std::min(available,
+                                                 PoolAlignment - address % PoolAlignment);
                         }
-                    }
-                }
-            }
-            const bool draw = op.replay >= ReplayOp::Draw && op.replay <= ReplayOp::DrawIndexedIndirect;
-            const bool dispatch = op.replay == ReplayOp::Dispatch;
-            if (draw) {
-                note_targets();
-            }
-            if (queue.resets_indirect_draws && op.replay == ReplayOp::Draw &&
-                op.args.size() == 3 && op.args[0] == 0) {
-                const auto& [address, size] = queue.storage_ranges[0][0];
-                const auto list = VideoCommon::NativeIndirectReset::GetListRange(
-                    address, static_cast<u32>(size), static_cast<u32>(op.args[1]),
-                    static_cast<u32>(op.args[2]));
-                if (list) {
-                    // Read below, so not left for the threads that share the ranges.
-                    copy_range(main_context, list->address, list->bytes, 0);
-                    drain();
-                    const auto bytes = batch.BufferSnapshot({list->address, list->bytes});
-                    if (!bytes.empty()) {
-                        for (size_t offset = 0; offset < list->bytes; offset += sizeof(u64)) {
-                            u64_le record;
-                            std::memcpy(&record, bytes.data() + offset, sizeof(record));
-                            if (batch.indirect_reset_addresses.contains(record)) {
-                                continue;
-                            }
-                            constexpr size_t RecordSize = sizeof(VideoCommon::NativeIndirectReset::Record);
-                            if (const auto guest = ResolveGpuRange(record, RecordSize);
-                                guest && ValidRange(memory, *guest, RecordSize)) {
-                                batch.indirect_reset_addresses.emplace(record, *guest);
-                            }
-                        }
-                    }
-                }
-            }
-            if (dispatch && op.args.size() == 1) {
-                snapshot(op.args[0], 3 * sizeof(u32));
-            }
-            if ((draw || dispatch) && buffers_pending) {
-                buffers_pending = false;
-                for (const auto& [address, size] : queue.vertex_ranges) {
-                    reference(address, size);
-                }
-                for (u32 stage = 0; stage < 3; ++stage) {
-                    for (const auto& range : queue.storage_ranges[stage]) {
-                        snapshot_graphics_storage(range);
-                    }
-                }
-                for (const auto& stage : queue.uniform_ranges) {
-                    for (const auto& [address, size] : stage) {
-                        snapshot(address, size);
-                    }
-                }
-            }
-            if (dispatch && storage_pending) {
-                storage_pending = false;
-                const auto snapshot_storage = [&](std::pair<u64, u64> range) {
-                    const bool unsized = range.first && !range.second;
-                    if (unsized) {
-                        const auto guest = ResolveGpuRange(range.first, 1);
-                        if (!guest || !ValidRange(memory, *guest, 1)) {
-                            batch.unsized_storage_sizes.try_emplace(range.first, 0);
-                            return;
-                        }
-                        const auto& pool = pools.at(std::prev(gpu_pools.upper_bound(range.first))->second);
-                        const u64 offset = range.first - pool.gpu_address;
-                        range.second = std::min(MaxRange, pool.size - offset);
-                        if (pool.flags & VirtualPool) {
-                            range.second = std::min(range.second, PoolAlignment - range.first % PoolAlignment);
-                        }
-                        const auto mapped_range = [&](u64 size) {
-                            return ResolveGpuRange(range.first, size) && ValidRange(memory, *guest, size);
-                        };
-                        if (!mapped_range(range.second)) {
-                            // Keep the mapped prefix when an unsized binding crosses a hole.
-                            u64 mapped = 1;
-                            u64 end = range.second;
-                            while (mapped < end) {
-                                const u64 size = mapped + (end - mapped + 1) / 2;
-                                if (mapped_range(size)) {
-                                    mapped = size;
-                                } else {
-                                    end = size - 1;
-                                }
-                            }
-                            range.second = mapped;
-                        }
-                    }
-                    copy_range(main_context, range.first, range.second, 0);
-                    if (batch.HasSnapshot(range)) {
-                        if (const auto guest = ResolveGpuRange(range.first, range.second);
-                            guest && ValidRange(memory, *guest, range.second)) {
-                            batch.storage_addresses.try_emplace(range, *guest);
-                            if (unsized) {
-                                batch.unsized_storage_sizes.try_emplace(range.first, range.second);
-                            }
-                        }
-                    }
-                };
-                for (const auto& range : queue.storage_ranges[5]) {
-                    snapshot_storage(range);
-                }
-                for (const auto& range : queue.uniform_ranges[5]) {
-                    snapshot_storage(range);
-                }
-            }
-            if ((draw || dispatch) && descriptors_pending) {
-                descriptors_pending = false;
-                for (const auto& stage : queue.texture_handles) {
-                    for (const u64 handle : stage) {
-                        if (handle) {
-                            descriptor(handle);
-                        }
-                    }
-                }
-                for (const auto& stage : queue.image_handles) {
-                    for (const u64 handle : stage) {
-                        if (handle) {
-                            descriptor(handle);
-                        }
+                        indirect_index_requests.try_emplace(address, available);
                     }
                 }
             }
         }
+        const bool draw = op.replay >= ReplayOp::Draw && op.replay <= ReplayOp::DrawIndexedIndirect;
+        const bool dispatch = op.replay == ReplayOp::Dispatch;
+        if (draw) {
+            note_targets();
+        }
+        if (queue.resets_indirect_draws && op.replay == ReplayOp::Draw &&
+            op.args.size() == 3 && op.args[0] == 0) {
+            const auto& [address, size] = queue.storage_ranges[0][0];
+            const auto list = VideoCommon::NativeIndirectReset::GetListRange(
+                address, static_cast<u32>(size), static_cast<u32>(op.args[1]),
+                static_cast<u32>(op.args[2]));
+            if (list && std::ranges::find(reset_lists, Range{list->address, list->bytes}) ==
+                            reset_lists.end()) {
+                reset_lists.emplace_back(list->address, list->bytes);
+            }
+        }
+        if (dispatch && op.args.size() == 1) {
+            snapshot(op.args[0], 3 * sizeof(u32));
+        }
+        if (draw || dispatch) {
+            flush_buffers();
+        }
+        if (dispatch && storage_pending) {
+            storage_pending = false;
+            const auto snapshot_storage = [&](std::pair<u64, u64> range) {
+                const bool unsized = range.first && !range.second;
+                if (unsized) {
+                    const auto guest = ResolveGpuRange(range.first, 1);
+                    if (!guest || !ValidRange(memory, *guest, 1)) {
+                        batch.unsized_storage_sizes.try_emplace(range.first, 0);
+                        return;
+                    }
+                    const auto& pool = pools.at(std::prev(gpu_pools.upper_bound(range.first))->second);
+                    const u64 offset = range.first - pool.gpu_address;
+                    range.second = std::min(MaxRange, pool.size - offset);
+                    if (pool.flags & VirtualPool) {
+                        range.second = std::min(range.second, PoolAlignment - range.first % PoolAlignment);
+                    }
+                    const auto mapped_range = [&](u64 size) {
+                        return ResolveGpuRange(range.first, size) && ValidRange(memory, *guest, size);
+                    };
+                    if (!mapped_range(range.second)) {
+                        // Keep the mapped prefix when an unsized binding crosses a hole.
+                        u64 mapped = 1;
+                        u64 end = range.second;
+                        while (mapped < end) {
+                            const u64 size = mapped + (end - mapped + 1) / 2;
+                            if (mapped_range(size)) {
+                                mapped = size;
+                            } else {
+                                end = size - 1;
+                            }
+                        }
+                        range.second = mapped;
+                    }
+                }
+                copy_range(main_context, range.first, range.second, 3);
+                if (const auto* const bytes = batch.FindSnapshot(range)) {
+                    if (const auto guest = ResolveGpuRange(range.first, range.second);
+                        guest && ValidRange(memory, *guest, range.second)) {
+                        batch.storage_addresses.try_emplace(
+                            range, Submission::StorageAddress{*guest, bytes->data,
+                                                              bytes->owned, bytes->late});
+                        if (unsized) {
+                            batch.unsized_storage_sizes.try_emplace(range.first, range.second);
+                        }
+                    }
+                }
+            };
+            for (const auto& range : queue.storage_ranges[5]) {
+                snapshot_storage(range);
+            }
+            for (const auto& range : queue.uniform_ranges[5]) {
+                snapshot_storage(range);
+            }
+        }
+        if (draw || dispatch) {
+            flush_descriptors();
+        }
+    };
+    static_assert(MaxRange == BananzaNvn2Commands::ScanMaxRange);
+    // The operations themselves, with EDEN_NX2_NVN_WALK_OPS=1.
+    const auto walk_ops = [&](auto&& self, const BananzaNvn2Commands::Recording& recording) -> void {
+        for (size_t op_index = 0; op_index < recording.operations.size(); ++op_index) {
+            const auto& op = recording.operations[op_index];
+            BananzaNvn2Commands::PrefetchCalled(recording.operations, op_index);
+            if (op.nested) {
+                self(self, *op.nested);
+            } else {
+                scan_op(op);
+            }
+        }
+    };
+    static const bool walk_entries = std::getenv("EDEN_NX2_NVN_WALK_OPS") == nullptr;
+    using ScanKind = BananzaNvn2Commands::ScanEntry::Kind;
+    // The entries a recording made of its own operations when it ended: the same steps as
+    // scan_op takes for a bind or an indexed draw. A called recording's entries are walked in
+    // place of its call.
+    const auto walk_scan = [&](auto&& self,
+                               const BananzaNvn2Commands::Recording& scanned) -> void {
+        const auto& entries = scanned.scan;
+        for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index) {
+            const BananzaNvn2Commands::ScanEntry& entry = entries[entry_index];
+#if defined(_M_X64) || defined(__x86_64__)
+            // The called recordings are small and scattered: start loading the next one.
+            if (entry_index + 2 < entries.size() &&
+                entries[entry_index + 2].kind == ScanKind::Call) {
+                _mm_prefetch(reinterpret_cast<const char*>(entries[entry_index + 2].a),
+                             _MM_HINT_T0);
+            }
+#endif
+            switch (entry.kind) {
+            case ScanKind::Vertex:
+                if (entry.slot < queue.vertex_ranges.size()) {
+                    queue.vertex_ranges[entry.slot] = {entry.a, entry.b};
+                    if (!buffers_pending) {
+                        reference(entry.a, entry.b);
+                    }
+                }
+                break;
+            case ScanKind::Uniform:
+            case ScanKind::Storage: {
+                const bool uniform = entry.kind == ScanKind::Uniform;
+                auto& ranges = uniform ? queue.uniform_ranges : queue.storage_ranges;
+                if (entry.stage < ranges.size() && entry.slot < 32) {
+                    ranges[entry.stage][entry.slot] = {entry.a, entry.b};
+                    storage_pending |= entry.stage == 5;
+                    if (!buffers_pending && uniform) {
+                        snapshot_uniform(entry.a, entry.b);
+                    } else if (!buffers_pending && entry.stage < 3) {
+                        snapshot_graphics_storage({entry.a, entry.b});
+                    }
+                }
+                break;
+            }
+            case ScanKind::Texture:
+                if (entry.stage < queue.texture_handles.size() && entry.slot < 64) {
+                    queue.texture_handles[entry.stage][entry.slot] = entry.a;
+                    bound_handle(entry.a);
+                }
+                break;
+            case ScanKind::Image:
+                if (entry.stage < queue.image_handles.size() && entry.slot < 32) {
+                    queue.image_handles[entry.stage][entry.slot] = entry.a;
+                    bound_handle(entry.a);
+                }
+                break;
+            case ScanKind::Index:
+                reference(entry.a, entry.b);
+                break;
+            case ScanKind::Draw:
+                note_targets();
+                flush_buffers();
+                flush_descriptors();
+                break;
+            case ScanKind::Op:
+                scan_op(*reinterpret_cast<const BananzaNvn2Commands::Operation*>(entry.a));
+                break;
+            case ScanKind::Call:
+                self(self, *reinterpret_cast<const BananzaNvn2Commands::Recording*>(entry.a));
+                break;
+            }
+        }
     };
     for (const auto& recording : batch.recordings) {
-        scan(scan, *recording);
+        if (!walk_entries) {
+            walk_ops(walk_ops, *recording);
+            continue;
+        }
+        walk_scan(walk_scan, *recording);
     }
     // The backing bytes of the sampled textures: on the game thread, while the range
     // threads work when there are any.
@@ -1904,24 +2235,54 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     }
     texture_ns = ElapsedNs(texture_start);
     };
+    // The staged uniform ranges as runs: ranges of a pool that touch or lie within 256 bytes
+    // go as one. With `later` the copy is left to the late-copy threads.
+    const auto stage_runs = [&](std::vector<std::array<u64, 5>>& wanted,
+                                std::vector<LateCopy>* later, size_t shard,
+                                std::vector<Submission::MirrorPage>& runs, bool& incomplete) {
+        std::ranges::sort(wanted);
+        for (size_t i = 0; i < wanted.size();) {
+            const u64 serial = wanted[i][0];
+            const u64 storage = wanted[i][1];
+            const u64 pool_size = wanted[i][2];
+            const u64 begin = wanted[i][3];
+            u64 end = wanted[i][4];
+            for (++i; i < wanted.size() && wanted[i][0] == serial && wanted[i][3] <= end + 256;
+                 ++i) {
+                end = std::max(end, wanted[i][4]);
+            }
+            const u64 bytes = end - begin;
+            const u8* const host = memory.GetSpan(storage + begin, bytes);
+            if (!host) {
+                incomplete = true;
+                continue;
+            }
+            u8* const dest = batch.snapshot_blocks[shard].Allocate(bytes);
+            if (later) {
+                later->push_back({dest, host, bytes});
+            } else {
+                std::memcpy(dest, host, bytes);
+            }
+            runs.push_back({serial, pool_size, begin, dest, bytes});
+        }
+    };
+    std::array<bool, Submission::SnapshotShards> runs_incomplete{};
     if (deferring) {
         deferring = false;
         std::array<ScanContext, Submission::SnapshotShards> contexts;
         const auto run = [&](size_t shard) {
             auto& context = contexts[shard];
             context.whole = false;
-            for (const Request& request : requests) {
-                if (Submission::SnapshotShard({request.address, request.size}) != shard) {
-                    continue;
-                }
+            for (const Request& request : requests[shard]) {
                 if (request.kind == 2) {
                     reference_range(context, request.address, request.size);
                 } else {
                     copy_range(context, request.address, request.size, request.kind);
                 }
             }
+            stage_runs(context.pages, &context.late, shard, context.runs, runs_incomplete[shard]);
         };
-        if (requests.size() >= 512) {
+        if (request_count >= 512) {
             const std::vector<PendingWrites> pending_copy = pending_writes;
             pending_view = &pending_copy;
             for (size_t shard = 0; shard < contexts.size(); ++shard) {
@@ -1937,6 +2298,7 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         }
         for (auto& context : contexts) {
             note_storage(context);
+            batch.after_writes = std::max(batch.after_writes, context.after_writes);
             fixed_candidates.insert(fixed_candidates.end(), context.fixed.begin(),
                                     context.fixed.end());
             fixed_bytes += context.fixed_bytes;
@@ -1953,6 +2315,11 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                                       std::min(PieceBytes, copy.size - offset)});
                 }
             }
+        }
+        for (size_t shard = 0; shard < contexts.size(); ++shard) {
+            batch.mirror_pages.insert(batch.mirror_pages.end(), contexts[shard].runs.begin(),
+                                      contexts[shard].runs.end());
+            batch.mirror_pages_incomplete |= runs_incomplete[shard];
         }
         if (!pieces.empty()) {
             const u32 tasks = static_cast<u32>(std::min<size_t>(4, pieces.size()));
@@ -1984,6 +2351,44 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         }
         note_storage(main_context);
     }
+    stage_runs(main_context.pages, nullptr, 0, batch.mirror_pages,
+               batch.mirror_pages_incomplete);
+    main_context.pages.clear();
+    for (const auto& [list_address, list_bytes] : reset_lists) {
+        copy_range(main_context, list_address, list_bytes, 0);
+        drain();
+        const auto bytes = batch.BufferSnapshot({list_address, list_bytes});
+        if (bytes.empty()) {
+            continue;
+        }
+        for (size_t offset = 0; offset < list_bytes; offset += sizeof(u64)) {
+            u64_le record;
+            std::memcpy(&record, bytes.data() + offset, sizeof(record));
+            if (batch.indirect_reset_addresses.contains(record)) {
+                continue;
+            }
+            constexpr size_t RecordSize = sizeof(VideoCommon::NativeIndirectReset::Record);
+            if (const auto guest = ResolveGpuRange(record, RecordSize);
+                guest && ValidRange(memory, *guest, RecordSize)) {
+                batch.indirect_reset_addresses.emplace(record, *guest);
+            }
+        }
+    }
+    for (const auto& key : wanted_slices) {
+        if (batch.indirect_index_slices.contains(key)) {
+            continue;
+        }
+        const auto& [arguments, address, type] = key;
+        std::array<u32_le, 5> words{};
+        const bool read = read_gpu(arguments, {reinterpret_cast<u8*>(words.data()),
+                                               sizeof(words)});
+        const u64 start = u64{words[2]} << type;
+        const u64 bytes = u64{words[0]} << type;
+        const bool valid = read && bytes && words[1] && bytes <= MaxRange &&
+                           address <= std::numeric_limits<u64>::max() - start;
+        batch.indirect_index_slices.try_emplace(key, valid ? address + start : 0,
+                                               valid ? bytes : 0);
+    }
     // Keep the order of indirect snapshots when they compete for the remaining byte budget.
     std::vector<Range> indirect_args(indirect_arg_requests.begin(), indirect_arg_requests.end());
     std::ranges::sort(indirect_args);
@@ -2014,8 +2419,8 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         AddRange(gpu_written_guest, start, end);
         written_grew = true;
     };
-    for (const auto& [range, guest] : batch.storage_addresses) {
-        add_written(guest, guest + range.second);
+    for (const auto& [range, stored] : batch.storage_addresses) {
+        add_written(stored.guest, stored.guest + range.second);
     }
     for (const auto& [record, guest] : batch.indirect_reset_addresses) {
         add_written(guest, guest + ResetRecordSize);
@@ -2041,6 +2446,7 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     if (!textures_done) {
         texture_stage();
     }
+    batch.after_writes = std::max(batch.after_writes, main_context.after_writes);
     for (const u64 serial : written_textures) {
         if (serial) {
             gpu_written_textures.insert(serial);
@@ -2081,35 +2487,42 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     }
 }
 
+u64 Session::InitializeBuffer(Memory::Memory& memory, const GuestCall& call) {
+    const auto& x = call.x;
+    if (!ValidRange(memory, x[0], 0x28) || !ValidRange(memory, x[1], 0x28)) {
+        return 0;
+    }
+    Buffer buffer{
+        .device = memory.Read64(x[1] + 0x08),
+        .pool = memory.Read64(x[1] + 0x10),
+        .offset = memory.Read64(x[1] + 0x18),
+        .size = memory.Read64(x[1] + 0x20),
+    };
+    {
+        // The pools and the buffer table: no other session state, so no wait for a scan.
+        std::unique_lock lock{pool_buffer_mutex};
+        const auto pool = pools.find(buffer.pool);
+        if (pool == pools.end() || pool->second.device != buffer.device ||
+            pool->second.flags & PhysicalPool ||
+            !Fits(buffer.offset, buffer.size, pool->second.size)) {
+            return 0;
+        }
+        buffer.pool_address = pool->second.gpu_address;
+        buffers.insert_or_assign(x[0], buffer);
+    }
+    memory.Write64(x[0], 0);
+    memory.Write64(x[0] + 0x08, buffer.device);
+    memory.Write64(x[0] + 0x10, buffer.pool);
+    memory.Write64(x[0] + 0x18, buffer.offset);
+    memory.Write64(x[0] + 0x20, buffer.size);
+    return 1;
+}
+
 std::optional<u64> Session::HandleBuffer(Memory::Memory& memory, std::string_view name,
                                         const GuestCall& call) {
     const auto& x = call.x;
     if (name == "nvnBufferInitialize") {
-        if (!ValidRange(memory, x[0], 0x28) || !ValidRange(memory, x[1], 0x28)) {
-            return 0;
-        }
-        Buffer buffer{
-            .device = memory.Read64(x[1] + 0x08),
-            .pool = memory.Read64(x[1] + 0x10),
-            .offset = memory.Read64(x[1] + 0x18),
-            .size = memory.Read64(x[1] + 0x20),
-        };
-        const auto pool = pools.find(buffer.pool);
-        if (pool == pools.end() || pool->second.device != buffer.device ||
-            pool->second.flags & PhysicalPool || !Fits(buffer.offset, buffer.size, pool->second.size)) {
-            return 0;
-        }
-        buffer.pool_address = pool->second.gpu_address;
-        {
-            std::unique_lock lock{pool_buffer_mutex};
-            buffers.insert_or_assign(x[0], buffer);
-        }
-        memory.Write64(x[0], 0);
-        memory.Write64(x[0] + 0x08, buffer.device);
-        memory.Write64(x[0] + 0x10, buffer.pool);
-        memory.Write64(x[0] + 0x18, buffer.offset);
-        memory.Write64(x[0] + 0x20, buffer.size);
-        return 1;
+        return InitializeBuffer(memory, call);
     } else if (name == "nvnBufferFinalize") {
         std::unique_lock lock{pool_buffer_mutex};
         buffers.erase(x[0]);
@@ -2241,6 +2654,282 @@ void Session::UpdateCommandCursor(Memory::Memory& memory, u64 address,
     }
 }
 
+void Session::FinishSubmit(Memory::Memory& memory, Queue& queue,
+                           BananzaNvn2Commands::Submission& submission,
+                           std::unique_lock<std::mutex>& lock) {
+    ApplyPendingFlushes();
+    // The operations in the order they run are only read by the replay: a helper thread
+    // lists them while the scan runs.
+    const auto flattened = std::make_shared<BananzaNvn2Commands::Submission::CopyState>();
+    flattened->left.store(1, std::memory_order_release);
+    late_copy_workers.QueueWork([flattened, &submission] {
+        BananzaNvn2Commands::FlattenRecordings(submission);
+        flattened->Done();
+    });
+    SnapshotResources(memory, submission, queue);
+    flattened->Wait();
+    ++accepted_submissions;
+    accepted_commands += submission.command_count;
+    if (recording_stats) {
+        CountRecordings(submission);
+    }
+    if (!logged_submit) {
+        logged_submit = true;
+        LOG_INFO(Core_ARM,
+                 "Bananza NVN 2 HLE accepted submission {} with {} handles and {} commands",
+                 submission.sequence, submission.handles.size(), submission.command_count);
+    }
+    const bool may_write_storage = !submission.storage_addresses.empty() ||
+                                   !submission.indirect_reset_addresses.empty();
+    std::map<u64, u64> writes;
+    const u64 sequence = submission.sequence;
+    submission.host_queued_ns = BananzaNvn2Commands::HostNs();
+    if (may_write_storage && !SyncSubmits()) {
+        // Sorted and merged first: thousands of ranges become a few map entries.
+        std::vector<std::pair<u64, u64>> spans;
+        spans.reserve(submission.storage_addresses.size() +
+                      submission.indirect_reset_addresses.size());
+        for (const auto& [range, stored] : submission.storage_addresses) {
+            spans.emplace_back(stored.guest, stored.guest + range.second);
+        }
+        constexpr u64 RecordSize = sizeof(VideoCommon::NativeIndirectReset::Record);
+        for (const auto& [record, guest] : submission.indirect_reset_addresses) {
+            spans.emplace_back(guest, guest + RecordSize);
+        }
+        std::ranges::sort(spans);
+        for (size_t i = 0; i < spans.size();) {
+            auto [start, end] = spans[i];
+            for (++i; i < spans.size() && spans[i].first <= end; ++i) {
+                end = std::max(end, spans[i].second);
+            }
+            writes.emplace_hint(writes.end(), start, end);
+        }
+    }
+    const auto late_copies = submission.late_copies;
+    const u64 replay_fence = system.GPU().SubmitRendererWork(
+        [batch = std::make_shared<const BananzaNvn2Commands::Submission>(
+             std::move(submission))](VideoCore::RendererBase& renderer) {
+            renderer.ReplayBananzaNvn2(*batch);
+        });
+    {
+        std::scoped_lock frame_lock{frame_mutex};
+        queue.fence = replay_fence;
+    }
+    // The replay runs already; the game gets its memory back once the copies are made.
+    if (late_copies) {
+        late_copies->Wait();
+    }
+    {
+        std::scoped_lock frame_lock{frame_mutex};
+        queue.sequence = sequence;
+        queue.submit_host_ns = static_cast<u64>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    if (call_profile) {
+        ++call_profile->submit.submits;
+    }
+    if (may_write_storage && !SyncSubmits()) {
+        if (call_profile && logged_overlaps < 48) {
+            LOG_INFO(Core_ARM, "Bananza NVN 2 submission {} is fence {}", sequence,
+                     queue.fence);
+        }
+        pending_writes.push_back({queue.fence, sequence, std::move(writes)});
+    } else if (may_write_storage) {
+        const u64 fence = queue.fence;
+        pending_storage_fence = fence;
+        if (call_profile) {
+            ++call_profile->submit.waits;
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
+        lock.unlock();
+        system.GPU().WaitForSyncOperation(fence);
+        BananzaNvn2Commands::GetRetirement().WaitWrites(sequence);
+        lock.lock();
+        if (pending_storage_fence == fence) {
+            pending_storage_fence = 0;
+        }
+        if (call_profile) {
+            call_profile->submit.wait_ns += ElapsedNs(wait_start);
+        }
+    }
+}
+
+bool Session::AcquireAsync(Memory::Memory& memory, const GuestCall& call) {
+    const auto& x = call.x;
+    std::scoped_lock frame_lock{frame_mutex};
+    const auto found = windows.find(x[0]);
+    if (found == windows.end()) {
+        return false;
+    }
+    Window& window = found->second;
+    const auto sync = syncs.find(x[1]);
+    if ((x[1] && (sync == syncs.end() || sync->second.device != window.device)) ||
+        !ValidRange(memory, x[2], sizeof(u32))) {
+        return false;
+    }
+    for (u32 i = 0; i < window.active; ++i) {
+        const u32 image = (window.next + i) % window.active;
+        if (window.acquired[image]) {
+            continue;
+        }
+        window.next = (image + 1) % window.active;
+        window.acquired[image] = true;
+        memory.Write32(x[2], image);
+        if (sync != syncs.end()) {
+            sync->second.status = SyncStatus::Signaled;
+            sync->second.fence = 0;
+            sync->second.sequence = 0;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool Session::FenceSyncAsync(const GuestCall& call) {
+    const auto& x = call.x;
+    std::scoped_lock frame_lock{frame_mutex};
+    const auto queue = queues.find(x[0]);
+    const auto sync = syncs.find(x[1]);
+    if (queue == queues.end() || sync == syncs.end() ||
+        queue->second.device != sync->second.device) {
+        return false;
+    }
+    sync->second.status =
+        queue->second.rejected_submit ? SyncStatus::Failed : SyncStatus::Signaled;
+    // The fence may still be an earlier submission's: the sequence is what a wait goes by.
+    sync->second.fence = queue->second.fence;
+    sync->second.sequence = queue->second.sequence;
+    sync->second.submit_host_ns = queue->second.submit_host_ns;
+    return true;
+}
+
+u64 Session::PresentAsync(const GuestCall& call,
+                          std::chrono::steady_clock::time_point* present_deadline) {
+    const auto& x = call.x;
+    std::unique_lock frame_lock{frame_mutex};
+    const auto queue = queues.find(x[0]);
+    const auto window = windows.find(x[1]);
+    const u32 image = static_cast<u32>(x[2]);
+    const bool valid = queue != queues.end() && window != windows.end() &&
+                       queue->second.device == window->second.device &&
+                       image < window->second.textures.size() && window->second.acquired[image];
+    std::optional<ResourceTextureInfo> texture;
+    if (valid) {
+        window->second.acquired[image] = false;
+        std::shared_lock resource_lock{resource_mutex};
+        if (const auto found = resources.GetTexture(window->second.textures[image])) {
+            texture = *found;
+        }
+    }
+    if (!texture) {
+        frame_lock.unlock();
+        std::scoped_lock session_lock{mutex};
+        NoteMissing(valid ? "nvnQueuePresentTexture invalid texture"
+                          : "nvnQueuePresentTexture invalid queue or image");
+        return 0;
+    }
+    const auto& description = texture->description;
+    Tegra::FramebufferConfig config{
+        .width = description.width,
+        .height = description.height,
+        .stride = description.width,
+        .pixel_format = Service::android::PixelFormat::Rgba8888,
+    };
+    // The colour space follows the format, as for a native present.
+    if (description.format == 0x29) {
+        config.pixel_format = Service::android::PixelFormat::RgbaFp16;
+        config.color_space = Tegra::ColorSpace::RGB709_Linear;
+    } else if (description.format == 0x3d) {
+        config.pixel_format = Service::android::PixelFormat::Rgba1010102;
+        if (Common::DisplayHdrMonitor::Instance().GuestToldHdr()) {
+            config.color_space = Tegra::ColorSpace::RGB2020_PQ;
+        }
+    }
+    const auto& crop = window->second.crop;
+    if (crop[2] && crop[3] && Fits(crop[0], crop[2], config.width) &&
+        Fits(crop[1], crop[3], config.height)) {
+        config.crop_rect = {static_cast<int>(crop[0]), static_cast<int>(crop[1]),
+                            static_cast<int>(crop[0] + crop[2]),
+                            static_cast<int>(crop[1] + crop[3])};
+    }
+    const auto present_call = std::chrono::steady_clock::now();
+    const auto game_stage = perf_frame_begin.time_since_epoch().count()
+                                ? present_call - perf_frame_begin
+                                : std::chrono::steady_clock::duration::zero();
+    perf_frame_begin = present_call;
+    presents_outstanding.fetch_add(1, std::memory_order_acq_rel);
+    present_marks = {queue->second.sequence, present_marks[0]};
+    // Behind the scans of the submits made before this call, on the same thread.
+    submit_lane->Queue([this, handle = x[0], shown = std::move(*texture), config, game_stage] {
+        std::scoped_lock session_lock{mutex};
+        ++present_serial;
+        if (recording_stats) {
+            ++recording_stats->presents;
+        }
+        if (call_profile) {
+            std::scoped_lock profile_lock{call_profile->mutex};
+            ++call_profile->presents;
+        }
+        const u64 fence = system.GPU().SubmitRendererWork(
+            [this, shown, config, game_stage,
+             perf = &system.GetPerfStats()](VideoCore::RendererBase& renderer) {
+                const auto start = std::chrono::steady_clock::now();
+                renderer.PresentBananzaNvn2(shown, config);
+                const std::chrono::nanoseconds replay_stage =
+                    std::chrono::nanoseconds{BananzaNvn2Commands::g_replay_busy_ns.exchange(
+                        0, std::memory_order_relaxed)} +
+                    (std::chrono::steady_clock::now() - start);
+                perf->AddSystemFrame(std::max<std::chrono::nanoseconds>(game_stage, replay_stage));
+                {
+                    std::scoped_lock wait_lock{present_wait_mutex};
+                    presents_outstanding.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                present_done.notify_all();
+            });
+        std::scoped_lock frame_lock{frame_mutex};
+        if (const auto found = queues.find(handle); found != queues.end()) {
+            found->second.fence = fence;
+        }
+    });
+    const u16 speed = Settings::SpeedLimitEnabled() ? Settings::SpeedLimit() : 0;
+    const auto interval = window->second.interval;
+    // Experiment: EDEN_NX2_NVN_UNPACED=1 never sleeps to the display's grid.
+    static const bool unpaced = std::getenv("EDEN_NX2_NVN_UNPACED") != nullptr;
+    static u32 unpaced_interval{};
+    if (unpaced && interval != unpaced_interval) {
+        unpaced_interval = interval;
+        LOG_INFO(Core_ARM, "Bananza NVN 2 present interval {}, not paced", interval);
+    }
+    const auto period = speed && interval && !unpaced
+        ? std::chrono::nanoseconds{100'000'000'000LL * std::min(interval, 4U) / 60 / speed}
+        : std::chrono::nanoseconds::zero();
+    if (period != present_period) {
+        LOG_INFO(Core_ARM, "Bananza NVN 2 present interval {}, pacing period {} us", interval,
+                 period.count() / 1000);
+        present_pacer = {};
+        present_period = period;
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(period.count(),
+                                                             std::memory_order_relaxed);
+    }
+    if (period.count() && present_deadline) {
+        *present_deadline =
+            present_pacer.Advance(std::chrono::steady_clock::now(), period).deadline;
+    }
+    if (present_deadline && *present_deadline > perf_frame_begin) {
+        perf_frame_begin = *present_deadline;
+    }
+    frame_lock.unlock();
+    // Nothing else keeps the game near the replay.
+    constexpr u32 PresentsAhead = 2;
+    if (presents_outstanding.load(std::memory_order_acquire) > PresentsAhead) {
+        std::unique_lock wait_lock{present_wait_mutex};
+        present_done.wait_for(wait_lock, std::chrono::milliseconds{250}, [&] {
+            return presents_outstanding.load(std::memory_order_acquire) <= PresentsAhead;
+        });
+    }
+    return 0;
+}
+
 std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view name,
                                        const GuestCall& call, std::unique_lock<std::mutex>& lock,
                                        std::chrono::steady_clock::time_point* present_deadline) {
@@ -2310,83 +2999,21 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
                 submission->depth_minus_one_to_one = device->second.depth_mode == 0;
                 submission->origin_lower_left = device->second.origin == 0;
             }
-            SnapshotResources(memory, *submission, queue->second);
-            ++accepted_submissions;
-            accepted_commands += submission->command_count;
-            if (recording_stats) {
-                CountRecordings(*submission);
-            }
-            if (!logged_submit) {
-                logged_submit = true;
-                LOG_INFO(Core_ARM,
-                         "Bananza NVN 2 HLE accepted submission {} with {} handles and {} commands",
-                         submission->sequence, submission->handles.size(), submission->command_count);
-            }
-            const bool may_write_storage = !submission->storage_addresses.empty() ||
-                                           !submission->indirect_reset_addresses.empty();
-            std::map<u64, u64> writes;
-            const u64 sequence = submission->sequence;
-            submission->host_queued_ns = BananzaNvn2Commands::HostNs();
-            if (may_write_storage && !SyncSubmits()) {
-                // Sorted and merged first: thousands of ranges become a few map entries.
-                std::vector<std::pair<u64, u64>> spans;
-                spans.reserve(submission->storage_addresses.size() +
-                              submission->indirect_reset_addresses.size());
-                for (const auto& [range, guest] : submission->storage_addresses) {
-                    spans.emplace_back(guest, guest + range.second);
+            if (submit_lane) {
+                // The sequence is the queue's at once: a sync fenced now waits for it.
+                {
+                    std::scoped_lock frame_lock{frame_mutex};
+                    queue->second.sequence = submission->sequence;
                 }
-                constexpr u64 RecordSize = sizeof(VideoCommon::NativeIndirectReset::Record);
-                for (const auto& [record, guest] : submission->indirect_reset_addresses) {
-                    spans.emplace_back(guest, guest + RecordSize);
-                }
-                std::ranges::sort(spans);
-                for (size_t i = 0; i < spans.size();) {
-                    auto [start, end] = spans[i];
-                    for (++i; i < spans.size() && spans[i].first <= end; ++i) {
-                        end = std::max(end, spans[i].second);
+                submit_lane->Queue([this, &memory, handle = x[0],
+                                    batch = std::move(*submission)]() mutable {
+                    std::unique_lock scan_lock{mutex};
+                    if (const auto found = queues.find(handle); found != queues.end()) {
+                        FinishSubmit(memory, found->second, batch, scan_lock);
                     }
-                    writes.emplace_hint(writes.end(), start, end);
-                }
-            }
-            const auto late_copies = submission->late_copies;
-            queue->second.fence = system.GPU().SubmitRendererWork(
-                [batch = std::make_shared<const BananzaNvn2Commands::Submission>(
-                     std::move(*submission))](VideoCore::RendererBase& renderer) {
-                    renderer.ReplayBananzaNvn2(*batch);
                 });
-            // The replay runs already; the game gets its memory back once the copies are made.
-            if (late_copies) {
-                late_copies->Wait();
-            }
-            queue->second.sequence = sequence;
-            queue->second.submit_host_ns = static_cast<u64>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            if (call_profile) {
-                ++call_profile->submit.submits;
-            }
-            if (may_write_storage && !SyncSubmits()) {
-                if (call_profile && logged_overlaps < 48) {
-                    LOG_INFO(Core_ARM, "Bananza NVN 2 submission {} is fence {}", sequence,
-                             queue->second.fence);
-                }
-                pending_writes.push_back({queue->second.fence, sequence, std::move(writes)});
-            } else if (may_write_storage) {
-                const u64 fence = queue->second.fence;
-                pending_storage_fence = fence;
-                if (call_profile) {
-                    ++call_profile->submit.waits;
-                }
-                const auto wait_start = std::chrono::steady_clock::now();
-                lock.unlock();
-                system.GPU().WaitForSyncOperation(fence);
-                BananzaNvn2Commands::GetRetirement().WaitWrites(sequence);
-                lock.lock();
-                if (pending_storage_fence == fence) {
-                    pending_storage_fence = 0;
-                }
-                if (call_profile) {
-                    call_profile->submit.wait_ns += ElapsedNs(wait_start);
-                }
+            } else {
+                FinishSubmit(memory, queue->second, *submission, lock);
             }
         } else {
             ++rejected_submissions;
@@ -2406,6 +3033,7 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
         }
         return 1;
     } else if (name == "nvnQueueFenceSync") {
+        std::scoped_lock frame_lock{frame_mutex};
         const auto queue = queues.find(x[0]);
         const auto sync = syncs.find(x[1]);
         if (queue == queues.end() || sync == syncs.end() ||
@@ -2419,6 +3047,7 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
             sync->second.submit_host_ns = queue->second.submit_host_ns;
         }
     } else if (name == "nvnQueueWaitSync") {
+        std::scoped_lock frame_lock{frame_mutex};
         const auto queue = queues.find(x[0]);
         const auto sync = syncs.find(x[1]);
         if (queue == queues.end() || sync == syncs.end() ||
@@ -2500,7 +3129,14 @@ std::optional<u64> Session::HandleQueue(Memory::Memory& memory, std::string_view
                 });
             const u16 speed = Settings::SpeedLimitEnabled() ? Settings::SpeedLimit() : 0;
             const auto interval = window->second.interval;
-            const auto period = speed && interval
+            // Experiment: EDEN_NX2_NVN_UNPACED=1 never sleeps to the display's grid.
+            static const bool unpaced = std::getenv("EDEN_NX2_NVN_UNPACED") != nullptr;
+            static u32 unpaced_interval{};
+            if (unpaced && interval != unpaced_interval) {
+                unpaced_interval = interval;
+                LOG_INFO(Core_ARM, "Bananza NVN 2 present interval {}, not paced", interval);
+            }
+            const auto period = speed && interval && !unpaced
                 ? std::chrono::nanoseconds{100'000'000'000LL * std::min(interval, 4U) / 60 / speed}
                 : std::chrono::nanoseconds::zero();
             if (period != present_period) {
@@ -2683,33 +3319,71 @@ std::optional<u64> Session::HandleSyncEvent(Memory::Memory& memory, std::string_
         if (!x[0] || !devices.contains(x[1])) {
             return 0;
         }
+        std::scoped_lock frame_lock{frame_mutex};
         syncs.insert_or_assign(x[0], Sync{.device = x[1]});
         return 1;
     }
     if (name == "nvnSyncFinalize") {
+        std::scoped_lock frame_lock{frame_mutex};
         syncs.erase(x[0]);
     } else if (name == "nvnSyncWait") {
-        const auto sync = syncs.find(x[0]);
-        if (sync == syncs.end() || sync->second.status == SyncStatus::Failed) {
-            return SyncFailed;
+        Sync waited;
+        u64 earlier_mark{};
+        {
+            std::scoped_lock frame_lock{frame_mutex};
+            const auto sync = syncs.find(x[0]);
+            if (sync == syncs.end() || sync->second.status == SyncStatus::Failed) {
+                return SyncFailed;
+            }
+            if (sync->second.status != SyncStatus::Signaled) {
+                return SyncTimeout;
+            }
+            waited = sync->second;
+            earlier_mark = present_marks[1];
         }
-        if (sync->second.status != SyncStatus::Signaled) {
-            return SyncTimeout;
+        // Experiment: EDEN_NX2_NVN_NO_SYNC_WAIT=1 never makes the game wait for the GPU side.
+        static const bool no_sync_wait = std::getenv("EDEN_NX2_NVN_NO_SYNC_WAIT") != nullptr;
+        if (no_sync_wait) {
+            return SyncAlreadySignaled;
         }
-        const u64 fence = sync->second.fence;
-        const u64 sequence = sync->second.sequence;
+        const u64 fence = waited.fence;
+        const u64 sequence = waited.sequence;
         auto& retirement = BananzaNvn2Commands::GetRetirement();
-        if (!fence || (system.GPU().CurrentSyncRequestFence() >= fence &&
-                       retirement.IsRetired(sequence))) {
+        // What a sync waits for, EDEN_NX2_NVN_SYNC:
+        // unset: what was submitted before the present before the last one is finished. The
+        //   game prepares and submits a frame while the one before is replayed, as it does
+        //   on the console while the GPU draws; never much more than a frame is outstanding.
+        // "replay": also the end of the submission's replay, when the game's memory has been
+        //   read for the last time (r155).
+        // "full": the GPU has finished the submission and its results are back (before r155).
+        // Without "full" the game can find counters and ranges the GPU wrote a frame later.
+        static const int sync_mode = [] {
+            const char* const value = std::getenv("EDEN_NX2_NVN_SYNC");
+            const std::string_view mode{value ? value : ""};
+            return mode == "full" ? 0 : mode == "replay" ? 1 : 2;
+        }();
+        const bool early = sync_mode != 0 && submit_lane;
+        const bool at_replay_end = early && sync_mode == 1;
+        const u64 finished = early ? std::min(sequence, earlier_mark) : sequence;
+        const bool reached = at_replay_end ? retirement.IsReplayed(sequence)
+                             : early       ? true
+                                           : system.GPU().CurrentSyncRequestFence() >= fence;
+        // Without a submission the sync is signalled as it is; one fenced before its
+        // submission reached the GPU thread has the sequence and an older fence.
+        if ((!fence && !sequence) || (reached && retirement.IsRetired(finished))) {
             return SyncAlreadySignaled;
         }
         if (x[1] == std::numeric_limits<u64>::max()) {
-            const u64 submitted = sync->second.submit_host_ns;
+            const u64 submitted = waited.submit_host_ns;
             lock.unlock();
             const auto start = std::chrono::steady_clock::now();
-            system.GPU().WaitForSyncOperation(fence);
+            if (at_replay_end) {
+                retirement.WaitReplayed(sequence);
+            } else if (!early) {
+                system.GPU().WaitForSyncOperation(fence);
+            }
             const auto replayed = std::chrono::steady_clock::now();
-            retirement.Wait(sequence);
+            retirement.Wait(finished);
             if (call_profile && BananzaNvn2Commands::InTimelineWindow(sequence)) {
                 LOG_INFO(Core_ARM, "NVN 2 timeline: seq {} sync wait {:.3f} to {:.3f} ms", sequence,
                          start.time_since_epoch().count() / 1e6,
@@ -2939,7 +3613,7 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
                                    texture_snapshots, std::move(program), replay)) {
         NoteMissing(fmt::format("{} invalid payload or recording state", name));
     } else if (bytes) {
-        UpdateCommandCursor(memory, x[0], command_buffers.at(x[0]));
+        UpdateCommandCursor(memory, x[0], CommandShardOf(x[0]).buffers.at(x[0]));
     }
     return 0;
 }
@@ -2956,10 +3630,12 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
         constexpr std::array<u8, CommandBufferSize> empty{};
         memory.WriteBlock(x[0], empty.data(), empty.size());
         memory.Write64(x[0] + 0x70, x[1]);
-        auto& object = command_buffers.insert_or_assign(x[0], CommandBuffer{}).first->second;
+        auto& object =
+            CommandShardOf(x[0]).buffers.insert_or_assign(x[0], CommandBuffer{}).first->second;
         UpdateCommandBuffer(memory, x[0], object, {});
         return 1;
     }
+    auto& command_buffers = CommandShardOf(x[0]).buffers;
     const auto it = command_buffers.find(x[0]);
     if (it == command_buffers.end() || !ValidRange(memory, x[0], CommandBufferSize)) {
         return std::nullopt;
@@ -3064,6 +3740,7 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
 std::optional<bool> Session::RecordCommand(Memory::Memory& memory, size_t index,
                                            const GuestCall& call) {
     const auto& x = call.x;
+    auto& command_buffers = CommandShardOf(x[0]).buffers;
     const auto buffer = command_buffers.find(x[0]);
     if (buffer == command_buffers.end() || !ValidRange(memory, x[0], CommandBufferSize)) {
         return std::nullopt;
@@ -3272,6 +3949,19 @@ void Session::ReportCallProfile() {
                      "Bananza NVN 2 call profile: {} calls/present={:.0f} ns/call={:.1f} ms/present={:.3f} lock_wait_ms/present={:.3f}",
                      entry.name, entry.calls / frames, double(entry.nanoseconds) / entry.calls,
                      ms(entry.nanoseconds), ms(entry.lock_wait));
+        }
+    }
+    // The calls that waited most for a lock or for the submit lane.
+    constexpr size_t Waiting = 10;
+    std::ranges::partial_sort(entries, entries.begin() + Waiting, std::greater{},
+                              &CallStats::lock_wait);
+    for (const auto& entry : std::span{entries}.first<Waiting>()) {
+        if (entry.calls && entry.lock_wait) {
+            LOG_INFO(Core_ARM,
+                     "Bananza NVN 2 call waits: {} calls/present={:.1f} waited {:.3f} ms a present, "
+                     "{:.1f} us a call",
+                     entry.name, entry.calls / frames, ms(entry.lock_wait),
+                     double(entry.lock_wait) / entry.calls / 1e3);
         }
     }
 }

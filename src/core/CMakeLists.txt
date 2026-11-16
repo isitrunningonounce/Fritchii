@@ -11,6 +11,7 @@ add_library(core STATIC
     arm/bananza_nvn2_device.h
     arm/bananza_nvn2_hle.cpp
     arm/bananza_nvn2_hle.h
+    arm/bananza_nvn2_submit_lane.h
     arm/bananza_nvn2_resources.cpp
     arm/bananza_nvn2_resources.h
     arm/bananza_nvn2_texture.cpp

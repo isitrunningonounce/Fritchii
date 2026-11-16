@@ -259,7 +259,9 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
             }
             jit.SetRegister(30, link);
             jit.SetPC(link);
-            if (deadline > std::chrono::steady_clock::now()) {
+            // Only a present sets a deadline: no clock read for the other calls.
+            if (deadline.time_since_epoch().count() != 0 &&
+                deadline > std::chrono::steady_clock::now()) {
                 m_present_deadline = deadline;
                 jit.HaltExecution(DeferredThreadSleep);
             }

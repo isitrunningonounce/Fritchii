@@ -69,3 +69,8 @@ Programming, alongside the physical act of writing code, also consists of archit
 - Try to rely less on indirection for architecting systems
   - If the underlying HLE kernel emulation requires it, try making a solution that keeps things local
     - For example, there isn't a need for file descriptors to each be a pointer, when they could be a fixed table size with elements that may be emplaced at will.
+
+- Keep classes small and split them by responsibility
+  - A class that mixes several jobs (state of a command stream, caches, uploads, a worker thread, diagnostics) hides which function depends on which state, which makes it hard to change safely and impossible to run on several threads.
+  - When a class grows past one job, split it before adding the next feature to it: state that is passed around as a value, caches with their own lookups, and each thread's work in a class of its own.
+  - Known exception, to be split later: `BananzaNvn2Replay` in `src/video_core/renderer_vulkan/vk_bananza_nvn2_replay.cpp` (about 6,400 lines, written for this fork's NVN 2 path). The owner allowed it to stay as it is for now (2026-11-15); do not add new responsibilities to it, put new work into separate classes and files, and come back to split it.

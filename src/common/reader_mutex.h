@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -42,7 +43,11 @@ public:
     void lock() noexcept {
         writers.lock();
         writer.store(true, std::memory_order_seq_cst);
-        for (auto& slot : slots) {
+        // Only the slots threads have taken: a thread that takes one from now on sees the
+        // writer before it counts itself in.
+        const size_t used = std::min(Slots, next_slot.load(std::memory_order_seq_cst));
+        for (size_t i = 0; i < used; ++i) {
+            auto& slot = slots[i];
             Wait([&slot] { return slot.count.load(std::memory_order_seq_cst) == 0; });
         }
     }
@@ -59,16 +64,20 @@ private:
         std::atomic<u32> count{};
     };
 
+    // Slots handed out so far, by all locks together.
+    static inline std::atomic<size_t> next_slot{};
     static size_t Slot() noexcept {
-        static std::atomic<size_t> next{};
-        thread_local const size_t slot = next.fetch_add(1, std::memory_order_relaxed) % Slots;
+        thread_local const size_t slot =
+            next_slot.fetch_add(1, std::memory_order_seq_cst) % Slots;
         return slot;
     }
 
     template <typename Done>
     static void Wait(Done&& done) noexcept {
         for (u32 spins = 0; !done(); ++spins) {
-            if (spins < 64) {
+            // A writer holds the lock for a few microseconds: longer than that is worth
+            // waiting for before the time slice is given up.
+            if (spins < 2048) {
 #if defined(_M_X64) || defined(__x86_64__)
                 _mm_pause();
 #endif

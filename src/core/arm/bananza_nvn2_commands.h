@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <chrono>
@@ -25,6 +26,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/reader_mutex.h"
+#include "common/thread_worker.h"
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
 #include "core/arm/bananza_nvn2_resources.h"
@@ -209,8 +211,45 @@ struct Operation {
 };
 static_assert(sizeof(Operation) == 64);
 
+// What the submit scan needs of a recording, in order: made once, when the recording ends.
+struct ScanEntry {
+    enum class Kind : u8 {
+        Vertex,  // slot, a address, b size
+        Uniform, // stage, slot, a address, b size
+        Storage, // the same
+        Texture, // stage, slot, a handle
+        Image,   // the same
+        Index,   // a address, b bytes: the index data of a draw
+        Draw,    // an indexed draw after which targets, buffers or descriptors may be pending
+        Op,      // a: the Operation, for the general code
+        Call,    // a: the Recording called here
+    };
+    Kind kind{};
+    u8 stage{};
+    u16 slot{};
+    u64 a{};
+    u64 b{};
+};
+static_assert(sizeof(ScanEntry) == 24);
+// The largest range the scan takes; an indexed draw over more is left to the general code.
+inline constexpr u64 ScanMaxRange = 8ULL << 20;
+
+struct Recording;
+struct Submission;
+// Fills recording.scan from its own operations, with a Call entry for each recording it
+// calls, and the totals of its flattened lists; the called recordings have theirs already.
+void BuildScanEntries(Recording& recording);
+// Fills submission.flats: for each recording submitted, its operations in the order they
+// run, with the called recordings' in place of the calls.
+void FlattenRecordings(Submission& submission);
+
 struct Recording {
     std::vector<Operation> operations;
+    // Its own operations as the submit scan reads them; a called recording is a Call entry.
+    std::vector<ScanEntry> scan;
+    // How many entries and operations it has once the called recordings are put in place.
+    u64 scan_total{};
+    u64 flat_total{};
     // The recordings its operations call: a called recording outlives its handle this way.
     std::vector<std::shared_ptr<const Recording>> called;
     u64 serial{};
@@ -249,6 +288,24 @@ inline void PrefetchCalled(const std::vector<Operation>& operations, size_t inde
 #endif
 }
 
+// For a loop over a recording's flat list: starts loading the operation eight steps ahead and
+// the rare part of the one four steps ahead (its operation is loaded by then).
+inline void PrefetchAhead(const std::vector<const Operation*>& flat, size_t index) {
+#if defined(_M_X64) || defined(__x86_64__)
+    if (index + 8 < flat.size()) {
+        _mm_prefetch(reinterpret_cast<const char*>(flat[index + 8]), _MM_HINT_T0);
+    }
+    if (index + 4 < flat.size()) {
+        if (const OperationExtra* const extra = flat[index + 4]->extra.get()) {
+            _mm_prefetch(reinterpret_cast<const char*>(extra), _MM_HINT_T0);
+        }
+    }
+#else
+    static_cast<void>(flat);
+    static_cast<void>(index);
+#endif
+}
+
 struct State {
     bool recording{};
     u64 command_size{};
@@ -282,6 +339,12 @@ public:
     // are still on their way to guest memory; RetireWrites follows.
     void Retire(u64 sequence, bool writes_done = true);
     void Wait(u64 sequence);
+    // The replay of the submission has ended: guest memory is not read for it any more.
+    bool IsReplayed(u64 sequence) const {
+        return replayed.load(std::memory_order_acquire) >= sequence;
+    }
+    void MarkReplayed(u64 sequence);
+    void WaitReplayed(u64 sequence);
     // Every range the GPU wrote for the submission is back in guest memory.
     bool WritesDone(u64 sequence) const {
         return written.load(std::memory_order_acquire) >= sequence;
@@ -292,13 +355,18 @@ public:
     void Start();
     // Releases waiters when the renderer that retires submissions goes away.
     void Stop();
+    // Called by Stop before anything else: work that still hands submissions to the renderer
+    // finishes first.
+    void SetDrain(std::function<void()> drain_);
 
 private:
     std::atomic<u64> next{};
     std::atomic<u64> retired{};
     std::atomic<u64> written{};
+    std::atomic<u64> replayed{};
     std::mutex mutex;
     std::condition_variable cv;
+    std::function<void()> drain;
     bool stopped{};
 };
 
@@ -362,10 +430,16 @@ struct Submission : std::enable_shared_from_this<Submission> {
     // Host steady clock at the submit call and when the replay was queued (timeline trace).
     u64 host_submit_ns{};
     u64 host_queued_ns{};
+    // The newest earlier submission whose GPU work may write a range this one passes by
+    // reference: the replay waits for its writes before it reads guest memory.
+    u64 after_writes{};
     bool depth_minus_one_to_one{};
     bool origin_lower_left{};
     std::vector<u64> handles;
     std::vector<std::shared_ptr<const Recording>> recordings;
+    // For each of the recordings: the operations in the order they run, the called
+    // recordings' in place of their calls (FlattenRecordings).
+    std::vector<std::vector<const Operation*>> flats;
     u64 command_count{};
     u64 payload_bytes{};
     // Bytes of a bound range: a copy made at submit (in snapshot_blocks), or guest memory
@@ -379,7 +453,28 @@ struct Submission : std::enable_shared_from_this<Submission> {
         u64 fixed_stamp{};
         // The copy may still run when the replay starts: wait for late_copies before reading.
         bool late{};
+        // With fixed_pool: where the range lies in that pool and the pool's storage, for the
+        // replay's mirror of the pool. A size of zero means the range cannot be mirrored.
+        u64 fixed_offset{};
+        u64 fixed_pool_guest{};
+        u64 fixed_pool_size{};
+        // Nonzero: a uniform range whose pages are in mirror_pages; the serial of its pool
+        // (fixed_offset and the two fields after it hold for it as well).
+        u64 staged_pool{};
     };
+    // A run of a pool's bytes as they were at submit (staged uniform ranges that touch,
+    // merged), for the replay's mirror of the pool.
+    struct MirrorPage {
+        u64 pool{};
+        u64 pool_size{};
+        // Where the run starts in the pool.
+        u64 offset{};
+        const u8* data{};
+        u64 bytes{};
+    };
+    std::vector<MirrorPage> mirror_pages;
+    // A page could not be read: the staged ranges are uploaded one by one instead.
+    bool mirror_pages_incomplete{};
     // The copies of large ranges that are still running when the replay is queued.
     struct CopyState {
         std::atomic<u32> left{};
@@ -435,7 +530,17 @@ struct Submission : std::enable_shared_from_this<Submission> {
         }
         return count;
     }
-    std::map<std::pair<u64, u64>, u64> storage_addresses;
+    // A storage range's guest address and its bytes as buffer_snapshots had them when the
+    // range was entered (the table's entries move, so not a pointer to one).
+    struct StorageAddress {
+        u64 guest{};
+        const u8* data{};
+        // A copy of the scan's; otherwise guest memory itself.
+        bool owned{};
+        // The copy may still run: wait for late_copies before reading.
+        bool late{};
+    };
+    std::map<std::pair<u64, u64>, StorageAddress> storage_addresses;
     // Zero denotes an unsized binding whose first byte is unmapped at submit.
     std::map<u64, u64> unsized_storage_sizes;
     std::map<u64, u64> indirect_index_sizes;
@@ -512,10 +617,24 @@ private:
         u64 control_end{};
     };
 
-    // Shared while one thread records into its own buffer (NVN allows one thread per command
-    // buffer); exclusive for calls that add or remove buffers and handles.
-    mutable Common::ReaderMutex mutex;
-    std::unordered_map<u64, Buffer> buffers;
+    // For the handles and what follows them below: shared for a lookup (a command buffer
+    // that calls another one, thousands of times a frame from every recording thread).
+    mutable std::shared_mutex handles_mutex;
+    // Frees recordings whose handles are gone: not work for a thread of the game.
+    Common::ThreadWorker garbage{1, "NvnFree"};
+    // The command buffers, in parts by address. A part's lock is shared while one thread
+    // works on its own buffer (NVN allows one thread per command buffer) and exclusive for
+    // the calls that add or remove a buffer of that part: the game makes and drops about a
+    // hundred a frame, which must not stop every recording thread.
+    struct BufferShard {
+        mutable Common::ReaderMutex mutex;
+        std::unordered_map<u64, Buffer> buffers;
+    };
+    static constexpr size_t BufferShards = 16;
+    mutable std::array<BufferShard, BufferShards> buffer_shards;
+    BufferShard& ShardOf(u64 command_buffer) const {
+        return buffer_shards[(command_buffer * 0x9E3779B97F4A7C15ULL) >> 60];
+    }
     std::unordered_map<u64, Handle> live_handles;
     std::set<std::pair<u64, u64>> handles_by_control_begin;
     u64 max_control_record_bytes{};

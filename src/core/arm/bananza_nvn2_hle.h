@@ -3,7 +3,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -19,6 +22,7 @@
 #include "common/thread_worker.h"
 #include "core/arm/bananza_nvn2_commands.h"
 #include "core/arm/bananza_nvn2_resources.h"
+#include "core/arm/bananza_nvn2_submit_lane.h"
 #include "core/hle/service/nx2_present_pacer.h"
 
 namespace Core {
@@ -55,6 +59,7 @@ class Session {
 public:
     Session(System& system, const BananzaNvn2Trace::Session& procedures, u64 bootstrap,
             u64 internal_bootstrap, u64 callback_return);
+    ~Session();
     bool IsBootstrap(u64 pc) const;
     bool IsCallbackReturn(u64 pc) const;
     u64 CallbackReturn() const;
@@ -299,6 +304,21 @@ private:
     const Pool* BackingPool(u64 address) const;
     void SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Submission& submission,
                            Queue& queue);
+    // The part of a submit after the recordings are taken: the scan and the hand-over to the
+    // GPU thread. Runs with the session lock held, in the submit call or on the submit lane.
+    void FinishSubmit(Memory::Memory& memory, Queue& queue,
+                      BananzaNvn2Commands::Submission& submission,
+                      std::unique_lock<std::mutex>& lock);
+    // nvnQueuePresentTexture without the session lock: the present itself goes to the submit
+    // lane, behind the scans of the submits before it.
+    u64 PresentAsync(const GuestCall& call, std::chrono::steady_clock::time_point* present_deadline);
+    // nvnQueueFenceSync without the session lock; false when the queue or the sync is unknown.
+    bool FenceSyncAsync(const GuestCall& call);
+    // nvnBufferInitialize: under pool_buffer_mutex alone.
+    u64 InitializeBuffer(Memory::Memory& memory, const GuestCall& call);
+    // nvnWindowAcquireTexture without the session lock; false when it cannot hand out an
+    // image (the call then goes the usual way and is reported).
+    bool AcquireAsync(Memory::Memory& memory, const GuestCall& call);
     // Waits for the pending submissions that may write back into [guest, guest + size).
     void WaitForPendingWrites(u64 guest, u64 size, const char* reason);
     std::optional<u64> HandleCommands(Memory::Memory& memory, size_t index,
@@ -332,9 +352,8 @@ private:
     // mutex. Writers also hold the session mutex.
     Common::ReaderMutex resource_mutex;
     std::mutex missing_mutex;
-    // If a call also needs session state, acquire the session mutex first.
-    // Shared for recording into one command buffer, exclusive for everything else.
-    Common::ReaderMutex command_mutex;
+    // The continuations of memory callbacks, by guest thread.
+    std::mutex callback_mutex;
     u64 pending_storage_fence{};
     // Guest ranges a submission may write back once its replay ends, start to end, disjoint.
     struct PendingWrites {
@@ -344,6 +363,27 @@ private:
     };
     std::vector<PendingWrites> pending_writes;
     std::vector<u64> present_fences;
+    // Guards the windows, the syncs, the set of queues and each queue's fence, sequence and
+    // submit time, for the present and the fence made without the session lock. Taken after
+    // the session lock by the calls that hold both, and never held across a wait.
+    std::mutex frame_mutex;
+    // The newest sequence submitted when the last present was made, and the present before.
+    std::array<u64, 2> present_marks{};
+    // Flushes of mapped ranges the game made without waiting for the session lock: applied
+    // by the next call that holds it, a scan included.
+    struct PendingFlush {
+        u64 pool;
+        u64 offset;
+        u64 size;
+    };
+    std::mutex flush_mutex;
+    std::vector<PendingFlush> pending_flushes;
+    std::atomic<bool> flushes_pending{};
+    void ApplyPendingFlushes();
+    // Presents handed to the submit lane that the GPU thread has not shown yet.
+    std::atomic<u32> presents_outstanding{};
+    std::mutex present_wait_mutex;
+    std::condition_variable present_done;
     u32 logged_overlaps{};
     Service::Nx2PresentPacer present_pacer;
     std::chrono::nanoseconds present_period{};
@@ -368,7 +408,18 @@ private:
     std::unordered_map<u64, Sync> syncs;
     std::unordered_map<u64, Event> event_builders;
     std::unordered_map<u64, Event> events;
-    std::unordered_map<u64, CommandBuffer> command_buffers;
+    // The command buffers, in parts by address. If a call also needs session state, acquire
+    // the session mutex first. A part's lock is shared for recording into one command buffer
+    // and exclusive for everything else done to a buffer of that part.
+    struct CommandShard {
+        Common::ReaderMutex mutex;
+        std::unordered_map<u64, CommandBuffer> buffers;
+    };
+    static constexpr size_t CommandShards = 16;
+    std::array<CommandShard, CommandShards> command_shards;
+    CommandShard& CommandShardOf(u64 command_buffer) {
+        return command_shards[(command_buffer * 0x9E3779B97F4A7C15ULL) >> 60];
+    }
     std::unordered_map<u64, std::vector<CallbackContinuation>> callback_continuations;
     BananzaNvn2Commands::Recorder recorder;
     Resources resources;
@@ -407,6 +458,8 @@ private:
     u64 accepted_commands{};
     u64 rejected_submissions{};
     bool logged_submit{};
+    // Declared last: its thread works on this object and stops before anything else goes.
+    std::unique_ptr<SubmitLane> submit_lane;
 };
 
 } // namespace Core::BananzaNvn2Hle

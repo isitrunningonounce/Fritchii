@@ -360,29 +360,25 @@ namespace {
 std::pair<u64, u64> WriteChangedBytes(Core::Memory::Memory& memory, u64 guest, u64 base,
                                       std::span<const u8> mapped,
                                       std::span<const std::pair<u64, u64>> snapshots,
-                                      const Core::BananzaNvn2Commands::Submission& submission) {
-    if (snapshots.empty()) {
+                                      const Core::BananzaNvn2Commands::Submission& submission,
+                                      const u8* whole = nullptr,
+                                      std::span<const std::pair<u64, u64>> written_intervals = {}) {
+    if (snapshots.empty() && !whole) {
         memory.WriteBlockUnsafe(guest, mapped.data(), mapped.size());
         return {mapped.size(), 0};
     }
     u64 written{};
     u64 compared{};
-    for (const auto& snapshot : snapshots) {
-        const u64 offset = snapshot.first - base;
-        if (offset >= mapped.size()) {
-            continue;
-        }
-        const auto before = submission.BufferSnapshot(snapshot);
-        const size_t size = std::min<size_t>(before.size(), mapped.size() - offset);
+    const auto compare = [&](u64 offset, const u8* before, size_t size) {
         const u8* const now = mapped.data() + offset;
         compared += size;
         // Most ranges come back as they went in.
-        if (std::memcmp(now, before.data(), size) == 0) {
-            continue;
+        if (std::memcmp(now, before, size) == 0) {
+            return;
         }
         size_t i = 0;
         while (i < size) {
-            const auto first = std::mismatch(now + i, now + size, before.data() + i);
+            const auto first = std::mismatch(now + i, now + size, before + i);
             i = static_cast<size_t>(first.first - now);
             if (i == size) {
                 break;
@@ -402,6 +398,32 @@ std::pair<u64, u64> WriteChangedBytes(Core::Memory::Memory& memory, u64 guest, u
             written += end - i;
             i = end;
         }
+    };
+    if (whole) {
+        // Guest memory holds the span as it is now, not as it went in: outside what a shader
+        // could write, a difference is the game's newer data and must stay.
+        std::vector<std::pair<u64, u64>> intervals(written_intervals.begin(),
+                                                   written_intervals.end());
+        std::ranges::sort(intervals);
+        constexpr size_t Piece = 64ULL << 10;
+        u64 done{};
+        for (const auto& [first, last] : intervals) {
+            const u64 begin = std::max(first, done);
+            const u64 end = std::min<u64>(last, mapped.size());
+            for (u64 offset = begin; offset < end; offset += Piece) {
+                compare(offset, whole + offset, static_cast<size_t>(std::min<u64>(Piece, end - offset)));
+            }
+            done = std::max(done, end);
+        }
+        return {written, compared};
+    }
+    for (const auto& snapshot : snapshots) {
+        const u64 offset = snapshot.first - base;
+        if (offset >= mapped.size()) {
+            continue;
+        }
+        const auto before = submission.BufferSnapshot(snapshot);
+        compare(offset, before.data(), std::min<size_t>(before.size(), mapped.size() - offset));
     }
     return {written, compared};
 }
@@ -424,7 +446,7 @@ void BananzaNvn2Replay::RetireLoop(std::stop_token token) {
                 const auto [written, compared] = WriteChangedBytes(
                     *job.submission->guest_memory, write.guest_address, write.base,
                     std::span<const u8>{write.data, write.bytes}, write.snapshots,
-                    *job.submission);
+                    *job.submission, write.before, write.written);
                 writeback_bytes.fetch_add(written, std::memory_order_relaxed);
                 writeback_compared.fetch_add(compared, std::memory_order_relaxed);
             }
@@ -946,6 +968,7 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::AllocateDeviceStorage(u64 aligned, u
 }
 
 void BananzaNvn2Replay::MoveStorageToDevice(StorageUpload& upload) {
+    run_stats.DrawCut(BananzaNvn2RunStats::Cut::StorageMove);
     u8* mapped{};
     const auto [buffer, base] =
         AllocateDeviceStorage(Common::AlignUp(upload.size, upload_alignment), mapped);
@@ -1941,14 +1964,26 @@ BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadRange(const Submission& su
                                                             Range range) {
     // A storage upload made for a range takes that range out of uploaded_ranges.
     if (const auto cached = uploaded_ranges.find(range); cached != uploaded_ranges.end()) {
+        run_stats.Count(BananzaNvn2RunStats::Note::RangeMemo);
         return cached->second;
     }
     static const bool fixed_cache_on = std::getenv("EDEN_NX2_NVN_NO_FIXED_CACHE") == nullptr;
     const auto* const snapshot = submission.FindSnapshot(range);
+    // A uniform range whose pages went to its pool's mirror at the start of the replay.
+    if (snapshot && snapshot->staged_pool && staged_ranges_ready && !HasBufferUpdates(range)) {
+        if (const auto mirror = pool_mirrors.find(snapshot->staged_pool);
+            mirror != pool_mirrors.end() && mirror->second.buffer) {
+            const BufferRef buffer{*mirror->second.buffer, snapshot->fixed_offset};
+            uploaded_ranges.emplace(range, buffer);
+            run_stats.Count(BananzaNvn2RunStats::Note::RangeStaged);
+            return buffer;
+        }
+    }
     // A range the GPU never writes is not a storage upload: no need to look for one.
     if (!(fixed_cache_on && snapshot && snapshot->fixed_pool)) {
         if (const auto storage = storage_upload_of.find(range);
             storage != storage_upload_of.end()) {
+            run_stats.Count(BananzaNvn2RunStats::Note::RangeStorage);
             return {storage->second->buffer, storage->second->base};
         }
     }
@@ -1960,16 +1995,174 @@ BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadRange(const Submission& su
     const bool patched = HasBufferUpdates(range);
     if (fixed_cache_on && !patched) {
         if (const auto& entry = *snapshot; entry.fixed_pool) {
+            // On by default since r129; EDEN_NX2_NVN_NO_POOL_MIRROR=1 is the per-range cache.
+            static const bool mirror_on =
+                std::getenv("EDEN_NX2_NVN_NO_POOL_MIRROR") == nullptr;
+            if (mirror_on) {
+                if (const auto buffer = MirrorUpload(submission, entry, range.second);
+                    buffer.first) {
+                    uploaded_ranges.emplace(range, buffer);
+                    return buffer;
+                }
+            }
             if (const auto buffer = FixedUpload(bytes, entry.fixed_pool, entry.fixed_stamp);
                 buffer.first) {
                 uploaded_ranges.emplace(range, buffer);
+                run_stats.Count(BananzaNvn2RunStats::Note::RangeFixed);
                 return buffer;
             }
         }
     }
     const auto buffer = UploadStream(bytes, patched ? std::optional{range.first} : std::nullopt);
     uploaded_ranges.emplace(range, buffer);
+    run_stats.Count(BananzaNvn2RunStats::Note::RangeStream);
     return buffer;
+}
+
+BananzaNvn2Replay::PoolMirror* BananzaNvn2Replay::GetMirror(u64 pool, u64 size) {
+    constexpr u64 MaxMirrorBytes = 3ULL << 30;
+    auto& mirror = pool_mirrors[pool];
+    if (mirror.buffer) {
+        return &mirror;
+    }
+    if (!size || pool_mirror_bytes + size > MaxMirrorBytes) {
+        return nullptr;
+    }
+    mirror.buffer = allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        },
+        MemoryUsage::DeviceLocal);
+    mirror.size = size;
+    mirror.synced.assign((size + 0xffff) >> 16, 0);
+    pool_mirror_bytes += size;
+    if ((pool_mirrors.size() & 63) == 1) {
+        LOG_INFO(Render_Vulkan, "NVN 2 pool mirror: {} pools, {} MiB in all", pool_mirrors.size(),
+                 pool_mirror_bytes >> 20);
+    }
+    return &mirror;
+}
+
+bool BananzaNvn2Replay::SyncMirrorPages(const Submission& submission) {
+    if (submission.mirror_pages.empty()) {
+        return true;
+    }
+    if (submission.mirror_pages_incomplete) {
+        return false;
+    }
+    if (submission.late_copies) {
+        submission.late_copies->Wait();
+    }
+    // One recorded command for all runs: a copy per pair of buffers, a region per run.
+    struct Copies {
+        VkBuffer from;
+        VkBuffer target;
+        std::vector<VkBufferCopy> regions;
+    };
+    std::vector<Copies> copies;
+    for (const auto& page : submission.mirror_pages) {
+        PoolMirror* const mirror = GetMirror(page.pool, page.pool_size);
+        const u64 begin = page.offset;
+        if (!mirror || begin > mirror->size || page.bytes > mirror->size - begin) {
+            return false;
+        }
+        const auto staging = UploadStream({page.data, page.bytes});
+        if (!staging.first) {
+            return false;
+        }
+        if (copies.empty() || copies.back().from != staging.first ||
+            copies.back().target != *mirror->buffer) {
+            copies.push_back({staging.first, *mirror->buffer, {}});
+        }
+        copies.back().regions.push_back({staging.second, begin, page.bytes});
+        ++pool_mirror_pages;
+    }
+    Record([copies = std::move(copies)](vk::CommandBuffer cmdbuf) {
+        for (const auto& copy : copies) {
+            cmdbuf.CopyBuffer(copy.from, copy.target, copy.regions);
+        }
+    });
+    Barrier();
+    return true;
+}
+
+BananzaNvn2Replay::BufferRef BananzaNvn2Replay::MirrorUpload(
+    const Submission& submission, const Core::BananzaNvn2Commands::Submission::BufferBytes& entry,
+    u64 size) {
+    constexpr u64 PageBits = 16;
+    constexpr u64 PageSize = 1ULL << PageBits;
+    constexpr u64 MaxMirrorBytes = 3ULL << 30;
+    const u64 offset = entry.fixed_offset;
+    // The offset is the game's own: it keeps the console's alignments, which are not finer
+    // than this device's.
+    if (!entry.fixed_pool_size || !size || !submission.guest_memory) {
+        return {};
+    }
+    auto& mirror = pool_mirrors[entry.fixed_pool];
+    if (!mirror.buffer) {
+        if (pool_mirror_bytes + entry.fixed_pool_size > MaxMirrorBytes) {
+            return {};
+        }
+        mirror.buffer = allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = entry.fixed_pool_size,
+                .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::DeviceLocal);
+        mirror.size = entry.fixed_pool_size;
+        mirror.synced.assign((mirror.size + PageSize - 1) >> PageBits, 0);
+        pool_mirror_bytes += mirror.size;
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 pool mirror: pool serial {} of {} KiB mirrored; {} pools, {} MiB in all",
+                 entry.fixed_pool, mirror.size >> 10, pool_mirrors.size(),
+                 pool_mirror_bytes >> 20);
+    }
+    if (offset > mirror.size || size > mirror.size - offset) {
+        return {};
+    }
+    bool copied = false;
+    for (u64 page = offset >> PageBits; page <= (offset + size - 1) >> PageBits; ++page) {
+        if (mirror.synced[page] > entry.fixed_stamp) {
+            continue;
+        }
+        const u64 begin = page << PageBits;
+        const u64 bytes = std::min(PageSize, mirror.size - begin);
+        const u8* const source =
+            submission.guest_memory->GetSpan(entry.fixed_pool_guest + begin, bytes);
+        if (!source) {
+            return {};
+        }
+        const auto staging = UploadStream({source, bytes});
+        if (!staging.first) {
+            return {};
+        }
+        Record([from = staging.first, from_offset = staging.second, target = *mirror.buffer, begin,
+                bytes](vk::CommandBuffer cmdbuf) {
+            const VkBufferCopy copy{from_offset, begin, bytes};
+            cmdbuf.CopyBuffer(from, target, copy);
+        });
+        mirror.synced[page] = entry.fixed_stamp + 1;
+        ++pool_mirror_pages;
+        copied = true;
+    }
+    if (copied) {
+        run_stats.DrawCut(BananzaNvn2RunStats::Cut::MirrorPage);
+        Barrier();
+    } else {
+        run_stats.Count(BananzaNvn2RunStats::Note::RangeMirror);
+    }
+    return {*mirror.buffer, offset};
 }
 
 BananzaNvn2Replay::BufferRef BananzaNvn2Replay::FixedUpload(std::span<const u8> bytes, u64 pool,
@@ -2076,19 +2269,29 @@ BananzaNvn2Replay::FindStorageRange(Range range) {
 }
 
 void BananzaNvn2Replay::NoteStorageRead(const StorageUpload& upload, u64 offset, u64 size) {
-    if (upload.written_barrier == barrier_serial) {
-        const auto next = upload.fresh.upper_bound(offset);
-        storage_fresh |= (next != upload.fresh.begin() && std::prev(next)->second > offset) ||
-                         (next != upload.fresh.end() && next->first < offset + size);
-    }
+    // Whether the bytes are fresh is decided where the draw is issued.
+    draw_storage_reads.push_back({&upload, offset, size});
 }
 
 BananzaNvn2Replay::StorageSpan* BananzaNvn2Replay::BoundSpan(Range range) {
     if (!storage_spans_disjoint) {
         return nullptr;
     }
-    const auto found = storage_span_of.find(range);
-    return found != storage_span_of.end() ? found->second : nullptr;
+    // The spans do not overlap: the one that starts at or before the range.
+    const auto next = storage_spans.upper_bound({range.first, std::numeric_limits<u64>::max()});
+    if (next == storage_spans.begin()) {
+        return nullptr;
+    }
+    auto& span = std::prev(next)->second;
+    const u64 offset = range.first - span.range.first;
+    if (offset >= span.range.second || range.second > span.range.second - offset) {
+        return nullptr;
+    }
+    // A span filled in one piece holds every byte in it; another one only its ranges.
+    if (!span.host && !std::ranges::binary_search(span.snapshots, range)) {
+        return nullptr;
+    }
+    return &span;
 }
 
 std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& submission,
@@ -2128,17 +2331,30 @@ void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
     const u64 alignment =
         device_limits.minStorageBufferOffsetAlignment;
     StorageSpan* span{};
-    for (const auto& [range, guest] : submission.storage_addresses) {
+    for (const auto& [range, stored] : submission.storage_addresses) {
         const auto [address, size] = range;
+        const u64 guest = stored.guest;
+        // Read from guest memory: not a copy of the scan's.
+        const u8* const direct = stored.owned ? nullptr : stored.data;
         // Only share Vulkan storage when both addresses describe the same aligned bytes.
-        if (!span || address >= span->range.first + span->range.second ||
+        // Slices packed one after the other share it too.
+        constexpr u64 MergeGap = 4096;
+        constexpr u64 MaxSpanBytes = 32ULL << 20;
+        if (!span || address > span->range.first + span->range.second + MergeGap ||
+            address - span->range.first + size > MaxSpanBytes ||
             address - span->range.first != guest - span->guest_address ||
             (address - span->range.first) % alignment) {
             span = &storage_spans.emplace(range, StorageSpan{range, guest, {range}}).first->second;
+            span->bytes.push_back(stored);
+            span->host = direct;
             continue;
         }
         span->range.second = std::max(span->range.second, address - span->range.first + size);
         span->snapshots.push_back(range);
+        span->bytes.push_back(stored);
+        if (!direct || !span->host || direct != span->host + (address - span->range.first)) {
+            span->host = nullptr;
+        }
     }
     static const bool use_maps = std::getenv("EDEN_NX2_NVN_STORAGE_MAPS") != nullptr;
     storage_span_of.clear();
@@ -2154,9 +2370,6 @@ void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
         storage_spans_disjoint &= entry.range.first >= end;
         end = std::max(end, entry.range.first + entry.range.second);
         guest_ranges.emplace_back(entry.guest_address, entry.guest_address + entry.range.second);
-        for (const auto& snapshot : entry.snapshots) {
-            storage_span_of.emplace(snapshot, &entry);
-        }
     }
     std::ranges::sort(guest_ranges);
     for (size_t i = 1; i < guest_ranges.size(); ++i) {
@@ -2216,13 +2429,13 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::WritableSto
 
 std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStorageUpload(
     const Submission& submission, Range range) {
+    run_stats.DrawCut(BananzaNvn2RunStats::Cut::StorageCreate);
     StorageSpan* bound{};
     if (storage_spans_disjoint) {
-        const auto found = storage_span_of.find(range);
-        if (found == storage_span_of.end()) {
+        bound = BoundSpan(range);
+        if (!bound) {
             return {};
         }
-        bound = found->second;
     } else {
         if (!submission.storage_addresses.contains(range)) {
             return {};
@@ -2296,9 +2509,27 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStora
     }
     static const bool serial_copies = std::getenv("EDEN_NX2_NVN_SERIAL_COPIES") != nullptr;
     const bool fill_later = !serial_copies && !HasBufferUpdates(span.range);
-    for (const auto& snapshot : span.snapshots) {
+    if (span.host) {
+        // One run of guest memory: one copy, with nothing to look up.
+        if (fill_later) {
+            copy_jobs.push_back({mapped.data(), span.host, span.range.second});
+            copy_job_bytes += span.range.second;
+        } else {
+            std::memcpy(mapped.data(), span.host, span.range.second);
+        }
+    }
+    for (size_t index = 0; index < span.snapshots.size() && !span.host; ++index) {
+        const auto& snapshot = span.snapshots[index];
         // A fill that runs later waits for the bytes itself (DispatchCopies, WaitCopies).
-        const auto bytes = submission.BufferSnapshot(snapshot, !fill_later);
+        std::span<const u8> bytes;
+        if (const auto& stored = span.bytes[index]; stored.data) {
+            if (!fill_later && stored.late && submission.late_copies) {
+                submission.late_copies->Wait();
+            }
+            bytes = {stored.data, snapshot.second};
+        } else {
+            bytes = submission.BufferSnapshot(snapshot, !fill_later);
+        }
         u8* const dest = mapped.data() + (snapshot.first - span.range.first);
         if (fill_later) {
             copy_jobs.push_back({dest, bytes.data(), bytes.size()});
@@ -2355,7 +2586,8 @@ void BananzaNvn2Replay::WriteBackStorage(const Submission& submission) {
             *submission.guest_memory, upload.guest_address, range.first,
             std::span<const u8>{upload.readback, upload.written_bytes},
             found ? std::span<const Range>{span->second.snapshots} : std::span<const Range>{},
-            submission);
+            submission, found ? span->second.host : nullptr, upload.written);
+        upload.written.clear();
         writeback_bytes.fetch_add(written, std::memory_order_relaxed);
         writeback_compared.fetch_add(compared, std::memory_order_relaxed);
     }
@@ -2686,17 +2918,16 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
             const auto& entry = found->second;
             if (std::ranges::find(destinations, entry.image) == destinations.end()) {
                 entry.image->last_present = present_count;
-                if (entry.image->written_barrier == barrier_serial) {
-                    sampled_fresh = true;
-                    fresh_image = entry.image;
-                }
+                draw_sampled.push_back(entry.image);
                 if (PrepareSampledImage(*entry.image, *entry.texture, submission)) {
                     TraceImage("sampled", *entry.texture, bound_program->serial);
+                    run_stats.Count(BananzaNvn2RunStats::Note::TextureHit);
                     return entry.descriptor;
                 }
             }
         }
     }
+    run_stats.DrawCut(BananzaNvn2RunStats::Cut::TextureSlow);
     const auto textures = submission.texture_descriptors.find(texture_pool);
     if (textures == submission.texture_descriptors.end()) {
         NoteSkip("missing texture pool snapshot");
@@ -2840,10 +3071,7 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindTexture(
         return std::nullopt;
     }
     const bool color = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
-    if (image->written_barrier == barrier_serial) {
-        sampled_fresh = true;
-        fresh_image = image;
-    }
+    draw_sampled.push_back(image);
     if (!PrepareSampledImage(*image, tex, submission)) {
         TraceImage("missing sampled snapshot", tex, bound_program->serial);
         if (trace_images && draw_diagnostics.emplace(bound_program->serial,
@@ -3103,6 +3331,7 @@ bool BananzaNvn2Replay::PrepareSampledImage(Image& image, const Texture& texture
                 }
             }
             if (!bytes.empty()) {
+                run_stats.DrawCut(BananzaNvn2RunStats::Cut::TextureUpload);
                 const bool uploaded = UploadTexture(image, texture, bytes);
                 upload_ns += static_cast<u64>(
                     (std::chrono::steady_clock::now() - upload_start).count());
@@ -3162,9 +3391,46 @@ std::optional<BananzaNvn2Replay::DrawState> BananzaNvn2Replay::DecodeDraw(
     return state;
 }
 
+BananzaNvn2Replay::BuiltPipeline BananzaNvn2Replay::BuildPipeline(
+    const PipelineInputs& inputs) const {
+    BuiltPipeline built;
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        built.pipeline = CreatePipeline(inputs, built.skips);
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Bananza NVN 2 graphics pipeline {}: {}",
+                    inputs.graphics_program->serial, error.what());
+    }
+    built.ns = static_cast<u64>((std::chrono::steady_clock::now() - start).count());
+    return built;
+}
+
+void BananzaNvn2Replay::TakePipeline(std::optional<Pipeline>& slot, BuiltPipeline& built) {
+    slot = std::move(built.pipeline);
+    ++pipeline_creates;
+    pipeline_create_ns += built.ns;
+    for (const auto reason : built.skips) {
+        NoteSkip(reason);
+    }
+}
+
 std::optional<BananzaNvn2Replay::Pipeline> BananzaNvn2Replay::CreatePipeline(
-    const ColorFormats& formats, u32 color_count, VkPrimitiveTopology topology,
-    const RasterState& raster) {
+    const PipelineInputs& inputs, std::vector<std::string_view>& skips) const {
+    // May run on a worker thread: everything it reads of the binding state is in the inputs.
+    const auto& graphics_program = inputs.graphics_program;
+    const auto& fragment_program = inputs.fragment_program;
+    const auto& geometry_program = inputs.geometry_program;
+    const auto& vertex_attributes = inputs.vertex_attributes;
+    const auto& vertex_strides = inputs.vertex_strides;
+    const auto& vertex_divisors = inputs.vertex_divisors;
+    const auto& color_state = inputs.color_state;
+    const auto& colors = inputs.colors;
+    const auto& formats = inputs.formats;
+    const u32 color_count = inputs.color_count;
+    const auto topology = inputs.topology;
+    const auto& raster = inputs.raster;
+    const auto NoteSkip = [&skips](std::string_view reason) { skips.push_back(reason); };
+    std::set<std::pair<u64, std::string_view>> draw_diagnostics;
     const auto& shaders = graphics_program->shaders;
     const auto vertex = std::ranges::find(shaders, 0U,
                                           &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
@@ -3811,6 +4077,15 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     if (!render_enabled) {
         return;
     }
+    // Experiment: EDEN_NX2_NVN_DRAW_STRIDE=N replays every Nth draw only (wrong image).
+    static const u64 draw_stride = [] {
+        const char* const value = std::getenv("EDEN_NX2_NVN_DRAW_STRIDE");
+        return value ? std::max<u64>(1, std::strtoull(value, nullptr, 10)) : u64{1};
+    }();
+    static u64 stride_draws{};
+    if (draw_stride > 1 && ++stride_draws % draw_stride != 0) {
+        return;
+    }
     if (graphics_program && colors[0]) {
         TraceImage("draw request", *colors[0], graphics_program->serial);
     }
@@ -3823,6 +4098,18 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     }
     sampled_fresh = false;
     storage_fresh = false;
+    draw_sampled.clear();
+    draw_storage_reads.clear();
+    run_stats.BeginDraw();
+    const struct RunDraw {
+        BananzaNvn2RunStats& stats;
+        ~RunDraw() {
+            stats.EndDraw();
+        }
+    } run_draw{run_stats};
+    if (op.replay == ReplayOp::DrawIndirect || op.replay == ReplayOp::DrawIndexedIndirect) {
+        run_stats.DrawCut(BananzaNvn2RunStats::Cut::Indirect);
+    }
     auto phase_start = profile_replay ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     const auto mark = [&](size_t phase) {
@@ -4024,20 +4311,34 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     if (last_pipeline == pipelines.end() || last_pipeline->first != key) {
         const auto [entry, inserted] = pipelines.try_emplace(key);
         if (inserted) {
-            try {
-                const auto create_start = std::chrono::steady_clock::now();
-                entry->second = CreatePipeline(formats, color_count, topology, raster);
-                ++pipeline_creates;
-                pipeline_create_ns += static_cast<u64>(
-                    (std::chrono::steady_clock::now() - create_start).count());
-            } catch (const vk::Exception& error) {
-                LOG_WARNING(Render_Vulkan, "Bananza NVN 2 graphics pipeline {}: {}",
-                            graphics_program->serial, error.what());
+            run_stats.DrawCut(BananzaNvn2RunStats::Cut::PipelineCreate);
+            PipelineInputs inputs{graphics_program, fragment_program, geometry_program,
+                                  vertex_attributes, vertex_strides, vertex_divisors,
+                                  color_state, colors, formats, color_count, topology, raster};
+            // Built here by default. With EDEN_NX2_NVN_ASYNC_PIPELINES=1 a worker builds it
+            // and the draw is left out meanwhile (a few vertices without indices, a screen
+            // pass or a UI quad, are still built here): that made the level's intro black,
+            // because frames without their draws spoil what the game keeps between frames.
+            static const bool build_here = std::getenv("EDEN_NX2_NVN_ASYNC_PIPELINES") == nullptr;
+            const bool screen_pass = draw->index_type == VK_INDEX_TYPE_MAX_ENUM &&
+                                     !draw->indirect_range.second && draw->count <= 6;
+            if (build_here || screen_pass) {
+                auto built = BuildPipeline(inputs);
+                TakePipeline(entry->second, built);
+            } else {
+                building_pipelines.insert(&entry->second);
+                pipeline_builder.Queue(&entry->second, [this, inputs = std::move(inputs)] {
+                    return BuildPipeline(inputs);
+                });
             }
         }
         last_pipeline = entry;
     }
     if (!last_pipeline->second) {
+        if (building_pipelines.contains(&last_pipeline->second)) {
+            ++pipeline_wait_draws;
+            return;
+        }
         NoteSkip("graphics pipeline unavailable");
         if (!missing_draw_logged) {
             missing_draw_logged = true;
@@ -4066,6 +4367,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     VkBuffer index_buffer{};
     u64 index_offset{};
     if (op.args[0] == 7 || op.args[0] == 8) {
+        run_stats.DrawCut(BananzaNvn2RunStats::Cut::Quads);
         const bool strip = op.args[0] == 8;
         const u32 quads = draw->count < 4 ? 0 : strip ? (draw->count - 2) / 2 : draw->count / 4;
         if (!quads) {
@@ -4211,12 +4513,14 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             }
             VkBuffer buffer{};
             u64 offset{};
+            run_stats.Count(writable ? BananzaNvn2RunStats::Note::WritableStorage : BananzaNvn2RunStats::Note::ReadStorage);
             if (writable) {
                 if (const auto [upload, start] = WritableStorage(submission, range); upload) {
                     buffer = upload->buffer;
                     offset = upload->base + start;
                     written_storage.emplace_back(upload, start + range.second);
                     written_intervals.emplace_back(upload, start, start + range.second);
+                    upload->NoteWritten(start, start + range.second);
                     traced_storage = range;
                 }
             } else {
@@ -4248,6 +4552,9 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
             return std::tie(a.sampler, a.imageView, a.imageLayout) ==
                    std::tie(b.sampler, b.imageView, b.imageLayout);
         };
+        if (!pipeline.push_descriptors) {
+            run_stats.DrawCut(BananzaNvn2RunStats::Cut::DescriptorSet);
+        }
         if (pipeline.push_descriptors) {
             if (PushBlockEntries - push_used < count) {
                 if (free_push_blocks.empty()) {
@@ -4357,6 +4664,22 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     const bool capture_draw = frame_dump.CapturingSampled() && colors[0] && extent.width >= 1900;
     const RenderingScope scope{views, depth_attachment_view, color_count, extent.width,
                                extent.height, layers};
+    // An image the draw samples, or storage it reads, that a draw wrote since the last barrier.
+    for (const Image* const sampled : draw_sampled) {
+        if (sampled->written_barrier == barrier_serial) {
+            sampled_fresh = true;
+            fresh_image = sampled;
+        }
+    }
+    for (const StorageRead& read : draw_storage_reads) {
+        const StorageUpload& upload = *read.upload;
+        if (upload.written_barrier == barrier_serial) {
+            const auto next = upload.fresh.upper_bound(read.offset);
+            storage_fresh |=
+                (next != upload.fresh.begin() && std::prev(next)->second > read.offset) ||
+                (next != upload.fresh.end() && next->first < read.offset + read.size);
+        }
+    }
     u32 fresh_kind{};
     u32 fresh_slot{8};
     if (sampled_fresh && fresh_image) {
@@ -4373,6 +4696,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
                              (sampled_fresh ? 2U : 0U) | (storage_barrier ? 4U : 0U) |
                              (!written_storage.empty() ? 8U : 0U) | (!rendering_scope ? 16U : 0U);
     if (rendering_scope != scope || sampled_fresh || storage_barrier || capture_draw) {
+        run_stats.Count(BananzaNvn2RunStats::Note::ScopeBarrier);
         Barrier();
     }
     std::optional<u32> probe;
@@ -4597,14 +4921,12 @@ BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadDriverConstants(u32 base_i
     return driver_upload;
 }
 
-void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submission& submission) {
-    for (size_t op_index = 0; op_index < recording.operations.size(); ++op_index) {
-        const auto& op = recording.operations[op_index];
-        Core::BananzaNvn2Commands::PrefetchCalled(recording.operations, op_index);
-        if (op.nested) {
-            ReplayRecording(*op.nested, submission);
-            continue;
-        }
+void BananzaNvn2Replay::ReplayRecording(const std::vector<const Operation*>& flat,
+                                        const Submission& submission) {
+    // Every operation that runs, in order: the called recordings' are in the list already.
+    for (size_t op_index = 0; op_index < flat.size(); ++op_index) {
+        Core::BananzaNvn2Commands::PrefetchAhead(flat, op_index);
+        const auto& op = *flat[op_index];
         switch (op.replay) {
         case ReplayOp::SetRenderTargets: {
             colors.fill(std::nullopt);
@@ -4662,9 +4984,11 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
         case ReplayOp::ClearColor:
         case ReplayOp::ClearColorSigned:
         case ReplayOp::ClearColorUnsigned:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Clear);
             ClearColor(op);
             break;
         case ReplayOp::ClearDepthStencil:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Clear);
             ClearDepthStencil(op);
             break;
         case ReplayOp::BindDepthStencil:
@@ -4718,9 +5042,11 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::CopyTexture:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Copy);
             CopyTexture(op, submission);
             break;
         case ReplayOp::CopyBufferToTexture:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Copy);
             CopyBufferToTexture(op, submission);
             break;
         case ReplayOp::SetCopyRowStride:
@@ -4729,6 +5055,7 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
             }
             break;
         case ReplayOp::Barrier:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::BarrierOp);
             Barrier();
             break;
         case ReplayOp::BindProgram:
@@ -4843,6 +5170,7 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
                 op.args[2] <= op.args[1] && op.args[3] <= op.args[1] - op.args[2]) {
                 const u64 address = op.args[0] + op.args[2];
                 const u64 end = address + op.Payload().size();
+                run_stats.OpCut(BananzaNvn2RunStats::Cut::BufferUpdate);
                 AddBufferUpdate(address, op.Payload());
                 erase_if(uploaded_ranges, [address, end](const auto& entry) {
                     const auto [start, size] = entry.first;
@@ -4957,6 +5285,7 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
         case ReplayOp::Dispatch: {
             const auto start = profile_replay ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Dispatch);
             Dispatch(op, submission);
             if (profile_replay) {
                 dispatch_ns += static_cast<u64>((std::chrono::steady_clock::now() - start).count());
@@ -4965,6 +5294,7 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
         }
         case ReplayOp::SignalEvent:
         case ReplayOp::WaitEvent:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Event);
             ReplayEvent(op, submission);
             break;
         case ReplayOp::SetRenderEnable:
@@ -4975,6 +5305,7 @@ void BananzaNvn2Replay::ReplayRecording(const Recording& recording, const Submis
         case ReplayOp::SetRenderEnableConditional:
         case ReplayOp::ReportCounter:
         case ReplayOp::ResetCounter:
+            run_stats.OpCut(BananzaNvn2RunStats::Cut::Counter);
             ReplayCounter(op, submission);
             break;
         case ReplayOp::Unsupported:
@@ -5066,7 +5397,27 @@ void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& sub
             }
             return;
         }
-        const std::array<u64_le, 2> report{0, submission.submitted_ns};
+        static const bool frame_stamps = std::getenv("EDEN_NX2_NVN_FRAME_TIMESTAMPS") != nullptr;
+        static const bool trace_counters = std::getenv("EDEN_NX2_NVN_COUNTER_TRACE") != nullptr;
+        static u64 stamp_present = std::numeric_limits<u64>::max();
+        static u64 frame_stamp_ns{};
+        static u64 frame_reports{};
+        if (stamp_present != present_count) {
+            stamp_present = present_count;
+            frame_stamp_ns = submission.submitted_ns;
+            frame_reports = 0;
+        }
+        const u64 stamp = frame_stamps ? frame_stamp_ns + 1000 * frame_reports
+                                       : submission.submitted_ns;
+        ++frame_reports;
+        if (trace_counters && present_count % 600 < 3) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 timestamp report: present {}, submission {}, draw {}, type {}, at "
+                     "{:#x}, value {} us, {} us after the frame's first submit",
+                     present_count, submission.sequence, draws, type, op.args[1], stamp / 1000,
+                     (stamp - frame_stamp_ns) / 1000);
+        }
+        const std::array<u64_le, 2> report{0, stamp};
         memory.WriteBlockUnsafe(address->second, report.data(), sizeof(report));
     }
 }
@@ -5163,6 +5514,32 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
                 std::memory_order_relaxed);
         }
     } busy_time{replay_start};
+    // The sync of the submission may signal when this returns.
+    struct Replayed {
+        u64 sequence;
+        ~Replayed() {
+            Core::BananzaNvn2Commands::GetRetirement().MarkReplayed(sequence);
+        }
+    } replayed{submission.sequence};
+    if (submission.after_writes) {
+        // Ranges read from guest memory below may be written by that submission's GPU work.
+        auto& retirement = Core::BananzaNvn2Commands::GetRetirement();
+        if (!retirement.WritesDone(submission.after_writes)) {
+            retirement.WaitWrites(submission.after_writes);
+            static std::atomic<u64> waits{};
+            static std::atomic<u64> wait_ns{};
+            wait_ns.fetch_add(static_cast<u64>((std::chrono::steady_clock::now() - replay_start)
+                                                   .count()),
+                              std::memory_order_relaxed);
+            if (const u64 count = waits.fetch_add(1, std::memory_order_relaxed) + 1;
+                count % 300 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "NVN 2 replay: the last 300 waits for an earlier submission's GPU "
+                         "writes took {:.3f} ms each",
+                         wait_ns.exchange(0, std::memory_order_relaxed) / 300e6);
+            }
+        }
+    }
     late_copies = submission.late_copies;
     const u64 draws_before = draws;
     const std::array slow_before{pipeline_creates, pipeline_create_ns, image_creates,
@@ -5211,14 +5588,21 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     next_replay_flush = replay_start + ReplayFlushInterval;
     flush_scopes = 0;
     ++replayed_submissions;
+    pipeline_builder.Collect([this](std::optional<Pipeline>* slot, BuiltPipeline&& built) {
+        building_pipelines.erase(slot);
+        ++worker_pipelines;
+        TakePipeline(*slot, built);
+    });
     ReclaimBusyResources();
     origin_lower_left = submission.origin_lower_left;
     const u64 first_tick = scheduler.CurrentTick();
     const u64 first_record = scheduler.RecordingSerial();
     CollectStorageSpans(submission);
-    for (const auto& recording : submission.recordings) {
-        ReplayRecording(*recording, submission);
+    staged_ranges_ready = SyncMirrorPages(submission);
+    for (const auto& flat : submission.flats) {
+        ReplayRecording(flat, submission);
     }
+    run_stats.EndSubmission();
     if (last_event_signal) {
         event_tail_draws += draws - last_event_signal->first;
         event_tail_dispatches += dispatches - last_event_signal->second;
@@ -5348,7 +5732,8 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
                                   upload.readback,
                                   found ? std::move(span->second.snapshots)
                                         : std::vector<Range>{},
-                                  tick});
+                                  tick, found ? span->second.host : nullptr,
+                                  std::move(upload.written)});
         }
     }
     storage_uploads.clear();
@@ -5442,6 +5827,14 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
         const auto presents = present_count - last_reported_present;
         LOG_INFO(Render_Vulkan, "Bananza NVN 2 Vulkan replay: {} draws in {} presents, {} dispatches and {} texture uploads total, {} MiB images",
                  draws - last_reported_draws, presents, dispatches, texture_uploads, image_bytes >> 20);
+        if (pipeline_wait_draws != reported_pipeline_wait_draws) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 pipelines: {} built by workers so far, {} being built, {} draws left "
+                     "out since the last report while theirs was being built",
+                     worker_pipelines, pipeline_builder.Pending(),
+                     pipeline_wait_draws - reported_pipeline_wait_draws);
+            reported_pipeline_wait_draws = pipeline_wait_draws;
+        }
         if (profile_replay && presents) {
             const auto ms = [&](u64 nanoseconds) { return double(nanoseconds) / presents / 1e6; };
             LOG_INFO(Render_Vulkan, "Bananza NVN 2 replay profile: replay_ms={:.3f} of which finish_ms={:.3f} upload_ms={:.3f}, submissions={:.1f} finishes={:.1f} refetched_MiB={:.2f} (per present)",
@@ -5876,6 +6269,9 @@ std::optional<VkDescriptorImageInfo> BananzaNvn2Replay::BindStorageImage(
 }
 
 void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submission) {
+    // A dispatch decides its barriers itself; the lists are a draw's.
+    draw_sampled.clear();
+    draw_storage_reads.clear();
     if (!compute_program) {
         return;
     }
@@ -6065,6 +6461,7 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
                                                                   pipeline.workgroup, groups)
                                     .value_or(range.second);
                 writes_to_buffers.emplace_back(upload, start + std::min(end, range.second));
+                upload->NoteWritten(start, start + std::min(end, range.second));
             }
         } else {
             std::tie(buffer, offset) = UploadBufferRange(submission, range);

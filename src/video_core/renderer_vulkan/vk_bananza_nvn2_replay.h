@@ -21,10 +21,14 @@
 
 #include <boost/container/flat_map.hpp>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/container/unordered_set.h"
 #include "common/thread_worker.h"
 #include "core/arm/bananza_nvn2_commands.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_async_builder.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_run_stats.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/shader_environment.h"
 #include "video_core/surface.h"
@@ -199,6 +203,29 @@ private:
         u64 descriptor_submission{};
     };
 
+    /// What a graphics pipeline is made from, as a value a worker thread can keep.
+    struct PipelineInputs {
+        std::shared_ptr<const Program> graphics_program;
+        std::shared_ptr<const Program> fragment_program;
+        std::shared_ptr<const Program> geometry_program;
+        std::array<u32, 32> vertex_attributes;
+        std::array<u32, 32> vertex_strides;
+        std::array<u32, 32> vertex_divisors;
+        ColorState color_state;
+        std::array<std::optional<Texture>, 8> colors;
+        ColorFormats formats;
+        u32 color_count;
+        VkPrimitiveTopology topology;
+        RasterState raster;
+    };
+
+    struct BuiltPipeline {
+        std::optional<Pipeline> pipeline;
+        // Reasons a draw with it has to be skipped, reported by the thread that takes it.
+        std::vector<std::string_view> skips;
+        u64 ns{};
+    };
+
     struct DrawState {
         u32 count{};
         u32 instances{1};
@@ -254,6 +281,14 @@ private:
         u64 readback_base{};
         u64 size{};
         u64 written_bytes{};
+        // The intervals bound to a shader with write access since the last write-back.
+        std::vector<std::pair<u64, u64>> written;
+        void NoteWritten(u64 begin, u64 end) {
+            if (!written.empty() && written.back().first <= begin && end <= written.back().second) {
+                return;
+            }
+            written.emplace_back(begin, end);
+        }
         // The scheduler tick of the last command buffer with a write to the span.
         u64 write_tick{};
         // Written since the last write-back.
@@ -273,6 +308,11 @@ private:
         std::vector<Range> snapshots;
         // The span's buffer once a binding needed it.
         StorageUpload* upload{};
+        // The bytes of each snapshot, in the order of `snapshots`.
+        std::vector<Core::BananzaNvn2Commands::Submission::StorageAddress> bytes;
+        // Set when every snapshot is read from guest memory and they form one host run:
+        // where the span's first byte is.
+        const u8* host{};
     };
 
     struct BufferUpdate {
@@ -320,7 +360,7 @@ private:
     Image* FindImage(const Texture& texture, bool create);
     bool ReserveImageBytes(u64 bytes);
     VkImageView GetAttachmentView(Image& image, const AttachmentView& view);
-    void ReplayRecording(const Recording& recording, const Submission& submission);
+    void ReplayRecording(const std::vector<const Operation*>& flat, const Submission& submission);
     void BindBufferRange(bool storage, u32 stage, u32 slot, Range range);
     BufferRef UploadDriverConstants(u32 base_instance);
     void ClearColor(const Operation& operation);
@@ -370,6 +410,10 @@ private:
         std::vector<Range> snapshots;
         // The GPU is done with the span after this tick.
         u64 tick{};
+        // The span's bytes in guest memory when it is compared in one piece.
+        const u8* before{};
+        // With `before`: the intervals a shader could write; only they are compared.
+        std::vector<std::pair<u64, u64>> written;
     };
     // One GPU timestamp of the pass trace: taken when all earlier work has finished.
     struct PassLabel {
@@ -412,8 +456,10 @@ private:
         const Submission& submission, u64 handle, const Shader::ImageDescriptor& binding,
         Image*& image);
     std::optional<DrawState> DecodeDraw(const Operation& operation) const;
-    std::optional<Pipeline> CreatePipeline(const ColorFormats& formats, u32 color_count,
-                                           VkPrimitiveTopology topology, const RasterState& raster);
+    std::optional<Pipeline> CreatePipeline(const PipelineInputs& inputs,
+                                           std::vector<std::string_view>& skips) const;
+    BuiltPipeline BuildPipeline(const PipelineInputs& inputs) const;
+    void TakePipeline(std::optional<Pipeline>& slot, BuiltPipeline& built);
     BufferRef UploadRange(const Submission& submission, Range range);
     VkBuffer Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage = 0,
                     std::optional<u64> patch_address = std::nullopt);
@@ -518,6 +564,26 @@ private:
     };
     Common::unordered_map<Range, FixedEntry> fixed_cache;
     std::vector<FixedChunk> fixed_chunks;
+    // A pool's bytes in device memory, kept between frames (EDEN_NX2_NVN_POOL_MIRROR=1).
+    struct PoolMirror {
+        vk::Buffer buffer;
+        u64 size{};
+        // Per 64 KiB page: the flush stamp it was synced with, plus one; zero is never.
+        std::vector<u64> synced;
+    };
+    Common::unordered_map<u64, PoolMirror> pool_mirrors;
+    u64 pool_mirror_bytes{};
+    u64 pool_mirror_pages{};
+    // The mirror of a pool, made when it is first needed; nothing past the limit.
+    PoolMirror* GetMirror(u64 pool, u64 size);
+    // Sends the submission's staged pages to the mirrors; false when its staged ranges have
+    // to be uploaded one by one.
+    bool SyncMirrorPages(const Submission& submission);
+    bool staged_ranges_ready{};
+    // The range in its pool's mirror, synced; nothing when the mirror cannot take it.
+    BufferRef MirrorUpload(const Submission& submission,
+                           const Core::BananzaNvn2Commands::Submission::BufferBytes& entry,
+                           u64 size);
     u64 fixed_hits{};
     u64 fixed_uploads{};
     u64 fixed_upload_bytes{};
@@ -617,6 +683,11 @@ private:
     u64 upload_ns{};
     // Totals for the slow-replay line.
     u64 pipeline_creates{};
+    // Pipelines a worker is building, and the draws left out meanwhile.
+    std::set<const std::optional<Pipeline>*> building_pipelines;
+    u64 worker_pipelines{};
+    u64 pipeline_wait_draws{};
+    u64 reported_pipeline_wait_draws{};
     u64 pipeline_create_ns{};
     u64 image_creates{};
     u64 replayed_submissions{};
@@ -647,6 +718,15 @@ private:
     const Image* fresh_image{};
     // A binding of this draw overlaps storage a draw wrote since the last barrier.
     bool storage_fresh{};
+    // What the draw being looked up samples and reads of written storage; whether that needs
+    // a barrier is decided where the draw is issued.
+    struct StorageRead {
+        const StorageUpload* upload;
+        u64 offset;
+        u64 size;
+    };
+    boost::container::small_vector<const Image*, 16> draw_sampled;
+    boost::container::small_vector<StorageRead, 8> draw_storage_reads;
     // Colour slots the current draw's pipeline writes.
     u32 draw_color_writes{~0U};
     std::map<u32, u32> scope_end_sites;
@@ -692,6 +772,7 @@ private:
     std::set<std::tuple<GPUVAddr, u32, u32>> captured_inputs;
     bool trace_images{};
     bool profile_replay{};
+    BananzaNvn2RunStats run_stats;
     bool replay_logged{};
     bool missing_draw_logged{};
     std::set<std::pair<u64, std::string_view>> dispatch_diagnostics;
@@ -712,6 +793,9 @@ private:
     Common::ThreadWorker copy_workers{3, "NvnFill"};
     Common::ThreadWorker retire_workers{3, "NvnWriteBack"};
     std::jthread retire_thread;
+    // Declared last: its threads read this object and stop before anything else goes.
+    BananzaNvn2AsyncBuilder<std::optional<Pipeline>*, BuiltPipeline> pipeline_builder{
+        4, "NvnPipeline"};
 };
 
 } // namespace Vulkan
