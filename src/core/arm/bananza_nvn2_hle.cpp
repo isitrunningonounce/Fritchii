@@ -586,6 +586,17 @@ u64 Session::Dispatch(const BananzaNvn2Trace::Session& procs, Memory::Memory& me
          name == "nvnMemoryPoolInvalidateMappedRange")) {
         return 0;
     }
+    // These only read and write the game's own memory: no lock, and no wait for a scan.
+    if (handler == Handler::Device && name == "nvnDeviceGetTimestampInNanoseconds" &&
+        ValidRange(memory, x[1], 2 * sizeof(u64))) {
+        return memory.Read64(x[1] + sizeof(u64));
+    }
+    if (handler == Handler::Resource && name.starts_with("nvnTextureView") &&
+        ValidRange(memory, x[0], 1)) {
+        if (const auto result = resources.ViewCall(memory, name, call)) {
+            return *result;
+        }
+    }
     if (submit_lane) {
         if (handler == Handler::Queue && name == "nvnQueuePresentTexture") {
             return PresentAsync(call, present_deadline);
@@ -1291,6 +1302,21 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             }
         }
     };
+    // For a pool the game must flush after writing: its serial and the newest flush over the
+    // range. Zeros otherwise.
+    const auto flush_state = [](const Pool* pool, u64 guest, u64 size) -> std::pair<u64, u64> {
+        if (!pool || !size || !(pool->flags & (CpuNoAccess | 4)) || (pool->flags & 2) ||
+            guest < pool->storage) {
+            return {};
+        }
+        u64 stamp{};
+        const u64 offset = guest - pool->storage;
+        for (u64 page = offset >> 16;
+             page <= (offset + size - 1) >> 16 && page < pool->flush_stamps.size(); ++page) {
+            stamp = std::max(stamp, pool->flush_stamps[page]);
+        }
+        return {pool->serial, stamp};
+    };
     static const bool reference_storage = std::getenv("EDEN_NX2_NVN_COPY_STORAGE") == nullptr;
     // Uniform ranges go to their pool's mirror as merged runs (r133); on by default since
     // r150, EDEN_NX2_NVN_NO_STAGED_UNIFORMS=1 copies each range as before.
@@ -1333,7 +1359,10 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
         }
         // The range's bytes as the table has them now, for the storage table.
         const auto stored_as = [&](const Submission::BufferBytes& bytes) {
-            return Submission::StorageAddress{*guest, bytes.data, bytes.owned, bytes.late};
+            const auto [flush_pool, flush_stamp] =
+                bytes.owned ? std::pair<u64, u64>{} : flush_state(pool, *guest, size);
+            return Submission::StorageAddress{*guest, bytes.data, bytes.owned, bytes.late,
+                                              flush_pool, flush_stamp};
         };
         std::optional<Submission::StorageAddress> stored;
         if (found != snapshots.end() && guest) {
@@ -1871,9 +1900,16 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                 if (const auto* const bytes = batch.FindSnapshot(range)) {
                     if (const auto guest = ResolveGpuRange(range.first, range.second);
                         guest && ValidRange(memory, *guest, range.second)) {
+                        const Pool* backing{};
+                        std::pair<u64, u64> flushed{};
+                        if (!bytes->owned && resolve(main_context, range.first, range.second,
+                                                     &backing)) {
+                            flushed = flush_state(backing, *guest, range.second);
+                        }
                         batch.storage_addresses.try_emplace(
                             range, Submission::StorageAddress{*guest, bytes->data,
-                                                              bytes->owned, bytes->late});
+                                                              bytes->owned, bytes->late,
+                                                              flushed.first, flushed.second});
                         if (unsized) {
                             batch.unsized_storage_sizes.try_emplace(range.first, range.second);
                         }
@@ -2379,6 +2415,11 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
             continue;
         }
         const auto& [arguments, address, type] = key;
+        // Reset by this submission: the replay draws from them only once the GPU has written
+        // them again, and then without the slice.
+        if (!scan_waits && batch.indirect_reset_addresses.contains(arguments)) {
+            continue;
+        }
         std::array<u32_le, 5> words{};
         const bool read = read_gpu(arguments, {reinterpret_cast<u8*>(words.data()),
                                                sizeof(words)});
@@ -2393,7 +2434,11 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
     std::vector<Range> indirect_args(indirect_arg_requests.begin(), indirect_arg_requests.end());
     std::ranges::sort(indirect_args);
     for (const auto& [address, size] : indirect_args) {
-        snapshot(address, size);
+        if (!scan_waits && batch.indirect_reset_addresses.contains(address)) {
+            reference(address, size);
+        } else {
+            snapshot(address, size);
+        }
     }
     std::erase_if(batch.indirect_index_slices, [&](const auto& entry) {
         const auto& [address, size] = entry.second;

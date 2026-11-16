@@ -539,6 +539,10 @@ struct Submission : std::enable_shared_from_this<Submission> {
         bool owned{};
         // The copy may still run: wait for late_copies before reading.
         bool late{};
+        // Nonzero when the game must flush the range's pool after writing it: the pool's
+        // serial, and the newest flush over the range's pages.
+        u64 pool{};
+        u64 stamp{};
     };
     std::map<std::pair<u64, u64>, StorageAddress> storage_addresses;
     // Zero denotes an unsized binding whose first byte is unmapped at submit.

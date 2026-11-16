@@ -101,6 +101,13 @@ public:
     const std::unordered_map<u32, ResourceTextureDescriptor>* GetTexturePool(u64 pool) const;
     const std::unordered_map<u32, ResourceSamplerInfo>* GetSamplerPool(u64 pool) const;
 
+    /// An nvnTextureView call: it only reads and writes the view object in guest memory, so
+    /// it needs none of the session's locks. Empty when the call is not valid.
+    std::optional<u64> ViewCall(Memory::Memory& memory, std::string_view name,
+                                const GuestCall& call) {
+        return HandleView(memory, name, call);
+    }
+
 private:
     struct TextureBuilder {
         u64 device{};

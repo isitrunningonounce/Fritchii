@@ -28,6 +28,7 @@
 #include "core/arm/bananza_nvn2_commands.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_async_builder.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_kept_storage.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_run_stats.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/shader_environment.h"
@@ -112,6 +113,8 @@ private:
         u64 cpu_serial{};
         u64 checked_submission{};
         u64 confirmed_replay_submission{};
+        // The submission that was found to hold no replay state for the image's texture.
+        u64 stateless_submission{};
         u64 write_version{};
         // Value of barrier_serial when a draw last wrote the image.
         u64 written_barrier{};
@@ -313,6 +316,10 @@ private:
         // Set when every snapshot is read from guest memory and they form one host run:
         // where the span's first byte is.
         const u8* host{};
+        // The pool every snapshot lies in when the game must flush it after writing, and the
+        // newest flush over them; a pool of zero when that does not hold for all of them.
+        u64 pool{};
+        u64 stamp{};
     };
 
     struct BufferUpdate {
@@ -339,6 +346,8 @@ private:
         std::vector<vk::Buffer> query_results;
         std::vector<std::pair<u64, vk::Buffer>> storage;
         std::vector<std::pair<u64, vk::Buffer>> device_storage;
+        // Kept storage buffers taken out during the replay.
+        std::vector<BananzaNvn2KeptStorage::Buffer> kept;
         std::vector<std::pair<bool, vk::DescriptorPool>> pools;
         std::vector<std::unique_ptr<DescriptorData[]>> pushed;
         std::vector<vk::Buffer> uploads;
@@ -400,6 +409,10 @@ private:
     u64 copy_job_bytes{};
     void DispatchCopies();
     void WaitCopies();
+    /// Before guest memory is read: waits for the write-back of earlier submissions over it.
+    void AwaitGuestWrites(const u8* data, u64 size);
+    /// A snapshot's bytes; one that is guest memory itself is waited for first.
+    std::span<const u8> ReadSnapshot(const Submission& submission, Range range);
     u32 import_probes{};
 
     struct WriteBack {
@@ -438,6 +451,8 @@ private:
         std::vector<WriteBack> writes;
         // The arenas the writes read from.
         std::vector<const vk::Buffer*> written_buffers;
+        // The kept storage buffers among them stay alive with the job.
+        std::vector<BananzaNvn2KeptStorage::Buffer> kept;
         std::vector<CounterEvent> counters;
         u32 queries;
         const vk::Buffer* query_results;
@@ -764,6 +779,31 @@ private:
     u64 storage_bytes{};
     u64 storage_creates{};
     u64 storage_reuses{};
+    // With the replay profile: the flush state each span had when it was last made, by guest
+    // address and size, and the bytes of spans made since the last report by how that state
+    // compares (same, flushed since, new, no flush information).
+    std::map<std::pair<u64, u64>, std::pair<u64, u64>> span_flush_states;
+    std::array<u64, 4> span_state_bytes{};
+    BananzaNvn2KeptStorage kept_storage;
+    // Of this replay: the kept buffers its spans use, the ones it filled (flushed before the
+    // next submit) and the ones it took out (alive until the GPU is done).
+    std::vector<BananzaNvn2KeptStorage::Buffer> used_kept;
+    std::vector<std::pair<BananzaNvn2KeptStorage::Buffer, u64>> kept_fills;
+    std::vector<BananzaNvn2KeptStorage::Buffer> evicted_kept;
+    u64 replay_count{};
+    // Host ranges of guest memory whose write-back by a retire job is not done, and the
+    // newest job with a write-back whose host range is not known.
+    struct PendingWriteback {
+        const u8* begin;
+        const u8* end;
+        u64 sequence;
+    };
+    std::vector<PendingWriteback> pending_writebacks;
+    u64 pending_unknown_writes{};
+    u64 kept_reused_bytes{};
+    u64 kept_filled_bytes{};
+    u64 guest_waits{};
+    u64 guest_wait_ns{};
     u64 stream_bytes{};
     u64 stream_uploads{};
     bool precise_queries{};
