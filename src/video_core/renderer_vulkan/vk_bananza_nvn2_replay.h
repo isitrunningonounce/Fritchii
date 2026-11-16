@@ -402,7 +402,8 @@ private:
     void DispatchCopies();
     void WaitCopies();
     /// Before guest memory is read: waits for the write-back of earlier submissions over it.
-    void AwaitGuestWrites(const u8* data, u64 size);
+    /// True when it had to wait.
+    bool AwaitGuestWrites(const u8* data, u64 size);
     /// A snapshot's bytes; one that is guest memory itself is waited for first.
     std::span<const u8> ReadSnapshot(const Submission& submission, Range range);
     u32 import_probes{};
@@ -481,7 +482,9 @@ private:
                                            std::vector<std::string_view>& skips) const;
     BuiltPipeline BuildPipeline(const PipelineInputs& inputs) const;
     void TakePipeline(std::optional<Pipeline>& slot, BuiltPipeline& built);
-    BufferRef UploadRange(const Submission& submission, Range range);
+    /// known: the range's snapshot when the caller has looked it up (looked_up).
+    BufferRef UploadRange(const Submission& submission, Range range,
+                          const Submission::BufferBytes* known = nullptr, bool looked_up = false);
     VkBuffer Upload(std::span<const u8> bytes, VkBufferUsageFlags extra_usage = 0,
                     std::optional<u64> patch_address = std::nullopt);
     BufferRef UploadStream(std::span<const u8> bytes,
@@ -870,6 +873,12 @@ private:
     u64 kept_filled_bytes{};
     u64 guest_waits{};
     u64 guest_wait_ns{};
+    // Storage spans whose fill waited for an earlier frame's GPU writes, since the last
+    // report, by why the span was not kept: its pool has no flush rule, it was flushed since
+    // it was kept, nothing was kept for it. And their bytes.
+    std::array<u64, 3> wait_spans{};
+    std::array<u64, 3> wait_span_bytes{};
+    u32 wait_span_notes{};
     u64 stream_bytes{};
     u64 stream_uploads{};
     bool precise_queries{};

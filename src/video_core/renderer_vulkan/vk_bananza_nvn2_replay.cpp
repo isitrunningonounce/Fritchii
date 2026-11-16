@@ -922,9 +922,9 @@ void BananzaNvn2Replay::DispatchCopies() {
     }
 }
 
-void BananzaNvn2Replay::AwaitGuestWrites(const u8* data, u64 size) {
+bool BananzaNvn2Replay::AwaitGuestWrites(const u8* data, u64 size) {
     if (pending_writebacks.empty() && !pending_unknown_writes) {
-        return;
+        return false;
     }
     auto& retirement = Core::BananzaNvn2Commands::GetRetirement();
     const auto prune = [&] {
@@ -943,13 +943,14 @@ void BananzaNvn2Replay::AwaitGuestWrites(const u8* data, u64 size) {
         }
     }
     if (!sequence) {
-        return;
+        return false;
     }
     const auto start = std::chrono::steady_clock::now();
     retirement.WaitWrites(sequence);
     guest_wait_ns += static_cast<u64>((std::chrono::steady_clock::now() - start).count());
     ++guest_waits;
     prune();
+    return true;
 }
 
 std::span<const u8> BananzaNvn2Replay::ReadSnapshot(const Submission& submission, Range range) {
@@ -2017,15 +2018,16 @@ VkDescriptorSet BananzaNvn2Replay::AllocateSet(VkDescriptorSetLayout layout, siz
     return VK_NULL_HANDLE;
 }
 
-BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadRange(const Submission& submission,
-                                                            Range range) {
+BananzaNvn2Replay::BufferRef BananzaNvn2Replay::UploadRange(
+    const Submission& submission, Range range, const Submission::BufferBytes* known,
+    bool looked_up) {
     // A storage upload made for a range takes that range out of uploaded_ranges.
     if (const auto cached = uploaded_ranges.find(range); cached != uploaded_ranges.end()) {
         run_stats.Count(BananzaNvn2RunStats::Note::RangeMemo);
         return cached->second;
     }
     static const bool fixed_cache_on = std::getenv("EDEN_NX2_NVN_NO_FIXED_CACHE") == nullptr;
-    const auto* const snapshot = submission.FindSnapshot(range);
+    const auto* const snapshot = looked_up ? known : submission.FindSnapshot(range);
     // A uniform range whose pages went to its pool's mirror at the start of the replay.
     if (snapshot && snapshot->staged_pool && staged_ranges_ready && !HasBufferUpdates(range)) {
         if (const auto mirror = pool_mirrors.find(snapshot->staged_pool);
@@ -2364,6 +2366,9 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
         bound.fixed = snapshot && snapshot->fixed_pool;
         bound.span = bound.fixed ? nullptr : BoundSpan(range);
         known->second = bound;
+        if (bound.fixed) {
+            return UploadRange(submission, range, snapshot, true);
+        }
     } else {
         bound = known->second;
     }
@@ -2398,7 +2403,7 @@ void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
     const u64 alignment =
         device_limits.minStorageBufferOffsetAlignment;
     StorageSpan* span{};
-    for (const auto& [range, stored] : submission.storage_addresses) {
+    for (const auto& [range, stored] : submission.storage_list) {
         const auto [address, size] = range;
         const u64 guest = stored.guest;
         // Read from guest memory: not a copy of the scan's.
@@ -2556,6 +2561,9 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStora
                                  replay_count);
     }
     const bool reused = kept != nullptr;
+    // Why a span that is filled again was not kept, for the count of waits below.
+    const size_t not_kept = !keepable ? 0
+                            : kept_storage.Holds(span.guest_address, span.range.second) ? 1 : 2;
     if (!reused) {
         // Whatever was kept over these guest bytes is not their newest state any more.
         kept_storage.Evict(span.guest_address, span.range.second, evicted_kept);
@@ -2635,7 +2643,21 @@ std::pair<BananzaNvn2Replay::StorageUpload*, u64> BananzaNvn2Replay::CreateStora
         kept_fills.emplace_back(kept, span.range.second);
     }
     if (span.host && !reused) {
-        AwaitGuestWrites(span.host, span.range.second);
+        if (AwaitGuestWrites(span.host, span.range.second)) {
+            ++wait_spans[not_kept];
+            wait_span_bytes[not_kept] += span.range.second;
+            if (wait_span_notes < 24) {
+                ++wait_span_notes;
+                LOG_INFO(Render_Vulkan,
+                         "NVN 2 storage wait: span at guest {:#x}, {} bytes, pool serial {}, "
+                         "flush stamp {}, {} ranges: {}",
+                         span.guest_address, span.range.second, span.pool, span.stamp,
+                         span.snapshots.size(),
+                         not_kept == 0   ? "its pool has no flush rule"
+                         : not_kept == 1 ? "flushed since it was kept"
+                                         : "nothing kept for it");
+            }
+        }
         // One run of guest memory: one copy, with nothing to look up.
         if (fill_later) {
             copy_jobs.push_back({mapped.data(), span.host, span.range.second});
@@ -4734,7 +4756,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     if (!pipeline.uniforms.empty() || !pipeline.storage.empty() || !pipeline.textures.empty()) {
         const auto count = pipeline.uniforms.size() + pipeline.storage.size() +
                            pipeline.textures.size();
-        boost::container::small_vector<DescriptorData, 24> descriptors(count);
+        boost::container::small_vector<DescriptorData, 64> descriptors(count);
         for (const auto& binding : pipeline.uniforms) {
             const auto& bound = uniform_buffers[binding.stage];
             // NVN user uniform slots follow the driver's three internal banks.
@@ -6211,6 +6233,19 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
                      compute_list->Size(), compute_ahead.size(), compute_ahead_built,
                      compute_ahead_dropped, compute_dispatch_built);
             reported_compute_ahead = compute_ahead_built + compute_dispatch_built;
+        }
+        if (wait_spans[0] + wait_spans[1] + wait_spans[2] != 0) {
+            const double frames = std::max<double>(1.0, static_cast<double>(presents));
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 storage waits per present: {:.2f} spans ({:.1f} KiB) in pools with "
+                     "no flush rule, {:.2f} ({:.1f} KiB) flushed since kept, {:.2f} ({:.1f} KiB) "
+                     "with nothing kept; {:.3f} ms waited per present",
+                     wait_spans[0] / frames, wait_span_bytes[0] / frames / 1024.0,
+                     wait_spans[1] / frames, wait_span_bytes[1] / frames / 1024.0,
+                     wait_spans[2] / frames, wait_span_bytes[2] / frames / 1024.0,
+                     guest_wait_ns / frames / 1e6);
+            wait_spans = {};
+            wait_span_bytes = {};
         }
         if (worker_fills != reported_worker_fills) {
             LOG_INFO(Render_Vulkan, "NVN 2 texture fills: {} made by workers so far", worker_fills);

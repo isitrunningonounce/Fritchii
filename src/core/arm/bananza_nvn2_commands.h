@@ -552,6 +552,8 @@ struct Submission : std::enable_shared_from_this<Submission> {
         u64 stamp{};
     };
     std::map<std::pair<u64, u64>, StorageAddress> storage_addresses;
+    // The same in order, made when the scan ends: the replay walks it every frame.
+    std::vector<std::pair<std::pair<u64, u64>, StorageAddress>> storage_list;
     // Zero denotes an unsized binding whose first byte is unmapped at submit.
     std::map<u64, u64> unsized_storage_sizes;
     std::map<u64, u64> indirect_index_sizes;

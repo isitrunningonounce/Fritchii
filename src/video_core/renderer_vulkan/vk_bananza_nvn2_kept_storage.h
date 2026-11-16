@@ -31,6 +31,12 @@ public:
         return found->second.buffer;
     }
 
+    /// Whether a buffer is kept for exactly these guest bytes, whatever its flush state.
+    bool Holds(u64 guest, u64 size) const {
+        const auto found = entries.find(guest);
+        return found != entries.end() && found->second.size == size;
+    }
+
     /// Takes out every entry that overlaps the guest bytes. The caller keeps the buffers until
     /// the GPU is done with them.
     void Evict(u64 guest, u64 size, std::vector<Buffer>& out) {

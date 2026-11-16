@@ -2717,6 +2717,8 @@ void Session::FinishSubmit(Memory::Memory& memory, Queue& queue,
         flattened->Done();
     });
     SnapshotResources(memory, submission, queue);
+    submission.storage_list.assign(submission.storage_addresses.begin(),
+                                   submission.storage_addresses.end());
     flattened->Wait();
     ++accepted_submissions;
     accepted_commands += submission.command_count;
