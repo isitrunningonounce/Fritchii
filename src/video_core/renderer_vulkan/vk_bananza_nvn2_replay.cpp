@@ -6089,7 +6089,9 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     const u64 replay_elapsed =
         static_cast<u64>((std::chrono::steady_clock::now() - replay_start).count());
     replay_ns += replay_elapsed;
-    if (profile_replay && replay_elapsed > 13'500'000) {
+    // With the call profile every replay that is late for a 60 Hz frame; without it only
+    // one the player sees as a hitch.
+    if (replay_elapsed > (profile_replay ? 13'500'000ULL : 50'000'000ULL)) {
         LOG_INFO(Render_Vulkan,
                  "NVN 2 slow replay: seq {} took {:.3f} ms for {} draws: {} pipelines made in "
                  "{:.3f} ms, {} images made, {} texture uploads in {:.3f} ms, {} ranges with {:.2f} "
@@ -6376,6 +6378,75 @@ public:
             }
         }
         return !missing_texture;
+    }
+
+    /// What of a variant's recorded reads the environment answers differently now; empty
+    /// when it matches.
+    std::string Mismatch(const VideoCommon::RecordedEnvQueries& queries) {
+        missing_texture = false;
+        std::string text;
+        size_t listed{};
+        const auto note = [&](std::string line) {
+            if (listed++ < 6) {
+                text += text.empty() ? "" : "; ";
+                text += line;
+            }
+        };
+        const auto handle_at = [&](const Shader::HandleKey& at) {
+            const u32 first = ReadCbufValue(at.index, at.offset) << at.shift_left;
+            return at.has_secondary
+                       ? first | (ReadCbufValue(at.sec_index, at.sec_offset) << at.sec_shift_left)
+                       : first;
+        };
+        for (const auto& [key, value] : queries.cbuf_values) {
+            const u32 bank = static_cast<u32>(key >> 32);
+            const u32 offset = static_cast<u32>(key);
+            if (const u32 now = ReadCbufValue(bank, offset); now != value) {
+                note(fmt::format("constant bank {} offset {:#x} was {:#x}, is {:#x}", bank, offset,
+                                 value, now));
+            }
+        }
+        for (const auto& [key, mapped] : queries.storage_pointer_types) {
+            const bool current = !(key >> 63) &&
+                                 IsCbufStorageBufferPointer(static_cast<u32>(key >> 32),
+                                                            static_cast<u32>(key));
+            if (current != bool(mapped)) {
+                note(fmt::format("storage pointer at bank {} offset {:#x}",
+                                 static_cast<u32>(key >> 32), static_cast<u32>(key)));
+            }
+        }
+        for (const auto& [handle, type] : queries.texture_types) {
+            if (ReadTextureType(handle) != type) {
+                note(fmt::format("type of texture handle {:#x}", handle));
+            }
+        }
+        for (const auto& [handle, format] : queries.texture_pixel_formats) {
+            if (ReadTexturePixelFormat(handle) != format) {
+                note(fmt::format("format of texture handle {:#x}", handle));
+            }
+        }
+        for (const auto& [at, type] : queries.location_texture_types) {
+            if (ReadTextureType(handle_at(at)) != type) {
+                note(fmt::format("texture type at bank {} offset {:#x}", at.index, at.offset));
+            }
+        }
+        for (const auto& [at, format] : queries.location_texture_formats) {
+            if (ReadTexturePixelFormat(handle_at(at)) != format) {
+                note(fmt::format("texture format at bank {} offset {:#x}", at.index, at.offset));
+            }
+        }
+        for (const auto& [at, is_integer] : queries.location_integer_formats) {
+            if (IsTexturePixelFormatInteger(handle_at(at)) != is_integer) {
+                note(fmt::format("integer format at bank {} offset {:#x}", at.index, at.offset));
+            }
+        }
+        if (missing_texture) {
+            note("a texture is missing");
+        }
+        if (listed > 6) {
+            text += fmt::format("; {} more", listed - 6);
+        }
+        return text;
     }
 
     std::span<const u8> Bank(u32 bank) const {
@@ -6680,12 +6751,21 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
     ComputeEnvironment environment{*shader, submission, texture_pool, layout,
                                    std::span{driver}.first(at), uniform_buffers[stage],
                                    storage_buffers[stage]};
-    auto& variants = compute_pipelines[program.serial];
+    // By the program's contents: the game makes many program objects of one shader.
+    auto& variants = compute_pipelines[program.content_hash];
     auto cached = std::ranges::find_if(variants, [&](const ComputePipeline& pipeline) {
         environment.texture_bank = pipeline.texture_bank;
         return environment.Matches(pipeline.queries);
     });
     if (cached == variants.end()) {
+        if (!variants.empty() && compute_variant_notes < 60) {
+            ++compute_variant_notes;
+            environment.texture_bank = variants.back().texture_bank;
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 compute variant: program {} ({:016x}) has {} and needs another: {}",
+                     program.serial, program.content_hash, variants.size(),
+                     environment.Mismatch(variants.back().queries));
+        }
         constexpr size_t MaxVariants = 32;
         if (variants.size() >= MaxVariants) {
             skip("compute translation variant limit");

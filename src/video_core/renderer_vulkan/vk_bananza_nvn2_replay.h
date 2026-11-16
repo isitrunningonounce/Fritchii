@@ -581,7 +581,9 @@ private:
     bool origin_lower_left{};
     std::map<PipelineKey, std::optional<Pipeline>> pipelines;
     decltype(pipelines)::iterator last_pipeline = pipelines.end();
+    // By the content hash of the compute program.
     std::map<u64, std::vector<ComputePipeline>> compute_pipelines;
+    u32 compute_variant_notes{};
     Common::unordered_map<Range, BufferRef> uploaded_ranges;
     // What the submission says of a range bound as a buffer, looked up once per replay:
     // kept in VRAM (UploadRange has it), or the storage span that holds it.
