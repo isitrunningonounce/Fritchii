@@ -3403,17 +3403,18 @@ std::optional<u64> Session::HandleSyncEvent(Memory::Memory& memory, std::string_
         const u64 sequence = waited.sequence;
         auto& retirement = BananzaNvn2Commands::GetRetirement();
         // What a sync waits for, EDEN_NX2_NVN_SYNC:
-        // unset: what was submitted before the present before the last one is finished. The
-        //   game prepares and submits a frame while the one before is replayed, as it does
-        //   on the console while the GPU draws; never much more than a frame is outstanding.
-        // "replay": also the end of the submission's replay, when the game's memory has been
-        //   read for the last time (r155).
-        // "full": the GPU has finished the submission and its results are back (before r155).
-        // Without "full" the game can find counters and ranges the GPU wrote a frame later.
+        // unset: the GPU has finished the submission and its results are back, as the game
+        //   asks. A game that culls with what the GPU wrote draws everything while those
+        //   results reach it late, and then stays late (r174).
+        // "ahead": what was submitted before the present before the last one is finished. The
+        //   game prepares and submits a frame while the one before is replayed; it can find
+        //   counters and ranges the GPU wrote a frame later (r156 to r173).
+        // "replay": as "ahead", and the end of the submission's replay, when the game's
+        //   memory has been read for the last time (r155).
         static const int sync_mode = [] {
             const char* const value = std::getenv("EDEN_NX2_NVN_SYNC");
             const std::string_view mode{value ? value : ""};
-            return mode == "full" ? 0 : mode == "replay" ? 1 : 2;
+            return mode == "ahead" ? 2 : mode == "replay" ? 1 : 0;
         }();
         const bool early = sync_mode != 0 && submit_lane;
         const bool at_replay_end = early && sync_mode == 1;
