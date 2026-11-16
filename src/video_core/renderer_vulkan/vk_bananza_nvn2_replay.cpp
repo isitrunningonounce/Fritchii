@@ -26,6 +26,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/renderer_vulkan/present/util.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_recorded_bindings.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_replay.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_shaders.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
@@ -349,6 +350,8 @@ BananzaNvn2Replay::BananzaNvn2Replay(const Device& device_, MemoryAllocator& all
         pipeline_list.emplace(Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                                   "bananza-nvn2-pipelines.bin",
                               properties.vendorID, properties.deviceID);
+        compute_list.emplace(Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                             "nvn2-compute-pipelines.bin");
     }
     Core::BananzaNvn2Commands::GetRetirement().Start();
     retire_thread = std::jthread([this](std::stop_token token) { RetireLoop(token); });
@@ -3556,6 +3559,18 @@ std::optional<BananzaNvn2Replay::DrawState> BananzaNvn2Replay::DecodeDraw(
 }
 
 void BananzaNvn2Replay::NoteProgram(const std::shared_ptr<const Program>& program) {
+    if (compute_list) {
+        for (const size_t index : compute_list->Of(program->content_hash)) {
+            // Once per variant: the game makes many program objects of one shader.
+            if (compute_ahead.insert(index).second) {
+                compute_builder.Queue(
+                    std::pair{program->content_hash, index},
+                    [this, program, variant = compute_list->At(index)] {
+                        return BuildComputeAhead(*program, variant);
+                    });
+            }
+        }
+    }
     if (!pipeline_list || !pipeline_list->Uses(program->content_hash)) {
         return;
     }
@@ -3589,7 +3604,61 @@ void BananzaNvn2Replay::BuildAhead(const BananzaNvn2PipelineList::Entry& entry) 
     });
 }
 
+std::optional<BananzaNvn2Replay::ComputePipeline> BananzaNvn2Replay::BuildComputeAhead(
+    const Program& program, const BananzaNvn2ComputeList::Variant& variant) const {
+    const auto shader = std::ranges::find(program.shaders, 5U,
+                                          &Core::BananzaNvn2Hle::ResourceShaderInfo::stage);
+    if (shader == program.shaders.end()) {
+        return std::nullopt;
+    }
+    try {
+        BananzaNvn2RecordedBindings bindings{*shader, variant.queries, variant.texture_bank};
+        auto built = CreateComputePipelineWith(bindings, program.serial);
+        // Only a build that asked what the recorded one asked and was answered the same is
+        // that variant. It then matches a dispatch by the record, not by its own reads
+        // (their texture handles are stand-ins).
+        if (!built || built->texture_bank != variant.texture_bank ||
+            !BananzaNvn2ComputeList::Same(
+                {.cbuf_values = built->queries.cbuf_values,
+                 .storage_pointer_types = built->queries.storage_pointer_types,
+                 .location_texture_types = built->queries.location_texture_types,
+                 .location_texture_formats = built->queries.location_texture_formats,
+                 .location_integer_formats = built->queries.location_integer_formats,
+                 .texture_bound = built->queries.texture_bound,
+                 .viewport_transform_state = built->queries.viewport_transform_state},
+                {.cbuf_values = variant.queries.cbuf_values,
+                 .storage_pointer_types = variant.queries.storage_pointer_types,
+                 .location_texture_types = variant.queries.location_texture_types,
+                 .location_texture_formats = variant.queries.location_texture_formats,
+                 .location_integer_formats = variant.queries.location_integer_formats,
+                 .texture_bound = variant.queries.texture_bound,
+                 .viewport_transform_state = variant.queries.viewport_transform_state})) {
+            return std::nullopt;
+        }
+        built->queries = variant.queries;
+        return built;
+    } catch (const std::exception& error) {
+        LOG_WARNING(Render_Vulkan, "NVN 2 compute program {} ahead: {}", program.serial,
+                    error.what());
+        return std::nullopt;
+    }
+}
+
 void BananzaNvn2Replay::CollectPipelines() {
+    compute_builder.Collect(
+        [this](const std::pair<u64, size_t>& key, std::optional<ComputePipeline>&& built) {
+            auto& variants = compute_pipelines[key.first];
+            // A dispatch that needed it first has built its own.
+            if (!built || std::ranges::any_of(variants, [&key](const ComputePipeline& held) {
+                    return held.list_index == key.second;
+                })) {
+                ++compute_ahead_dropped;
+                return;
+            }
+            built->list_index = key.second;
+            variants.push_back(std::move(*built));
+            ++compute_ahead_built;
+        });
     pipeline_builder.Collect([this](std::optional<Pipeline>* slot, BuiltPipeline&& built) {
         if (building_pipelines.erase(slot)) {
             ++worker_pipelines;
@@ -6135,6 +6204,14 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
                      ahead_dropped, draw_built);
             reported_ahead = ahead_queued + draw_built;
         }
+        if (compute_list && compute_ahead_built + compute_dispatch_built != reported_compute_ahead) {
+            LOG_INFO(Render_Vulkan,
+                     "NVN 2 compute ahead: {} variants on the list, {} given to the workers, {} "
+                     "built by them, {} dropped; {} built at a dispatch in all",
+                     compute_list->Size(), compute_ahead.size(), compute_ahead_built,
+                     compute_ahead_dropped, compute_dispatch_built);
+            reported_compute_ahead = compute_ahead_built + compute_dispatch_built;
+        }
         if (worker_fills != reported_worker_fills) {
             LOG_INFO(Render_Vulkan, "NVN 2 texture fills: {} made by workers so far", worker_fills);
             reported_worker_fills = worker_fills;
@@ -6503,6 +6580,12 @@ private:
 
 std::optional<BananzaNvn2Replay::ComputePipeline> BananzaNvn2Replay::CreateComputePipeline(
     ComputeEnvironment& environment) {
+    return CreateComputePipelineWith(environment, compute_program->serial);
+}
+
+template <class Bindings>
+std::optional<BananzaNvn2Replay::ComputePipeline> BananzaNvn2Replay::CreateComputePipelineWith(
+    Bindings& environment, const u64 serial) const {
     Shader::Backend::Bindings bindings;
     const auto& profile = pipeline_cache.ShaderProfile();
     auto shader = TranslateBananzaNvn2Shader(environment.shader, profile,
@@ -6515,7 +6598,6 @@ std::optional<BananzaNvn2Replay::ComputePipeline> BananzaNvn2Replay::CreateCompu
                                             pipeline_cache.ShaderHostInfo(), {}, bindings,
                                             &environment);
     }
-    const u64 serial = compute_program->serial;
     if (shader.status != BananzaNvn2ShaderStatus::Success || environment.missing_texture) {
         LOG_WARNING(Render_Vulkan, "Bananza NVN 2 compute program {} at {:#x}: {}",
                     serial, environment.shader.data_address,
@@ -6757,6 +6839,14 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         environment.texture_bank = pipeline.texture_bank;
         return environment.Matches(pipeline.queries);
     });
+    if (cached == variants.end() && compute_builder.Pending()) {
+        // A worker may have finished the one this dispatch needs.
+        CollectPipelines();
+        cached = std::ranges::find_if(variants, [&](const ComputePipeline& pipeline) {
+            environment.texture_bank = pipeline.texture_bank;
+            return environment.Matches(pipeline.queries);
+        });
+    }
     if (cached == variants.end()) {
         if (!variants.empty() && compute_variant_notes < 60) {
             ++compute_variant_notes;
@@ -6790,6 +6880,11 @@ void BananzaNvn2Replay::Dispatch(const Operation& op, const Submission& submissi
         if (!compiled) {
             skip("compute pipeline unavailable");
             return;
+        }
+        ++compute_dispatch_built;
+        if (compute_list) {
+            compiled->list_index =
+                compute_list->Add(program.content_hash, compiled->texture_bank, compiled->queries);
         }
         variants.push_back(std::move(*compiled));
         cached = std::prev(variants.end());

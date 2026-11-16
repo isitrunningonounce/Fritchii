@@ -206,7 +206,10 @@ add_library(video_core STATIC
     renderer_vulkan/vk_bananza_nvn2_async_builder.h
     renderer_vulkan/vk_bananza_nvn2_replay.cpp
     renderer_vulkan/vk_bananza_nvn2_replay.h
+    renderer_vulkan/vk_bananza_nvn2_compute_list.cpp
+    renderer_vulkan/vk_bananza_nvn2_compute_list.h
     renderer_vulkan/vk_bananza_nvn2_kept_storage.h
+    renderer_vulkan/vk_bananza_nvn2_recorded_bindings.h
     renderer_vulkan/vk_bananza_nvn2_pipeline_list.cpp
     renderer_vulkan/vk_bananza_nvn2_pipeline_list.h
     renderer_vulkan/vk_bananza_nvn2_pipeline_state.h

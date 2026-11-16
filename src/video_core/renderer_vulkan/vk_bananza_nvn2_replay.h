@@ -28,6 +28,7 @@
 #include "core/arm/bananza_nvn2_commands.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_async_builder.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_compute_list.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_kept_storage.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_pipeline_list.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_pipeline_state.h"
@@ -250,6 +251,8 @@ private:
         std::vector<std::pair<u32, Shader::ImageDescriptor>> images;
         u32 texture_bank;
         std::array<u32, 3> workgroup;
+        // Its place in the list of variants kept across runs.
+        size_t list_index{~size_t{}};
     };
 
     // Host memory the spans of one submission are cut from.
@@ -456,6 +459,15 @@ private:
     void ReportPassTimes(const RetireJob& job);
     void Dispatch(const Operation& operation, const Submission& submission);
     std::optional<ComputePipeline> CreateComputePipeline(ComputeEnvironment& environment);
+    /// The build itself, from any environment that has a shader, a texture bank and a
+    /// missing texture flag. Reads nothing the replay changes: runs on a worker too.
+    template <class Bindings>
+    std::optional<ComputePipeline> CreateComputePipelineWith(Bindings& environment,
+                                                             u64 serial) const;
+    /// A listed variant of a program, built from its record; nothing when the build does
+    /// not come out as recorded.
+    std::optional<ComputePipeline> BuildComputeAhead(
+        const Program& program, const BananzaNvn2ComputeList::Variant& variant) const;
     std::optional<VkDescriptorImageInfo> BindStorageImage(
         const Submission& submission, u64 handle, const Shader::ImageDescriptor& binding,
         Image*& image);
@@ -583,6 +595,13 @@ private:
     decltype(pipelines)::iterator last_pipeline = pipelines.end();
     // By the content hash of the compute program.
     std::map<u64, std::vector<ComputePipeline>> compute_pipelines;
+    // The variants of earlier runs, and the indices of those given to the workers.
+    std::optional<BananzaNvn2ComputeList> compute_list;
+    std::set<size_t> compute_ahead;
+    u64 compute_ahead_built{};
+    u64 compute_ahead_dropped{};
+    u64 compute_dispatch_built{};
+    u64 reported_compute_ahead{};
     u32 compute_variant_notes{};
     Common::unordered_map<Range, BufferRef> uploaded_ranges;
     // What the submission says of a range bound as a buffer, looked up once per replay:
@@ -884,6 +903,9 @@ private:
     // Declared last: its threads read this object and stop before anything else goes.
     BananzaNvn2AsyncBuilder<std::optional<Pipeline>*, BuiltPipeline> pipeline_builder{
         4, "NvnPipeline"};
+    // Keyed by the program's content hash and the variant's index in the list.
+    BananzaNvn2AsyncBuilder<std::pair<u64, size_t>, std::optional<ComputePipeline>>
+        compute_builder{2, "NvnCompute"};
 };
 
 } // namespace Vulkan
