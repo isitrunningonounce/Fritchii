@@ -535,6 +535,21 @@ private:
     std::array<u32, 32> vertex_attributes{};
     std::array<u32, 32> vertex_strides{};
     std::array<u32, 32> vertex_divisors{};
+    // The hash of the layout each of them holds (zero: not known), and the layouts seen
+    // last, by hash: an operation that binds one of those does not read its payload.
+    u64 vertex_attributes_id{};
+    u64 vertex_streams_id{};
+    struct KnownAttributes {
+        u64 id{};
+        std::array<u32, 32> attributes;
+    };
+    struct KnownStreams {
+        u64 id{};
+        std::array<u32, 32> strides;
+        std::array<u32, 32> divisors;
+    };
+    std::array<KnownAttributes, 16> known_attributes{};
+    std::array<KnownStreams, 16> known_streams{};
     std::array<Range, 32> vertex_buffers{};
     std::array<BufferRef, 32> vertex_uploads{};
     std::array<std::array<Range, 32>, 6> uniform_buffers{};
@@ -568,6 +583,13 @@ private:
     decltype(pipelines)::iterator last_pipeline = pipelines.end();
     std::map<u64, std::vector<ComputePipeline>> compute_pipelines;
     Common::unordered_map<Range, BufferRef> uploaded_ranges;
+    // What the submission says of a range bound as a buffer, looked up once per replay:
+    // kept in VRAM (UploadRange has it), or the storage span that holds it.
+    struct BoundRange {
+        bool fixed{};
+        StorageSpan* span{};
+    };
+    Common::unordered_map<Range, BoundRange> bound_ranges;
     // Ranges kept in VRAM between submissions, by host address and size.
     struct FixedEntry {
         BufferRef buffer;

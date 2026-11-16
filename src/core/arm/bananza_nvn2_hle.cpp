@@ -3554,6 +3554,10 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
         const u64 element_size = name == "nvnCommandBufferBindVertexAttribState" ? 4 : 8;
         args = {count};
         valid = count <= 32 && copy(x[2], count * element_size);
+        // The hash of the layout, never zero: the replay knows a layout it has seen by it
+        // and does not read the bytes again.
+        args.push_back(
+            Common::CityHash64(reinterpret_cast<const char*>(payload.data()), payload.size()) | 1);
     } else if (name == "nvnCommandBufferPushGraphicsConstants" ||
                name == "nvnCommandBufferPushComputeConstants") {
         const u32 offset = static_cast<u32>(x[2]);

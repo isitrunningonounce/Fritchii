@@ -2355,13 +2355,19 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
                                                             Range range) {
     // A range the GPU never writes is in no storage upload: UploadRange has it in VRAM.
     static const bool fixed_cache_on = std::getenv("EDEN_NX2_NVN_NO_FIXED_CACHE") == nullptr;
-    if (fixed_cache_on) {
-        if (const auto* const snapshot = submission.FindSnapshot(range);
-            snapshot && snapshot->fixed_pool) {
-            return UploadRange(submission, range);
-        }
+    BoundRange bound;
+    if (const auto [known, fresh] = bound_ranges.try_emplace(range); fresh) {
+        const auto* const snapshot = fixed_cache_on ? submission.FindSnapshot(range) : nullptr;
+        bound.fixed = snapshot && snapshot->fixed_pool;
+        bound.span = bound.fixed ? nullptr : BoundSpan(range);
+        known->second = bound;
+    } else {
+        bound = known->second;
     }
-    if (const auto* span = BoundSpan(range)) {
+    if (bound.fixed) {
+        return UploadRange(submission, range);
+    }
+    if (const auto* span = bound.span) {
         // No other span holds these bytes: its buffer, or a new one.
         if (span->upload) {
             const u64 offset = range.first - span->range.first;
@@ -2385,6 +2391,7 @@ std::pair<VkBuffer, u64> BananzaNvn2Replay::UploadBufferRange(const Submission& 
 
 void BananzaNvn2Replay::CollectStorageSpans(const Submission& submission) {
     storage_spans.clear();
+    bound_ranges.clear();
     const u64 alignment =
         device_limits.minStorageBufferOffsetAlignment;
     StorageSpan* span{};
@@ -5440,24 +5447,53 @@ void BananzaNvn2Replay::ReplayRecording(const std::vector<const Operation*>& fla
             break;
         case ReplayOp::StencilCullCriteria:
             break;
-        case ReplayOp::BindVertexAttribState:
-            if (op.args.size() == 1 && op.args[0] <= vertex_attributes.size() &&
-                op.Payload().size() == op.args[0] * 4) {
-                vertex_attributes.fill(0);
-                std::memcpy(vertex_attributes.data(), op.Payload().data(), op.Payload().size());
+        case ReplayOp::BindVertexAttribState: {
+            if (op.args.size() != 2 || op.args[0] > vertex_attributes.size()) {
+                break;
             }
-            break;
-        case ReplayOp::BindVertexStreamState:
-            if (op.args.size() == 1 && op.args[0] <= vertex_strides.size() &&
-                op.Payload().size() == op.args[0] * 8) {
-                vertex_strides.fill(0);
-                vertex_divisors.fill(0);
-                for (size_t i = 0; i < op.args[0]; ++i) {
-                    std::memcpy(&vertex_strides[i], op.Payload().data() + i * 8, 4);
-                    std::memcpy(&vertex_divisors[i], op.Payload().data() + i * 8 + 4, 4);
+            const u64 id = op.args[1];
+            if (id == vertex_attributes_id) {
+                break;
+            }
+            auto& known = known_attributes[(id >> 8) % known_attributes.size()];
+            if (known.id != id) {
+                if (op.Payload().size() != op.args[0] * 4) {
+                    break;
                 }
+                known.attributes.fill(0);
+                std::memcpy(known.attributes.data(), op.Payload().data(), op.Payload().size());
+                known.id = id;
             }
+            vertex_attributes = known.attributes;
+            vertex_attributes_id = id;
             break;
+        }
+        case ReplayOp::BindVertexStreamState: {
+            if (op.args.size() != 2 || op.args[0] > vertex_strides.size()) {
+                break;
+            }
+            const u64 id = op.args[1];
+            if (id == vertex_streams_id) {
+                break;
+            }
+            auto& known = known_streams[(id >> 8) % known_streams.size()];
+            if (known.id != id) {
+                if (op.Payload().size() != op.args[0] * 8) {
+                    break;
+                }
+                known.strides.fill(0);
+                known.divisors.fill(0);
+                for (size_t i = 0; i < op.args[0]; ++i) {
+                    std::memcpy(&known.strides[i], op.Payload().data() + i * 8, 4);
+                    std::memcpy(&known.divisors[i], op.Payload().data() + i * 8 + 4, 4);
+                }
+                known.id = id;
+            }
+            vertex_strides = known.strides;
+            vertex_divisors = known.divisors;
+            vertex_streams_id = id;
+            break;
+        }
         case ReplayOp::SetViewport:
             if (op.args.size() == 4) {
                 viewport = {static_cast<float>(static_cast<s32>(op.args[0])),
@@ -5931,6 +5967,7 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     }
     next_flush_draw = std::numeric_limits<u64>::max();
     uploaded_ranges.clear();
+    bound_ranges.clear();
     vertex_uploads.fill({});
     ++upload_generation;
     sampled_bindings.clear();
