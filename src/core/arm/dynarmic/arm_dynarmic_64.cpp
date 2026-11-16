@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -13,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
@@ -25,10 +29,12 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/jit_block_list.h"
 #include "core/arm/dynarmic/lichii_hooks.h"
 #include "core/arm/dynarmic/lichii_zstd_hle.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
 #if defined(_M_X64) || defined(__x86_64__)
@@ -685,44 +691,66 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
-namespace {
-struct StoredBlock {
-    u64 location;
-    u32 first_instruction;
-    u32 reserved;
-};
-static_assert(sizeof(StoredBlock) == 16);
-
-std::filesystem::path StoredBlocksPath(u64 program_id) {
-    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "lichii_jit" /
-           fmt::format("{:016X}.bin", program_id);
-}
-} // Anonymous namespace
-
 void ArmDynarmic64::PrecompileStoredBlocks() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("LICHII_JIT_PRECOMPILE");
-        return value != nullptr && value[0] == '1';
-    }();
-    const u64 program_id = m_cb->m_process->GetProgramId();
-    if (!enabled || program_id == 0 || program_id != m_system.GetApplicationProcessProgramID()) {
+    // The first core to run a thread does it for all of them; the others wait here.
+    static std::mutex mutex;
+    std::scoped_lock lock{mutex};
+    if (m_blocks_precompiled.load(std::memory_order_acquire)) {
         return;
     }
-    std::ifstream in{StoredBlocksPath(program_id), std::ios::binary};
-    if (!in) {
+    Kernel::KProcess* const process = m_cb->m_process;
+    const u64 program_id = process->GetProgramId();
+    if (program_id == 0 || program_id != m_system.GetApplicationProcessProgramID()) {
+        m_blocks_precompiled.store(true, std::memory_order_release);
         return;
     }
-    const auto begin = std::chrono::steady_clock::now();
-    size_t stored = 0;
-    size_t compiled = 0;
-    StoredBlock block{};
-    while (in.read(reinterpret_cast<char*>(&block), sizeof(block))) {
-        ++stored;
-        compiled += m_jit->PrecompileBlock(block.location, block.first_instruction) ? 1 : 0;
+    std::array<ArmDynarmic64*, Core::Hardware::NUM_CPU_CORES> cores{};
+    for (size_t core = 0; core < cores.size(); ++core) {
+        // The cores of a 64-bit process all have this kind of interface.
+        cores[core] = static_cast<ArmDynarmic64*>(process->GetArmInterface(core));
     }
-    LOG_INFO(Core_ARM, "LICHII_JIT: core {} precompiled {} of {} stored blocks in {:.2f} s",
-             m_core_index, compiled, stored,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    // Read for every game, so its file loses the repeats of earlier runs.
+    JitBlockList& list = JitBlockList::For(program_id);
+    static const char* const setting = std::getenv("LICHII_JIT_PRECOMPILE");
+    const bool enabled = setting != nullptr && setting[0] != '\0'
+                             ? setting[0] == '1'
+                             : program_id == Settings::DonkeyKongBananzaProgramId;
+    if (enabled) {
+        const auto begin = std::chrono::steady_clock::now();
+        std::array<size_t, Core::Hardware::NUM_CPU_CORES> compiled{};
+        const auto compile = [&list, &compiled](ArmDynarmic64& arm, size_t core) {
+            for (const JitBlockList::Block& block : list.ForCore(core)) {
+                compiled[core] +=
+                    arm.m_jit->PrecompileBlock(block.location, block.first_instruction) ? 1 : 0;
+            }
+        };
+        {
+            // No core runs guest code on its JIT before this returns: each waits above.
+            std::vector<std::jthread> helpers;
+            for (size_t core = 0; core < cores.size(); ++core) {
+                if (cores[core] != nullptr && cores[core] != this) {
+                    helpers.emplace_back([&compile, arm = cores[core], core] { compile(*arm, core); });
+                }
+            }
+            compile(*this, m_core_index);
+        }
+        size_t total{};
+        for (const size_t count : compiled) {
+            total += count;
+        }
+        LOG_INFO(Core_ARM,
+                 "LICHII_JIT: precompiled {} blocks on the cores ({} to {} a core) of {} on the "
+                 "list in {:.2f} s",
+                 total, *std::ranges::min_element(compiled), *std::ranges::max_element(compiled),
+                 list.Size(),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    }
+    for (ArmDynarmic64* const arm : cores) {
+        if (arm != nullptr) {
+            arm->m_blocks_precompiled.store(true, std::memory_order_release);
+        }
+    }
+    m_blocks_precompiled.store(true, std::memory_order_release);
 }
 
 void ArmDynarmic64::ReportCompiledBlocks() {
@@ -745,28 +773,20 @@ void ArmDynarmic64::ReportCompiledBlocks() {
     if (blocks.empty() || program_id == 0) {
         return;
     }
-    static std::mutex file_mutex;
-    std::scoped_lock lock{file_mutex};
-    const auto path = StoredBlocksPath(program_id);
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
-    std::ofstream out{path, std::ios::binary | std::ios::app};
-    for (const auto& [location, pc] : blocks) {
-        const StoredBlock block{
-            .location = location,
-            .first_instruction = m_cb->m_memory.Read32(pc),
-            .reserved = 0,
-        };
-        out.write(reinterpret_cast<const char*>(&block), sizeof(block));
+    std::vector<JitBlockList::Block> compiled;
+    compiled.reserve(blocks.size());
+    for (const auto& block : blocks) {
+        compiled.push_back({block.location, m_cb->m_memory.Read32(block.pc),
+                            1U << (block.processor & 31)});
     }
+    JitBlockList::For(program_id).Add(compiled);
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     if (m_cb->m_process->GetBananzaNvn2Trace()) {
         m_cb->m_nvn2_thread_id = thread->GetThreadId();
     }
-    if (!m_blocks_precompiled) {
-        m_blocks_precompiled = true;
+    if (!m_blocks_precompiled.load(std::memory_order_acquire)) {
         PrecompileStoredBlocks();
     }
     ReportCompiledBlocks();

@@ -1308,6 +1308,8 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/dynarmic_cp15.h
         arm/dynarmic/dynarmic_exclusive_monitor.cpp
         arm/dynarmic/dynarmic_exclusive_monitor.h
+        arm/dynarmic/jit_block_list.cpp
+        arm/dynarmic/jit_block_list.h
         hle/service/jit/jit_code_memory.cpp
         hle/service/jit/jit_code_memory.h
         hle/service/jit/jit_context.cpp

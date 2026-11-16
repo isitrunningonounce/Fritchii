@@ -144,8 +144,14 @@ struct CompileStats {
 };
 CompileStats TakeCompileStats();
 
-/// Lichii: each block compiled since the last call, once: (location descriptor, guest pc).
-std::vector<std::pair<std::uint64_t, std::uint64_t>> TakeNewBlocks();
+/// Lichii: each block compiled since the last call, once per JIT that compiled it (its
+/// processor_id).
+struct NewBlock {
+    std::uint64_t location = 0;
+    std::uint64_t pc = 0;
+    std::uint32_t processor = 0;
+};
+std::vector<NewBlock> TakeNewBlocks();
 
 }  // namespace A64
 }  // namespace Dynarmic
