@@ -128,6 +128,10 @@ bool ValidRange(Memory::Memory& memory, u64 address, u64 size) {
            memory.IsValidVirtualAddressRange(address, size);
 }
 
+// Counts every command buffer made or removed, in any session: what a thread remembers of a
+// command buffer holds while this stays the same.
+std::atomic<u64> command_generation{1};
+
 std::optional<std::vector<u64>> ReadHandles(Memory::Memory& memory, u64 address, u64 count) {
     if (count > 0x10000 || (count && !ValidRange(memory, address, count * sizeof(u64)))) {
         return std::nullopt;
@@ -263,6 +267,7 @@ Session::Session(System& system_, const BananzaNvn2Trace::Session& trace, u64 bo
                  u64 internal_bootstrap_, u64 callback_return_)
     : bootstrap{bootstrap_}, internal_bootstrap{internal_bootstrap_},
       callback_return{callback_return_}, procedures(trace.Size()), system{system_} {
+    command_generation.fetch_add(1, std::memory_order_release);
     // EDEN_NX2_NVN_SYNC_SCAN=1: the scan runs inside the game's submit call, as before.
     if (std::getenv("EDEN_NX2_NVN_SYNC_SCAN") == nullptr && !SyncSubmits()) {
         submit_lane = std::make_unique<SubmitLane>();
@@ -389,6 +394,12 @@ std::optional<std::pair<size_t, size_t>> Session::DirectCallArguments(size_t ind
     if (procedure.state_binding) {
         return std::pair<size_t, size_t>{2, 0};
     }
+    // Lookups that never wait and never call back into the game.
+    if (procedure.handler == Handler::GetPoolFlags ||
+        procedure.handler == Handler::GetBufferAddress ||
+        procedure.handler == Handler::MapBuffer) {
+        return std::pair<size_t, size_t>{1, 0};
+    }
     return std::nullopt;
 }
 
@@ -432,10 +443,10 @@ std::optional<GuestCallback> Session::BeginCallback(u64 thread, size_t procedure
     auto& shard = CommandShardOf(address);
     std::shared_lock lock{shard.mutex};
     const auto buffer = shard.buffers.find(address);
-    const auto state = recorder.GetState(address);
-    if (buffer == shard.buffers.end() || !state || !buffer->second.callback) {
+    if (buffer == shard.buffers.end() || !buffer->second.recording || !buffer->second.callback) {
         return std::nullopt;
     }
+    const auto* const state = &buffer->second.recording->state;
     if (command_bytes) {
         if (!state->recording || !buffer->second.command_callback ||
             Fits(state->command_used, command_bytes, state->command_size)) {
@@ -2692,13 +2703,6 @@ void Session::UpdateCommandBuffer(Memory::Memory& memory, u64 address,
     memory.Write64(address + 0x80, object.callback_data);
 }
 
-void Session::UpdateCommandCursor(Memory::Memory& memory, u64 address,
-                                  const CommandBuffer& object) {
-    if (const auto state = recorder.GetState(address)) {
-        memory.Write64(address, object.command_storage + state->command_used);
-    }
-}
-
 void Session::FinishSubmit(Memory::Memory& memory, Queue& queue,
                            BananzaNvn2Commands::Submission& submission,
                            std::unique_lock<std::mutex>& lock) {
@@ -3650,15 +3654,17 @@ std::optional<u64> Session::HandleCommandPayload(Memory::Memory& memory, size_t 
     } else {
         return std::nullopt;
     }
-    if (memory.Read8(x[0] + 0x11)) {
-        recorder.Begin(x[0]);
+    const CommandBuffer& object = CommandShardOf(x[0]).buffers.at(x[0]);
+    auto& recording = *object.recording;
+    if (!recording.state.recording && memory.Read8(x[0] + 0x11)) {
+        recorder.Begin(recording);
     }
     const u64 bytes = CommandBytes(name, call);
-    if (!valid || !recorder.Record(x[0], static_cast<u32>(index), args, payload, bytes,
+    if (!valid || !recorder.Record(recording, static_cast<u32>(index), args, payload, bytes,
                                    texture_snapshots, std::move(program), replay)) {
         NoteMissing(fmt::format("{} invalid payload or recording state", name));
     } else if (bytes) {
-        UpdateCommandCursor(memory, x[0], CommandShardOf(x[0]).buffers.at(x[0]));
+        memory.Write64(x[0], object.command_storage + recording.state.command_used);
     }
     return 0;
 }
@@ -3677,6 +3683,8 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
         memory.Write64(x[0] + 0x70, x[1]);
         auto& object =
             CommandShardOf(x[0]).buffers.insert_or_assign(x[0], CommandBuffer{}).first->second;
+        object.recording = recorder.Find(x[0]);
+        command_generation.fetch_add(1, std::memory_order_release);
         UpdateCommandBuffer(memory, x[0], object, {});
         return 1;
     }
@@ -3687,6 +3695,7 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
     }
     auto& object = it->second;
     if (name == "nvnCommandBufferFinalize") {
+        command_generation.fetch_add(1, std::memory_order_release);
         ok = recorder.Finalize(x[0]);
         command_buffers.erase(it);
         return 0;
@@ -3785,13 +3794,30 @@ std::optional<u64> Session::HandleCommands(Memory::Memory& memory, size_t index,
 std::optional<bool> Session::RecordCommand(Memory::Memory& memory, size_t index,
                                            const GuestCall& call) {
     const auto& x = call.x;
-    auto& command_buffers = CommandShardOf(x[0]).buffers;
-    const auto buffer = command_buffers.find(x[0]);
-    if (buffer == command_buffers.end() || !ValidRange(memory, x[0], CommandBufferSize)) {
-        return std::nullopt;
+    // The command buffers this thread recorded into last: the caller holds the lock of the
+    // buffer's part, so an object found before is still there while no command buffer was
+    // made or removed since.
+    struct Known {
+        u64 generation{};
+        u64 address{};
+        CommandBuffer* object{};
+    };
+    thread_local std::array<Known, 4> known_buffers;
+    Known& known = known_buffers[(x[0] * 0x9E3779B97F4A7C15ULL) >> 62];
+    const u64 generation = command_generation.load(std::memory_order_acquire);
+    if (known.address != x[0] || known.generation != generation || !known.object) {
+        auto& command_buffers = CommandShardOf(x[0]).buffers;
+        const auto buffer = command_buffers.find(x[0]);
+        if (buffer == command_buffers.end() || !buffer->second.recording ||
+            !ValidRange(memory, x[0], CommandBufferSize)) {
+            return std::nullopt;
+        }
+        known = {generation, x[0], &buffer->second};
     }
-    if (memory.Read8(x[0] + 0x11)) {
-        recorder.Begin(x[0]);
+    const CommandBuffer& object = *known.object;
+    auto& recording = *object.recording;
+    if (!recording.state.recording && memory.Read8(x[0] + 0x11)) {
+        recorder.Begin(recording);
     }
     const auto& procedure = procedures[index];
     const auto* scalar = static_cast<const ScalarCommand*>(procedure.scalar_command);
@@ -3800,22 +3826,30 @@ std::optional<bool> Session::RecordCommand(Memory::Memory& memory, size_t index,
         const auto payload = std::span{data}.first(state->bytes);
         return ValidRange(memory, x[1], payload.size()) &&
                memory.ReadBlock(x[1], payload.data(), payload.size()) &&
-               recorder.Record(x[0], static_cast<u32>(index), {}, payload, 0, {}, {}, state->replay);
+               recorder.Record(recording, static_cast<u32>(index), {}, payload, 0, {}, {},
+                               state->replay);
     }
     if (procedure.binds_deferred_textures) {
         const u32 count = static_cast<u32>(x[3]);
         const std::array<u64, 4> args{static_cast<u32>(x[1]), static_cast<u32>(x[2]), count, x[4]};
         return count <= 64 && (!count || ValidRange(memory, x[4], count * sizeof(u64))) &&
-               recorder.Record(x[0], static_cast<u32>(index), args, {}, 0, {}, {},
+               recorder.Record(recording, static_cast<u32>(index), args, {}, 0, {}, {},
                                ReplayOp::BindTexturesDeferred);
     }
     if (!scalar) {
-        const auto handles = ReadHandles(memory, x[2], static_cast<u32>(x[1]));
-        if (!handles || !recorder.AppendHandles(x[0], *handles, 0, procedure.calls_handles)) {
-            return false;
+        // No command memory is charged for the handles, so the fields the game reads of the
+        // command buffer stay as they are.
+        const u32 count = static_cast<u32>(x[1]);
+        std::array<u64_le, 16> few;
+        if (count <= few.size()) {
+            return (!count || (ValidRange(memory, x[2], count * sizeof(u64)) &&
+                               memory.ReadBlock(x[2], few.data(), count * sizeof(u64)))) &&
+                   recorder.AppendHandles(
+                       recording, std::span{reinterpret_cast<const u64*>(few.data()), count}, 0,
+                       procedure.calls_handles);
         }
-        UpdateCommandBuffer(memory, x[0], buffer->second, *recorder.GetState(x[0]));
-        return true;
+        const auto handles = ReadHandles(memory, x[2], count);
+        return handles && recorder.AppendHandles(recording, *handles, 0, procedure.calls_handles);
     }
     const auto& command = *scalar;
     const auto args = std::span{x}.subspan(1, command.args);
@@ -3825,12 +3859,12 @@ std::optional<bool> Session::RecordCommand(Memory::Memory& memory, size_t index,
                            [](u64 reg) { return static_cast<u32>(reg); });
     const auto bytes = std::span<const u8>{reinterpret_cast<const u8*>(floats.data()),
                                            floats.size_bytes()};
-    if (!recorder.Record(x[0], static_cast<u32>(index), args, bytes, command.command_bytes,
+    if (!recorder.Record(recording, static_cast<u32>(index), args, bytes, command.command_bytes,
                          {}, {}, command.replay)) {
         return false;
     }
     if (command.command_bytes) {
-        UpdateCommandCursor(memory, x[0], buffer->second);
+        memory.Write64(x[0], object.command_storage + recording.state.command_used);
     }
     return true;
 }

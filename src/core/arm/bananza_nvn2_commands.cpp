@@ -241,15 +241,26 @@ bool Recorder::SetControlMemory(u64 command_buffer, u64 guest_base, u64 size) {
     return true;
 }
 
+Recorder::Buffer* Recorder::Find(u64 command_buffer) {
+    auto& shard = ShardOf(command_buffer);
+    std::shared_lock lock{shard.mutex};
+    const auto it = shard.buffers.find(command_buffer);
+    return it != shard.buffers.end() ? &it->second : nullptr;
+}
+
 bool Recorder::Begin(u64 command_buffer) {
     auto& shard = ShardOf(command_buffer);
     std::shared_lock lock{shard.mutex};
     const auto it = shard.buffers.find(command_buffer);
-    if (it == shard.buffers.end() || it->second.state.recording) {
+    return it != shard.buffers.end() && Begin(it->second);
+}
+
+bool Recorder::Begin(Buffer& buffer) {
+    if (buffer.state.recording) {
         return false;
     }
-    auto& buffer = it->second;
     buffer.operations.clear();
+    buffer.extras.clear();
     buffer.called.clear();
     buffer.operations.reserve(std::min(operations_hint, MaxOperationsHint));
     buffer.called.reserve(std::min(called_hint, MaxCalledHint));
@@ -271,17 +282,23 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
                       std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures,
                       std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program,
                       ReplayOp replay) {
-    if (args.size() > MaxPayloadBytes / sizeof(u64) || payload.size() > MaxPayloadBytes ||
-        textures.size() > 9) {
-        return false;
-    }
     auto& shard = ShardOf(command_buffer);
     std::shared_lock lock{shard.mutex};
     const auto it = shard.buffers.find(command_buffer);
-    if (it == shard.buffers.end() || !it->second.state.recording) {
+    return it != shard.buffers.end() &&
+           Record(it->second, op, args, payload, command_bytes, textures, std::move(program),
+                  replay);
+}
+
+bool Recorder::Record(Buffer& buffer, u32 op, std::span<const u64> args,
+                      std::span<const u8> payload, u64 command_bytes,
+                      std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures,
+                      std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program,
+                      ReplayOp replay) {
+    if (args.size() > MaxPayloadBytes / sizeof(u64) || payload.size() > MaxPayloadBytes ||
+        textures.size() > 9 || !buffer.state.recording) {
         return false;
     }
-    auto& buffer = it->second;
     const u64 argument_bytes = args.size_bytes();
     if (buffer.operations.size() >= MaxCommands || buffer.command_count >= MaxCommands ||
         !Fits(buffer.payload_bytes, payload.size(), MaxPayloadBytes) ||
@@ -294,7 +311,7 @@ bool Recorder::Record(u64 command_buffer, u32 op, std::span<const u64> args,
     operation.replay = replay;
     operation.args.assign(args.begin(), args.end());
     if (!payload.empty() || !textures.empty() || program) {
-        operation.extra = std::make_unique<OperationExtra>();
+        operation.extra = buffer.extras.Make();
         operation.extra->payload.assign(payload.begin(), payload.end());
         operation.extra->textures.assign(textures.begin(), textures.end());
         operation.extra->program = std::move(program);
@@ -313,11 +330,13 @@ bool Recorder::AppendHandles(u64 command_buffer, std::span<const u64> handles, u
     auto& shard = ShardOf(command_buffer);
     std::shared_lock lock{shard.mutex};
     const auto it = shard.buffers.find(command_buffer);
-    if (it == shard.buffers.end() || !it->second.state.recording) {
-        return false;
-    }
-    auto& buffer = it->second;
-    if (!Fits(buffer.operations.size(), handles.size(), MaxCommands) ||
+    return it != shard.buffers.end() && AppendHandles(it->second, handles, command_bytes, call);
+}
+
+bool Recorder::AppendHandles(Buffer& buffer, std::span<const u64> handles, u64 command_bytes,
+                             bool call) {
+    if (!buffer.state.recording ||
+        !Fits(buffer.operations.size(), handles.size(), MaxCommands) ||
         !Fits(buffer.state.command_used, command_bytes, buffer.state.command_size)) {
         return false;
     }
@@ -567,6 +586,7 @@ std::optional<u64> Recorder::End(u64 command_buffer, u64 control_bytes, u64 gues
     snapshot->copied_commands = buffer.copied_commands;
     snapshot->copied_draws = buffer.copied_draws;
     snapshot->operations = std::move(buffer.operations);
+    snapshot->extras = std::move(buffer.extras);
     snapshot->called = std::move(buffer.called);
     operations_hint = snapshot->operations.size() + snapshot->operations.size() / 8 + 16;
     called_hint = snapshot->called.size() + snapshot->called.size() / 8 + 8;

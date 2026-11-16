@@ -185,6 +185,8 @@ private:
     };
 
     struct CommandBuffer {
+        // The recorder's entry for it, from Initialize to Finalize.
+        BananzaNvn2Commands::Recorder::Buffer* recording{};
         u64 callback{};
         u64 callback_data{};
         u64 command_storage{};
@@ -326,7 +328,6 @@ private:
     std::optional<bool> RecordCommand(Memory::Memory& memory, size_t index, const GuestCall& call);
     std::optional<u64> HandleCommandPayload(Memory::Memory& memory, size_t index,
                                             std::string_view name, const GuestCall& call);
-    void UpdateCommandCursor(Memory::Memory& memory, u64 address, const CommandBuffer& object);
     void UpdateCommandBuffer(Memory::Memory& memory, u64 address, const CommandBuffer& object,
                              const BananzaNvn2Commands::State& state);
     void NoteMissing(std::string_view name);

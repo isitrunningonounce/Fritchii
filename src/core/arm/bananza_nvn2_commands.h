@@ -29,6 +29,8 @@
 #include "common/thread_worker.h"
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
+#include "core/arm/bananza_nvn2_chunk_pool.h"
+#include "core/arm/bananza_nvn2_op_bytes.h"
 #include "core/arm/bananza_nvn2_resources.h"
 
 namespace Core::Memory {
@@ -181,7 +183,7 @@ private:
 
 // What few operations carry.
 struct OperationExtra {
-    std::vector<u8> payload;
+    OpBytes payload;
     std::vector<BananzaNvn2Hle::ResourceTextureInfo> textures;
     std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program;
 };
@@ -194,10 +196,11 @@ struct Operation {
     OpArgs args;
     // The called recording; Recording::called keeps it alive.
     const Recording* nested{};
-    std::unique_ptr<OperationExtra> extra;
+    // In the recording's pool.
+    OperationExtra* extra{};
 
-    const std::vector<u8>& Payload() const {
-        static const std::vector<u8> none;
+    const OpBytes& Payload() const {
+        static const OpBytes none;
         return extra ? extra->payload : none;
     }
     const std::vector<BananzaNvn2Hle::ResourceTextureInfo>& Textures() const {
@@ -245,6 +248,8 @@ void FlattenRecordings(Submission& submission);
 
 struct Recording {
     std::vector<Operation> operations;
+    // What few of its operations carry.
+    ChunkPool<OperationExtra> extras;
     // Its own operations as the submit scan reads them; a called recording is a Call entry.
     std::vector<ScanEntry> scan;
     // How many entries and operations it has once the called recordings are put in place.
@@ -296,7 +301,7 @@ inline void PrefetchAhead(const std::vector<const Operation*>& flat, size_t inde
         _mm_prefetch(reinterpret_cast<const char*>(flat[index + 8]), _MM_HINT_T0);
     }
     if (index + 4 < flat.size()) {
-        if (const OperationExtra* const extra = flat[index + 4]->extra.get()) {
+        if (const OperationExtra* const extra = flat[index + 4]->extra) {
             _mm_prefetch(reinterpret_cast<const char*>(extra), _MM_HINT_T0);
         }
     }
@@ -578,6 +583,22 @@ struct Submission : std::enable_shared_from_this<Submission> {
 // One instance belongs to one guest process. Guest pointers are opaque addresses, never host pointers.
 class Recorder {
 public:
+    struct Buffer {
+        State state;
+        std::vector<Operation> operations;
+        ChunkPool<OperationExtra> extras;
+        std::vector<std::shared_ptr<const Recording>> called;
+        u64 command_count{};
+        u64 payload_bytes{};
+        u64 argument_bytes{};
+        u64 draw_count{};
+        u64 called_commands{};
+        u64 called_draws{};
+        u64 copied_commands{};
+        u64 copied_draws{};
+        u32 nesting_depth{1};
+    };
+
     bool Initialize(u64 command_buffer);
     bool Finalize(u64 command_buffer);
     bool SetCommandMemory(u64 command_buffer, u64 size);
@@ -596,25 +617,23 @@ public:
     bool FinalizeHandle(u64 handle);
     std::optional<State> GetState(u64 command_buffer) const;
 
+    /// The command buffer's entry, which stays where it is until Finalize. A caller that
+    /// keeps Initialize and Finalize of the buffer away while it works (the session holds the
+    /// lock of the buffer's part) records through the entry without a lookup or a lock.
+    Buffer* Find(u64 command_buffer);
+    bool Begin(Buffer& buffer);
+    bool Record(Buffer& buffer, u32 op, std::span<const u64> args = {},
+                std::span<const u8> payload = {}, u64 command_bytes = 0,
+                std::span<const BananzaNvn2Hle::ResourceTextureInfo> textures = {},
+                std::shared_ptr<const BananzaNvn2Hle::ResourceProgramInfo> program = {},
+                ReplayOp replay = ReplayOp::Unsupported);
+    bool AppendHandles(Buffer& buffer, std::span<const u64> handles, u64 command_bytes = 0,
+                       bool call = true);
+
     // Validates the entire batch and retains its snapshots; it does not execute or complete GPU work.
     std::optional<Submission> Submit(u64 queue, std::span<const u64> handles);
 
 private:
-    struct Buffer {
-        State state;
-        std::vector<Operation> operations;
-        std::vector<std::shared_ptr<const Recording>> called;
-        u64 command_count{};
-        u64 payload_bytes{};
-        u64 argument_bytes{};
-        u64 draw_count{};
-        u64 called_commands{};
-        u64 called_draws{};
-        u64 copied_commands{};
-        u64 copied_draws{};
-        u32 nesting_depth{1};
-    };
-
     struct Handle {
         std::shared_ptr<const Recording> recording;
         u64 control_begin{};
@@ -623,7 +642,7 @@ private:
 
     // For the handles and what follows them below: shared for a lookup (a command buffer
     // that calls another one, thousands of times a frame from every recording thread).
-    mutable std::shared_mutex handles_mutex;
+    mutable Common::ReaderMutex handles_mutex;
     // Frees recordings whose handles are gone: not work for a thread of the game.
     Common::ThreadWorker garbage{1, "NvnFree"};
     // The command buffers, in parts by address. A part's lock is shared while one thread

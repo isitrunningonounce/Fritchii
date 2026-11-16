@@ -6,11 +6,13 @@
 
 add_library(core STATIC
     arm/arm_interface.cpp
+    arm/bananza_nvn2_chunk_pool.h
     arm/bananza_nvn2_commands.cpp
     arm/bananza_nvn2_commands.h
     arm/bananza_nvn2_device.h
     arm/bananza_nvn2_hle.cpp
     arm/bananza_nvn2_hle.h
+    arm/bananza_nvn2_op_bytes.h
     arm/bananza_nvn2_submit_lane.h
     arm/bananza_nvn2_resources.cpp
     arm/bananza_nvn2_resources.h
