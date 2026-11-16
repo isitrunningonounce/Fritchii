@@ -211,6 +211,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_bananza_nvn2_pipeline_list.h
     renderer_vulkan/vk_bananza_nvn2_pipeline_state.h
     renderer_vulkan/vk_bananza_nvn2_run_stats.h
+    renderer_vulkan/vk_bananza_nvn2_texture_fill.cpp
+    renderer_vulkan/vk_bananza_nvn2_texture_fill.h
     renderer_vulkan/vk_bananza_nvn2_shaders.cpp
     renderer_vulkan/vk_bananza_nvn2_shaders.h
     renderer_vulkan/vk_blit_screen.cpp

@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_pipeline_list.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_bananza_nvn2_run_stats.h"
+#include "video_core/renderer_vulkan/vk_bananza_nvn2_texture_fill.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/shader_environment.h"
 #include "video_core/surface.h"
@@ -493,6 +494,14 @@ private:
     VkImage PrepareDepthComparisonImage(const Image& source, VkFormat depth_format);
     VkDescriptorImageInfo BindUnboundTexture(VkImageViewType type);
     bool UploadTexture(Image& image, const Texture& texture, std::span<const u8> data);
+    /// Copies a filled buffer into the image.
+    void FillImage(Image& image, vk::Buffer upload, std::vector<VkBufferImageCopy> copies);
+    /// Gives the submission's new texture bytes to the workers.
+    void StartTextureFills(const Submission& submission);
+    /// Applies the workers' fill of the texture, waiting for it; false when there is none.
+    bool TakeTextureFill(Image& image, u64 serial);
+    /// Applies the fills no draw took.
+    void FinishTextureFills(const Submission& submission);
     void NoteSkip(std::string_view reason);
     void TraceImage(std::string_view operation, const Texture& texture, u64 detail = 0);
     VkRect2D ScissorFor(VkExtent2D extent) const;
@@ -692,6 +701,16 @@ private:
     // Totals for the slow-replay line.
     u64 pipeline_creates{};
     // Pipelines a worker is building, and the draws left out meanwhile.
+    // The textures whose bytes workers are turning into their image's contents, by serial,
+    // from the start of a replay to its end.
+    struct PendingFill {
+        BananzaNvn2TextureFill fill;
+        vk::Buffer buffer;
+        std::atomic<bool> done{};
+    };
+    std::unordered_map<u64, std::unique_ptr<PendingFill>> texture_fills;
+    u64 worker_fills{};
+    u64 reported_worker_fills{};
     std::set<const std::optional<Pipeline>*> building_pipelines;
     // The pipelines of earlier runs, and those of them the workers are building now. A draw
     // that needs one of these builds it itself and the worker's is dropped.
@@ -835,6 +854,7 @@ private:
     std::unordered_map<u64, u32> pending_reports;
     std::atomic<u32> pending_counter_jobs{};
     Common::ThreadWorker copy_workers{3, "NvnFill"};
+    Common::ThreadWorker texture_workers{3, "NvnTexture"};
     Common::ThreadWorker retire_workers{3, "NvnWriteBack"};
     std::jthread retire_thread;
     // Declared last: its threads read this object and stop before anything else goes.

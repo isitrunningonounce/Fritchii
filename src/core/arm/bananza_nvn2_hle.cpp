@@ -2270,6 +2270,7 @@ void Session::SnapshotResources(Memory::Memory& memory, BananzaNvn2Commands::Sub
                 hash = TextureHash(snapshot.data(), size, nullptr);
             }
             batch.texture_snapshots.emplace(texture->serial, std::move(snapshot));
+            batch.texture_infos.insert_or_assign(texture->serial, *texture);
         }
         texture_checks.insert_or_assign(
             texture->serial,

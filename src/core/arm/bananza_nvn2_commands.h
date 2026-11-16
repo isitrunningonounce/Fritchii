@@ -564,6 +564,8 @@ struct Submission : std::enable_shared_from_this<Submission> {
         sampler_descriptors;
     // Bytes of the textures that are new or changed since they were last sent.
     std::map<u64, std::vector<u8>> texture_snapshots;
+    // The texture of each snapshot.
+    std::map<u64, BananzaNvn2Hle::ResourceTextureInfo> texture_infos;
     std::map<u64, TextureSource> texture_sources;
     std::unordered_map<u64, std::shared_ptr<TextureReplayState>> texture_replay_states;
     Memory::Memory* guest_memory{};

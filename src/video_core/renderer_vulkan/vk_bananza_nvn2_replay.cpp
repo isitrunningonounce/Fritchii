@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "common/cityhash.h"
 #include "common/fs/path_util.h"
+#include "common/scope_exit.h"
 #include "common/swap.h"
 #include "core/arm/bananza_nvn2_commands.h"
 #include "core/memory.h"
@@ -2748,89 +2749,19 @@ void BananzaNvn2Replay::WriteBackStorage(const Submission& submission) {
 
 bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
                                      std::span<const u8> data) {
-    const auto& d = texture.description;
-    const auto block = Core::BananzaNvn2Hle::GetTextureFormatBlock(d.format);
-    if (!block || (texture.layout.stride && d.levels != 1)) {
+    const auto fill = BananzaNvn2TextureFill::Plan(texture, image.layers, image.depth,
+                                                   image.aspects, data.size());
+    if (!fill) {
         return false;
     }
-    struct Level {
-        size_t guest_offset;
-        size_t bytes_per_layer;
-        size_t upload_stride;
-        u32 width;
-        u32 height;
-        u32 tile_height;
-        u32 tile_depth;
-    };
-    std::vector<Level> levels;
-    std::vector<VkBufferImageCopy> copies;
-    const bool decode_astc = d.format >= 0x79 && d.format <= 0x94;
-    size_t upload_size{};
-    for (u32 level = 0; level < d.levels; ++level) {
-        const auto offset = Core::BananzaNvn2Hle::TextureLevelOffset(d, level);
-        const u32 width = std::max(d.width >> level, 1U);
-        const u32 height = std::max(d.height >> level, 1U);
-        const u32 depth = std::max(image.depth >> level, 1U);
-        const u32 columns = (width + block->width - 1) / block->width;
-        const u32 rows = (height + block->height - 1) / block->height;
-        u32 tile = texture.layout.tile_height;
-        while (tile && (8U << (tile - 1)) >= rows) {
-            --tile;
-        }
-        u32 tile_depth = texture.layout.tile_depth;
-        while (tile_depth && (1U << (tile_depth - 1)) >= depth) {
-            --tile_depth;
-        }
-        const size_t bytes = texture.layout.stride
-                                 ? texture.layout.stride * (rows - 1) + columns * block->bytes
-                                 : Tegra::Texture::CalculateSize(true, block->bytes, columns,
-                                                                  rows, depth, tile, tile_depth);
-        const auto last_layer = (image.layers - 1) * texture.layout.layer_size;
-        if (!offset || last_layer > data.size() || *offset > data.size() - last_layer ||
-            bytes > data.size() - last_layer - *offset) {
-            return false;
-        }
-        const size_t alignment = decode_astc ? 4 : std::lcm(size_t{4}, size_t{block->bytes});
-        upload_size = (upload_size + alignment - 1) / alignment * alignment;
-        copies.push_back({
-            .bufferOffset = upload_size,
-            .imageSubresource = {image.aspects, level, 0, image.layers},
-            .imageExtent = {width, height, depth},
-        });
-        const auto upload_stride = decode_astc ? size_t{width} * height * depth * 4
-                                               : size_t{columns} * rows * depth * block->bytes;
-        levels.push_back({*offset, texture.layout.layer_size, upload_stride, columns, rows, tile,
-                          tile_depth});
-        upload_size += upload_stride * image.layers;
-    }
-    auto upload = CreateWrappedBuffer(allocator, upload_size, MemoryUsage::Upload);
-    for (u32 level = 0; level < levels.size(); ++level) {
-        const auto& src = levels[level];
-        const size_t row = size_t{src.width} * block->bytes;
-        const auto extent = copies[level].imageExtent;
-        std::vector<u8> astc(decode_astc ? row * src.height * extent.depth : 0);
-        for (u32 layer = 0; layer < image.layers; ++layer) {
-            const size_t offset = src.guest_offset + layer * src.bytes_per_layer;
-            auto linear = upload.Mapped().subspan(copies[level].bufferOffset +
-                                                      layer * src.upload_stride,
-                                                  src.upload_stride);
-            auto dest = decode_astc ? std::span{astc} : linear;
-            if (texture.layout.stride) {
-                for (u32 y = 0; y < src.height; ++y) {
-                    std::memcpy(dest.data() + row * y,
-                                data.data() + offset + texture.layout.stride * y, row);
-                }
-            } else {
-                Tegra::Texture::UnswizzleTexture(dest, data.subspan(offset), block->bytes,
-                                                src.width, src.height, extent.depth,
-                                                src.tile_height, src.tile_depth, 0, true);
-            }
-            if (decode_astc) {
-                Tegra::Texture::ASTC::Decompress(astc, extent.width, extent.height, extent.depth, block->width,
-                                                block->height, linear);
-            }
-        }
-    }
+    auto upload = CreateWrappedBuffer(allocator, fill->Size(), MemoryUsage::Upload);
+    fill->Run(data, upload.Mapped());
+    FillImage(image, std::move(upload), fill->Copies());
+    return true;
+}
+
+void BananzaNvn2Replay::FillImage(Image& image, vk::Buffer upload,
+                                  std::vector<VkBufferImageCopy> copies) {
     upload.Flush();
     Initialize(image);
     Barrier();
@@ -2840,7 +2771,76 @@ bool BananzaNvn2Replay::UploadTexture(Image& image, const Texture& texture,
     });
     uploads.push_back(std::move(upload));
     ++image.write_version;
+}
+
+void BananzaNvn2Replay::StartTextureFills(const Submission& submission) {
+    static const bool off = std::getenv("EDEN_NX2_NVN_NO_TEXTURE_WORKERS") != nullptr;
+    if (off) {
+        return;
+    }
+    for (const auto& [serial, bytes] : submission.texture_snapshots) {
+        const auto info = submission.texture_infos.find(serial);
+        const auto source = submission.texture_sources.find(serial);
+        if (info == submission.texture_infos.end() ||
+            source == submission.texture_sources.end()) {
+            continue;
+        }
+        // The same tests as where a draw samples the texture.
+        Image* const image = FindImage(info->second, true);
+        if (!image || image->gpu_written ||
+            (image->aspects != VK_IMAGE_ASPECT_COLOR_BIT && image->format != VK_FORMAT_D16_UNORM &&
+             image->format != VK_FORMAT_D32_SFLOAT) ||
+            (image->initialized && image->cpu_serial == serial &&
+             image->cpu_hash == source->second.hash)) {
+            continue;
+        }
+        auto fill = BananzaNvn2TextureFill::Plan(info->second, image->layers, image->depth,
+                                                 image->aspects, bytes.size());
+        if (!fill) {
+            continue;
+        }
+        auto pending = std::make_unique<PendingFill>();
+        pending->fill = std::move(*fill);
+        pending->buffer = CreateWrappedBuffer(allocator, pending->fill.Size(), MemoryUsage::Upload);
+        texture_workers.QueueWork([entry = pending.get(), data = std::span<const u8>{bytes}] {
+            entry->fill.Run(data, entry->buffer.Mapped());
+            entry->done.store(true, std::memory_order_release);
+            entry->done.notify_all();
+        });
+        texture_fills.emplace(serial, std::move(pending));
+        ++worker_fills;
+    }
+}
+
+bool BananzaNvn2Replay::TakeTextureFill(Image& image, u64 serial) {
+    const auto found = texture_fills.find(serial);
+    if (found == texture_fills.end()) {
+        return false;
+    }
+    const auto pending = std::move(found->second);
+    texture_fills.erase(found);
+    pending->done.wait(false, std::memory_order_acquire);
+    FillImage(image, std::move(pending->buffer), pending->fill.Copies());
     return true;
+}
+
+void BananzaNvn2Replay::FinishTextureFills(const Submission& submission) {
+    // The bytes are not sent again, so a texture no draw of this replay sampled is filled
+    // all the same.
+    for (auto& [serial, pending] : texture_fills) {
+        pending->done.wait(false, std::memory_order_acquire);
+        const auto info = submission.texture_infos.find(serial);
+        const auto source = submission.texture_sources.find(serial);
+        Image* const image =
+            info != submission.texture_infos.end() ? FindImage(info->second, false) : nullptr;
+        if (image && !image->gpu_written && source != submission.texture_sources.end()) {
+            FillImage(*image, std::move(pending->buffer), pending->fill.Copies());
+            image->cpu_hash = source->second.hash;
+            image->cpu_serial = serial;
+            ++texture_uploads;
+        }
+    }
+    texture_fills.clear();
 }
 
 VkImage BananzaNvn2Replay::PrepareDepthComparisonImage(const Image& source, VkFormat depth_format) {
@@ -3488,7 +3488,8 @@ bool BananzaNvn2Replay::PrepareSampledImage(Image& image, const Texture& texture
             }
             if (!bytes.empty()) {
                 run_stats.DrawCut(BananzaNvn2RunStats::Cut::TextureUpload);
-                const bool uploaded = UploadTexture(image, texture, bytes);
+                const bool uploaded = TakeTextureFill(image, texture.serial) ||
+                                      UploadTexture(image, texture, bytes);
                 upload_ns += static_cast<u64>(
                     (std::chrono::steady_clock::now() - upload_start).count());
                 if (!uploaded) {
@@ -5833,9 +5834,18 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
     const u64 first_record = scheduler.RecordingSerial();
     CollectStorageSpans(submission);
     staged_ranges_ready = SyncMirrorPages(submission);
+    StartTextureFills(submission);
+    // The workers read the submission's bytes: none of them outlives this replay.
+    SCOPE_EXIT {
+        for (auto& [serial, pending] : texture_fills) {
+            pending->done.wait(false, std::memory_order_acquire);
+        }
+        texture_fills.clear();
+    };
     for (const auto& flat : submission.flats) {
         ReplayRecording(flat, submission);
     }
+    FinishTextureFills(submission);
     run_stats.EndSubmission();
     if (last_event_signal) {
         event_tail_draws += draws - last_event_signal->first;
@@ -6085,6 +6095,10 @@ std::optional<BananzaNvn2Replay::Source> BananzaNvn2Replay::PresentSource(const 
                      pipeline_list->Size(), ahead_queued, ahead_built, ahead_pipelines.size(),
                      ahead_dropped, draw_built);
             reported_ahead = ahead_queued + draw_built;
+        }
+        if (worker_fills != reported_worker_fills) {
+            LOG_INFO(Render_Vulkan, "NVN 2 texture fills: {} made by workers so far", worker_fills);
+            reported_worker_fills = worker_fills;
         }
         if (pipeline_wait_draws != reported_pipeline_wait_draws) {
             LOG_INFO(Render_Vulkan,
