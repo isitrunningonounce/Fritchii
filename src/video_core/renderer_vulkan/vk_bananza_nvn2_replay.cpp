@@ -4622,7 +4622,9 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     };
     const auto topology = Topology(op.args[0]);
     std::optional<DrawState> draw;
+    using ReplayDependency = BananzaNvn2RunStats::ReplayDependency;
     if (op.replay == ReplayOp::DrawIndirect && op.args.size() == 2) {
+        run_stats.Count(ReplayDependency::NonIndexedIndirect);
         draw = DrawState{.indirect_range = {op.args[1], sizeof(VkDrawIndirectCommand)}};
     } else if (op.replay == ReplayOp::DrawIndexedIndirect && op.args.size() == 4 &&
                op.args[1] <= 2) {
@@ -4637,7 +4639,10 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
         const bool gpu_written = argument_storage != storage_uploads.end() &&
                                  arguments.first - argument_storage->first.first <
                                      argument_storage->second.written_bytes;
-        if (!gpu_written && reset_indirect_draws.contains(arguments.first)) {
+        if (gpu_written) {
+            run_stats.Count(ReplayDependency::GpuIndexedIndirect);
+        } else if (reset_indirect_draws.contains(arguments.first)) {
+            run_stats.Count(ReplayDependency::ResetIndexedIndirect);
             return;
         }
         // Only a draw from arguments the CPU provided reads them and needs the slice.
@@ -4701,6 +4706,7 @@ void BananzaNvn2Replay::Draw(const Operation& op, const Submission& submission) 
     }
     if (graphics_program->resets_indirect_draws && op.replay == ReplayOp::Draw && op.args[0] == 0 &&
         ResetIndirectDraws(*draw, submission)) {
+        run_stats.Count(ReplayDependency::IndirectResetList);
         return;
     }
     VkBuffer indirect_buffer{};
@@ -5916,6 +5922,7 @@ void BananzaNvn2Replay::ReplayCounter(const Operation& op, const Submission& sub
     }
     auto& memory = *submission.guest_memory;
     if (op.replay == ReplayOp::SetRenderEnableConditional && type <= 1) {
+        run_stats.Count(BananzaNvn2RunStats::ReplayDependency::ConditionalRender);
         if (std::ranges::any_of(counter_events, [&](const CounterEvent& event) {
                 return event.kind == CounterEvent::Kind::Report && event.gpu_address == op.args[1];
             })) {
@@ -6171,7 +6178,7 @@ void BananzaNvn2Replay::Replay(const Core::BananzaNvn2Commands::Submission& subm
         ReplayRecording(flat, submission);
     }
     FinishTextureFills(submission);
-    run_stats.EndSubmission();
+    run_stats.EndSubmission(present_count);
     if (last_event_signal) {
         event_tail_draws += draws - last_event_signal->first;
         event_tail_dispatches += dispatches - last_event_signal->second;

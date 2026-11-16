@@ -57,6 +57,15 @@ public:
         Count,
     };
 
+    enum class ReplayDependency : u32 {
+        ConditionalRender,
+        NonIndexedIndirect,
+        GpuIndexedIndirect,
+        ResetIndexedIndirect,
+        IndirectResetList,
+        Count,
+    };
+
     [[nodiscard]] bool Enabled() const {
         return enabled;
     }
@@ -83,6 +92,12 @@ public:
         }
     }
 
+    void Count(ReplayDependency dependency) {
+        if (enabled) {
+            ++dependencies[static_cast<size_t>(dependency)];
+        }
+    }
+
     void BeginDraw() {
         draw_cut = false;
     }
@@ -100,7 +115,7 @@ public:
         }
     }
 
-    void EndSubmission() {
+    void EndSubmission(u64 present_count) {
         if (!enabled) {
             return;
         }
@@ -110,9 +125,10 @@ public:
         if (now < next_report) {
             return;
         }
-        next_report = now + std::chrono::seconds{5};
         Report();
+        ReportReplayDependencies(present_count - last_present);
         *this = BananzaNvn2RunStats{};
+        last_present = present_count;
         next_report = now + std::chrono::seconds{5};
     }
 
@@ -165,16 +181,33 @@ private:
                  submissions, draws, serial_draws, lengths, reasons, volumes);
     }
 
+    void ReportReplayDependencies(u64 presents) const {
+        const auto count = [this](ReplayDependency dependency) {
+            return dependencies[static_cast<size_t>(dependency)];
+        };
+        LOG_INFO(Render_Vulkan,
+                 "NVN 2 replay dependencies in {} presents: {} conditional renders, "
+                 "{} non-indexed indirect draws, {} GPU-written indexed indirect draws, "
+                 "{} reset indexed indirect draws, {} indirect reset lists",
+                 presents, count(ReplayDependency::ConditionalRender),
+                 count(ReplayDependency::NonIndexedIndirect),
+                 count(ReplayDependency::GpuIndexedIndirect),
+                 count(ReplayDependency::ResetIndexedIndirect),
+                 count(ReplayDependency::IndirectResetList));
+    }
+
     bool enabled{std::getenv("EDEN_NX2_NVN_RUN_STATS") != nullptr};
     bool draw_cut{};
     u64 run{};
     u64 draws{};
     u64 serial_draws{};
     u64 submissions{};
+    u64 last_present{};
     std::array<u64, Buckets> runs{};
     std::array<u64, Buckets> run_draws{};
     std::array<u64, static_cast<size_t>(Cut::Count)> cuts{};
     std::array<u64, static_cast<size_t>(Note::Count)> notes{};
+    std::array<u64, static_cast<size_t>(ReplayDependency::Count)> dependencies{};
     std::chrono::steady_clock::time_point next_report{};
 };
 
