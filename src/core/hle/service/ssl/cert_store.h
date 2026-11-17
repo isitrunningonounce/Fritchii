@@ -6,9 +6,7 @@
 
 #pragma once
 
-#include <map>
 #include <span>
-#include <vector>
 
 #include "core/hle/result.h"
 #include "core/hle/service/ssl/ssl_types.h"
@@ -29,17 +27,6 @@ public:
     Result GetCertificateBufSize(u32* out_size, u32* out_num_entries,
                                  std::span<const CaCertificateId> certificate_ids);
 
-private:
-    template <typename F>
-    void ForEachCertificate(std::span<const CaCertificateId> certs, F&& f);
-
-private:
-    struct Certificate {
-        TrustedCertStatus status;
-        std::vector<u8> der_data;
-    };
-
-    std::map<CaCertificateId, Certificate> m_certs;
 };
 
 } // namespace Service::SSL

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -15,7 +16,6 @@
 #include "common/container/unordered_map.h"
 #include <boost/container/flat_map.hpp>
 #include "common/common_types.h"
-#include "core/crypto/key_manager.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/nca_metadata.h"
 
@@ -23,8 +23,6 @@ namespace FileSys {
 class ExternalContentProvider;
 class CNMT;
 class NCA;
-class NSP;
-class XCI;
 enum class NCAContentType : u8;
 enum class TitleType : u8;
 
@@ -34,17 +32,7 @@ struct MetaRecord;
 class RegisteredCache;
 
 using NcaID = std::array<u8, 0x10>;
-using ContentProviderParsingFunction = std::function<VirtualFile(const VirtualFile&, const NcaID&)>;
 using VfsCopyFunction = std::function<bool(const VirtualFile&, const VirtualFile&, size_t)>;
-
-enum class InstallResult {
-    Success,
-    OverwriteExisting,
-    ErrorAlreadyExists,
-    ErrorCopyFailed,
-    ErrorMetaFailed,
-    ErrorBaseInstall,
-};
 
 struct ContentProviderEntry {
     u64 title_id;
@@ -101,10 +89,6 @@ public:
         std::optional<u64> title_id = {}) const = 0;
 
     [[nodiscard]] std::optional<u64> GetParentApplicationId(u64 program_id) const;
-
-protected:
-    // A single instance of KeyManager to be used by GetEntry()
-    Core::Crypto::KeyManager& keys = Core::Crypto::KeyManager::Instance();
 };
 
 class PlaceholderCache {
@@ -145,12 +129,7 @@ class RegisteredCache : public ContentProvider {
     friend class PlaceholderCache;
 
 public:
-    // Parsing function defines the conversion from raw file to NCA. If there are other steps
-    // besides creating the NCA from the file (e.g. NAX0 on SD Card), that should go in a custom
-    // parsing function.
-    explicit RegisteredCache(
-        VirtualDir dir, ContentProviderParsingFunction parsing_function =
-                            [](const VirtualFile& file, const NcaID& id) { return file; });
+    explicit RegisteredCache(VirtualDir dir);
     ~RegisteredCache() override;
 
     void Refresh() override;
@@ -170,24 +149,6 @@ public:
         std::optional<TitleType> title_type = {}, std::optional<ContentRecordType> record_type = {},
         std::optional<u64> title_id = {}) const override;
 
-    // Raw copies all the ncas from the xci/nsp to the csache. Does some quick checks to make sure
-    // there is a meta NCA and all of them are accessible.
-    InstallResult InstallEntry(const XCI& xci, bool overwrite_if_exists = false,
-                               const VfsCopyFunction& copy = &VfsRawCopy);
-    InstallResult InstallEntry(const NSP& nsp, bool overwrite_if_exists = false,
-                               const VfsCopyFunction& copy = &VfsRawCopy);
-
-    // Due to the fact that we must use Meta-type NCAs to determine the existence of files, this
-    // poses quite a challenge. Instead of creating a new meta NCA for this file, yuzu will create a
-    // dir inside the NAND called 'yuzu_meta' and store the raw CNMT there.
-    // TODO(DarkLordZach): Author real meta-type NCAs and install those.
-    InstallResult InstallEntry(const NCA& nca, TitleType type, bool overwrite_if_exists = false,
-                               const VfsCopyFunction& copy = &VfsRawCopy);
-
-    InstallResult InstallEntry(const NCA& nca, const CNMTHeader& base_header,
-                               const ContentRecord& base_record, bool overwrite_if_exists = false,
-                               const VfsCopyFunction& copy = &VfsRawCopy);
-
     // Removes an existing entry based on title id
     bool RemoveExistingEntry(u64 title_id) const;
     bool Delete(const NcaID& id) const;
@@ -197,18 +158,10 @@ private:
     void IterateAllMetadata(std::vector<T>& out,
                             std::function<T(const CNMT&, const ContentRecord&)> proc,
                             std::function<bool(const CNMT&, const ContentRecord&)> filter) const;
-    std::vector<NcaID> AccumulateFiles() const;
-    void ProcessFiles(const std::vector<NcaID>& ids);
-    void AccumulateYuzuMeta();
     std::optional<NcaID> GetNcaIDFromMetadata(u64 title_id, ContentRecordType type) const;
     VirtualFile GetFileAtID(NcaID id) const;
     VirtualFile OpenFileOrDirectoryConcat(const VirtualDir& open_dir, std::string_view path) const;
-    InstallResult RawInstallNCA(const NCA& nca, const VfsCopyFunction& copy,
-                                bool overwrite_if_exists, std::optional<NcaID> override_id = {});
-    bool RawInstallYuzuMeta(const CNMT& cnmt);
-
     VirtualDir dir;
-    ContentProviderParsingFunction parser;
 
     // maps tid -> NcaID of meta
     ::Common::unordered_map<u64, NcaID> meta_id;
@@ -223,7 +176,7 @@ enum class ContentProviderUnionSlot {
     UserNAND,       ///< User NAND
     SDMC,           ///< SD Card
     FrontendManual, ///< Frontend-defined game list or similar
-    External,       ///< External content from NSP/XCI files in configured directories
+    External,
     Count,
 };
 
@@ -266,8 +219,6 @@ public:
                   VirtualFile file);
     void AddEntryWithVersion(TitleType title_type, ContentRecordType content_type, u64 title_id,
                              u32 version, const std::string& version_string, VirtualFile file);
-    bool AddEntriesFromContainer(VirtualFile file, bool only_content = false,
-                                 std::optional<u64> base_program_id = std::nullopt);
     void ClearAllEntries();
 
     void Refresh() override;
@@ -310,10 +261,6 @@ public:
     VirtualFile GetEntryForVersion(u64 title_id, ContentRecordType type, u32 version) const;
 
 private:
-    void ScanDirectory(const VirtualDir& dir);
-    void ProcessNSP(const VirtualFile& file);
-    void ProcessXCI(const VirtualFile& file);
-
     std::vector<VirtualDir> load_dirs;
     ::Common::unordered_map<std::tuple<u64, ContentRecordType, TitleType>, VirtualFile> entries;
     ::Common::unordered_map<u64, u32> versions;

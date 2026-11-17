@@ -168,8 +168,6 @@ add_executable(yuzu
 
     hotkeys.cpp
     hotkeys.h
-    install_dialog.cpp
-    install_dialog.h
     loading_screen.cpp
     loading_screen.h
     loading_screen.ui

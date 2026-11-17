@@ -54,11 +54,6 @@ enum class GameListOpenTarget {
     ModData,
 };
 
-enum class DumpRomFSTarget {
-    Normal,
-    SDMC,
-};
-
 class GameList : public QWidget {
     Q_OBJECT
 
@@ -113,7 +108,6 @@ signals:
                              const std::string& game_path);
     void RemovePlayTimeRequested(u64 program_id);
     void SetPlayTimeRequested(u64 program_id);
-    void DumpRomFSRequested(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void VerifyIntegrityRequested(const std::string& game_path);
     void ConvertToNupRequested(const std::string& game_path);
     void ExtractNupRequested(const std::string& game_path);

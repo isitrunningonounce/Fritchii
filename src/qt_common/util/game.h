@@ -66,7 +66,6 @@ void CreateShortcut(const std::string& game_path, const u64 program_id,
                     std::string arguments_, const bool needs_title);
 
 std::string GetShortcutPath(ShortcutTarget target);
-void CreateHomeMenuShortcut(ShortcutTarget target);
 
 /**
  * Saves a windows icon to a file

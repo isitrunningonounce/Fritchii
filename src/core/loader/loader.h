@@ -58,22 +58,8 @@ enum class FileType {
  */
 FileType IdentifyFile(FileSys::VirtualFile file);
 
-/**
- * Returns whether the file type represents a container format that can bundle multiple titles
- * (currently NSP/XCI).
- */
-bool IsContainerType(FileType type);
-
-/**
- * Returns whether a container file is bootable as a game (has Application/Program content).
- *
- * @param file open file
- * @param type optional file type; if Unknown it is auto-detected.
- * @param program_id optional program id hint for multi-program containers.
- * @param program_index optional program index hint for multi-program containers.
- */
-bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type = FileType::Unknown,
-                             u64 program_id = 0, std::size_t program_index = 0);
+/// Returns whether a NUP contains a base game or standalone update with an ExeFS.
+bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type = FileType::Unknown);
 
 /**
  * Guess the type of a bootable file from its name
@@ -160,6 +146,7 @@ enum class ResultStatus : u16 {
     ErrorIntegrityVerificationFailed,
     ErrorNUPBadFormat,
     ErrorNUPNoBasePackage,
+    ErrorEncryptedContentUnsupported,
 };
 
 std::string GetResultStatusString(ResultStatus status);

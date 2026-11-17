@@ -29,6 +29,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check for game decryption code
+        run: python3 -I tools/check_no_decryption.py
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update

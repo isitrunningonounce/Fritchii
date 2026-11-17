@@ -28,7 +28,6 @@ class PlaceholderCache;
 class RomFSFactory;
 class SaveDataFactory;
 class SDMCFactory;
-class XCI;
 
 enum class BisPartitionId : u32;
 enum class ContentRecordType : u8;
@@ -89,9 +88,6 @@ public:
     u64 GetFreeSpaceSize(FileSys::StorageId id) const;
     u64 GetTotalSpaceSize(FileSys::StorageId id) const;
 
-    void SetGameCard(FileSys::VirtualFile file);
-    FileSys::XCI* GetGameCard() const;
-
     FileSys::RegisteredCache* GetSystemNANDContents() const;
     FileSys::RegisteredCache* GetUserNANDContents() const;
     FileSys::RegisteredCache* GetSDMCContents() const;
@@ -148,9 +144,6 @@ private:
 
     std::unique_ptr<FileSys::ExternalContentProvider> external_provider;
 
-    std::unique_ptr<FileSys::XCI> gamecard;
-    std::unique_ptr<FileSys::RegisteredCache> gamecard_registered;
-    std::unique_ptr<FileSys::PlaceholderCache> gamecard_placeholder;
 
     Core::System& system;
 };

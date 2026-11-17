@@ -90,7 +90,7 @@ def inventory(root):
             shader_directory = "shader" in os.path.relpath(parent, directory).lower()
             for filename in sorted(files):
                 name = filename.lower()
-                if name.startswith(".") or name in ("prod.keys", "title.keys", "dev.keys", "keys.rar"):
+                if name.startswith(".") or name.endswith(".keys") or name == "keys.rar":
                     continue
                 path = Path(parent, filename)
                 try:

@@ -29,7 +29,6 @@
 #include "core/debugger/debugger.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/device_memory.h"
-#include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/nup_container.h"
@@ -39,7 +38,6 @@
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
-#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -203,7 +201,7 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 namespace {
 
 // Detect the platform before initializing the kernel memory layout and guest clock.
-bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
+bool IsSwitch2Program(const FileSys::VirtualFile& file) {
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
@@ -223,38 +221,10 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
         return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
                metadata.IsSwitch2();
     }
-    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
-    if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
-        const FileSys::XCI xci{file, program_id, program_index};
-        if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto partition = xci.GetSecurePartitionNSP();
-        const auto program = partition != nullptr
-                                 ? partition->GetNCA(xci.GetProgramTitleID(),
-                                                     FileSys::ContentRecordType::Program)
-                                 : nullptr;
-        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+    if (!file || file->GetName() != "main") {
+        return false;
     }
-    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
-        const FileSys::NSP nsp{file, program_id, program_index};
-        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        auto exefs = nsp.GetExeFS();
-        if (!nsp.IsExtractedType()) {
-            const auto program =
-                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
-            exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        }
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
+    const auto dir = file->GetContainingDirectory();
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
            metadata.IsSwitch2();
@@ -452,8 +422,7 @@ struct System::Impl {
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
-                             params.program_index);
+            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
@@ -563,15 +532,6 @@ struct System::Impl {
         // Register with applet manager
         // All threads are started, begin main process execution, now that we're in the clear
         applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
-
-        if (Settings::values.gamecard_inserted) {
-            if (Settings::values.gamecard_current_game) {
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
-            } else if (!Settings::values.gamecard_path.GetValue().empty()) {
-                const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
-            }
-        }
 
         perf_stats.emplace(params.program_id);
         // Reset counters and set time origin to current frame
