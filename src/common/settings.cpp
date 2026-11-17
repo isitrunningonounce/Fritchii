@@ -420,7 +420,15 @@ bool EnvIsOne(const char* name) {
 // LICHII_DLSS, read again at every game start (UpdateRescalingInfo): the Graphics menu changes it
 // for the next start.
 std::atomic<bool> g_dlss_forced{EnvIsOne("LICHII_DLSS")};
+// LICHII_DLSS_FG, read again at every game start like LICHII_DLSS.
+std::atomic<bool> g_dlss_fg_forced{EnvIsOne("LICHII_DLSS_FG")};
 } // Anonymous namespace
+
+bool NvidiaFrameGenChosen() {
+    return g_dlss_fg_forced.load(std::memory_order_relaxed) ||
+           (values.frame_gen.GetValue() &&
+            values.frame_gen_type.GetValue() == FrameGenType::Nvidia);
+}
 
 bool NvidiaDlssEnabled() {
     return g_dlss_forced.load(std::memory_order_relaxed) || values.nvidia_dlss.GetValue();
@@ -445,6 +453,7 @@ bool OotNoSharpening() {
 
 void UpdateRescalingInfo() {
     g_dlss_forced.store(EnvIsOne("LICHII_DLSS"), std::memory_order_relaxed);
+    g_dlss_fg_forced.store(EnvIsOne("LICHII_DLSS_FG"), std::memory_order_relaxed);
     // LICHII_RESOLUTION=<ResolutionSetup index> (3 = 1x, 5 = 1.5x): this session only, the config
     // keeps its value (DLSS needs 1x; the other launchers use 1.5x). Read at every game start.
     const std::optional<ResolutionSetup> forced = []() -> std::optional<ResolutionSetup> {
@@ -469,7 +478,7 @@ u32 FrameGenMultiplier() {
 }
 
 bool FrameGenActive() {
-    return values.frame_gen.GetValue();
+    return values.frame_gen.GetValue() && !NvidiaFrameGenChosen();
 }
 
 namespace {

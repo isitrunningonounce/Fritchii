@@ -49,8 +49,9 @@ bool Start();
 [[nodiscard]] std::vector<std::string> InstanceExtensions();
 [[nodiscard]] std::vector<std::string> DeviceExtensions();
 
-/// LICHII_DLSS_FG=1: DLSS Frame Generation is wanted (with Reflex and PCL, which it needs).
-/// LICHII_DLSS_FG_MULTIPLIER=2..6 picks its multiplier, within what the GPU allows.
+/// DLSS Frame Generation is wanted (with Reflex and PCL, which it needs): frame_gen_type Nvidia,
+/// or LICHII_DLSS_FG=1. Its multiplier is dlss_fg_multiplier, or LICHII_DLSS_FG_MULTIPLIER=2..6,
+/// within what the GPU allows.
 [[nodiscard]] bool FrameGenRequested();
 
 /// The queues DLSS Frame Generation asks the device for, beyond the renderer's own: compute and

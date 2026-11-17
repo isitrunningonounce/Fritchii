@@ -39,6 +39,7 @@
 #include "yuzu/configuration/amd_fsr4_panel.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 #ifdef HAS_RESHADE
 #include "yuzu/configuration/configure_post_processing.h"
@@ -223,6 +224,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    QComboBox* frame_gen_type_combobox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -366,6 +368,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
             hold_graphics.emplace(setting->Id(), widget);
+        } else if (setting->Id() == Settings::values.frame_gen_type.Id()) {
+            frame_gen_type_combobox = widget->combobox;
+            hold_graphics.emplace(setting->Id(), widget);
         } else {
             hold_graphics.emplace(setting->Id(), widget);
         }
@@ -375,18 +380,63 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         graphics_layout.addWidget(widget);
     }
 
-    // Hide rather than disable, a disabled widget would read as using the global value
+    constexpr auto nvidia_frame_gen = static_cast<u32>(Settings::FrameGenType::Nvidia);
+    if (frame_gen_type_combobox != nullptr) {
+        const int nvidia = frame_gen_type_combobox->findData(nvidia_frame_gen);
+#ifdef EGLANTINE_STREAMLINE
+        // Named for what DLSS Frame Generation reported on this PC: 2x, or multi frame generation.
+        if (nvidia >= 0) {
+            frame_gen_type_combobox->setItemText(nvidia, FritchiiUi::DlssFrameGenName());
+            frame_gen_type_combobox->setItemData(
+                nvidia,
+                tr("Needs NVIDIA DLSS on and an RTX 40 or newer GPU; the game must use DLSS. "
+                   "Multi frame generation (3x to 6x) needs an RTX 50. The FRAME GEN button on "
+                   "the status bar picks the multiplier."),
+                Qt::ToolTipRole);
+        }
+#else
+        // Only builds with NVIDIA Streamline (Windows) can use it.
+        if (nvidia >= 0 && frame_gen_type_combobox->currentIndex() != nvidia) {
+            frame_gen_type_combobox->removeItem(nvidia);
+        }
+#endif
+    }
+
+    // Hide rather than disable, a disabled widget would read as using the global value. NVIDIA's
+    // frame generation has none of the emulator's own options.
     if (frame_gen_checkbox != nullptr) {
-        for (const u32 id : {Settings::values.frame_gen_type.Id(),
-                             Settings::values.frame_gen_multiplier.Id(),
+        QWidget* type_row = nullptr;
+        if (const auto it = hold_graphics.find(Settings::values.frame_gen_type.Id());
+            it != hold_graphics.end()) {
+            type_row = it->second;
+        }
+        std::vector<QWidget*> own_rows;
+        for (const u32 id : {Settings::values.frame_gen_multiplier.Id(),
                              Settings::values.frame_gen_target_rate.Id(),
                              Settings::values.frame_gen_flow_scale_auto.Id(),
                              Settings::values.frame_gen_flow_scale.Id(),
                              Settings::values.frame_gen_queue_target.Id()}) {
             if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
-                it->second->setVisible(frame_gen_checkbox->isChecked());
-                connect(frame_gen_checkbox, &QCheckBox::toggled, it->second, &QWidget::setVisible);
+                own_rows.push_back(it->second);
             }
+        }
+        const auto update_rows = [frame_gen_checkbox, frame_gen_type_combobox, type_row,
+                                  own_rows] {
+            const bool on = frame_gen_checkbox->isChecked();
+            const bool nvidia = frame_gen_type_combobox != nullptr &&
+                                frame_gen_type_combobox->currentData().toUInt() == nvidia_frame_gen;
+            if (type_row != nullptr) {
+                type_row->setVisible(on);
+            }
+            for (QWidget* row : own_rows) {
+                row->setVisible(on && !nvidia);
+            }
+        };
+        update_rows();
+        connect(frame_gen_checkbox, &QCheckBox::toggled, this, update_rows);
+        if (frame_gen_type_combobox != nullptr) {
+            connect(frame_gen_type_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, update_rows);
         }
     }
 
