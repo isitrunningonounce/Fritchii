@@ -537,6 +537,14 @@ struct Values {
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
                                                 Category::Renderer};
 
+    // NVIDIA DLSS Frame Generation (frame_gen_type Nvidia), set on the status bar: its multiplier,
+    // and the highest one Streamline reported at the last game start with it (0 before any; 2 is
+    // frame generation, 3 to 6 multi frame generation).
+    Setting<u32, true> dlss_fg_multiplier{linkage, 2, 2, 6, "dlss_fg_multiplier",
+                                          Category::Renderer};
+    Setting<u32, true> dlss_fg_max_multiplier{linkage, 0, 0, 6, "dlss_fg_max_multiplier",
+                                              Category::Renderer};
+
     SwitchableSetting<bool> use_asynchronous_gpu_emulation{linkage, true, "use_asynchronous_gpu_emulation",
                                                            Category::Renderer};
     // *nix platforms may have issues with the borderless windowed fullscreen mode.
@@ -1074,8 +1082,12 @@ extern Values values;
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
 
-/// Whether frame generation runs (an experimental opt-in; the host frame pacer is off meanwhile).
+/// Whether the emulator's own frame generation runs (LSFG or optical flow; an experimental opt-in,
+/// the host frame pacer is off meanwhile). Not with NVIDIA's, which Streamline runs.
 [[nodiscard]] bool FrameGenActive();
+/// Whether NVIDIA DLSS Frame Generation is chosen: frame_gen_type Nvidia, or LICHII_DLSS_FG=1 at
+/// this game's start.
+[[nodiscard]] bool NvidiaFrameGenChosen();
 [[nodiscard]] u32 FrameGenMultiplier();
 /// Whether emulation runs at the speed limit: use_speed_limit, and in Fritchii always for Ocarina
 /// of Time, whose logic speeds up with the frame rate ("Unlocked" made the game run fast). Not

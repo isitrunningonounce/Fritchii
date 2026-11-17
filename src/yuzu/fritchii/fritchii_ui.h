@@ -58,9 +58,16 @@ struct GraphicsHooks {
 /// DLSS (Lichii mod), effects.
 [[nodiscard]] QPushButton* MakeGraphicsButton(QWidget* parent, GraphicsHooks hooks);
 
-/// Lichii mod: the status bar's "Frame Gen 2x" switch (DLSS Frame Generation). At once when the
-/// running game was started with it, else for the next start.
+/// Lichii mod: the status bar's "Frame Gen 2x" button for the chosen frame generator. A click
+/// switches it on or off; with NVIDIA multi frame generation it offers 2x to 6x. NVIDIA's changes
+/// apply at once when the running game was started with it, the others' at the next start.
 [[nodiscard]] QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks);
+
+/// The highest DLSS Frame Generation multiplier known: the running game's, else what the last
+/// game start with it reported (saved). 0 when it never ran; above 2 is multi frame generation.
+[[nodiscard]] unsigned DlssFrameGenMax();
+/// "NVIDIA DLSS Frame Generation", or "... Multi Frame Generation (up to 6x)" as detected.
+[[nodiscard]] QString DlssFrameGenName();
 
 /// A settings page as the settings dialog shows it: inside a scroll area in Fritchii builds, so
 /// the window keeps a normal size with the larger type; the page itself otherwise.

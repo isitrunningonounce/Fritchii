@@ -354,6 +354,9 @@ bool Start() {
         return true;
     }
     if (!Settings::NvidiaDlssEnabled()) {
+        if (FrameGenRequested()) {
+            LOG_WARNING(Render_Vulkan, "DLSS Frame Generation needs NVIDIA DLSS on; it stays off");
+        }
         return false;
     }
     if (!state.module) {
@@ -516,8 +519,7 @@ std::vector<std::string> DeviceExtensions() {
 
 bool FrameGenRequested() {
     // Read at every game start: the status bar sets it for the next one.
-    const char* value = std::getenv("LICHII_DLSS_FG");
-    return value != nullptr && value[0] == '1';
+    return Settings::NvidiaFrameGenChosen();
 }
 
 ExtraQueues ExtraQueuesWanted() {
@@ -647,12 +649,15 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
             state.fg_max_frames = (std::max)(fg_state.numFramesToGenerateMax, 1u);
             Common::FrameGenStats::max_multiplier.store(state.fg_max_frames + 1,
                                                        std::memory_order_relaxed);
-            if (const char* const value = std::getenv("LICHII_DLSS_FG_MULTIPLIER");
-                value && value[0] != '\0') {
-                Common::FrameGenStats::multiplier.store(
-                    static_cast<unsigned>(std::clamp(std::atoi(value), 2, 6)),
-                    std::memory_order_relaxed);
-            }
+            const char* const value = std::getenv("LICHII_DLSS_FG_MULTIPLIER");
+            const int multiplier =
+                value && value[0] != '\0'
+                    ? std::atoi(value)
+                    : static_cast<int>(Settings::values.dlss_fg_multiplier.GetValue());
+            Common::FrameGenStats::multiplier.store(
+                static_cast<unsigned>(std::clamp(multiplier, 2, 6)), std::memory_order_relaxed);
+            // Chosen for this start, so on (an earlier game may have left the switch off).
+            Common::FrameGenStats::user_enabled.store(true, std::memory_order_relaxed);
             Common::FrameGenStats::available.store(true, std::memory_order_relaxed);
             LOG_INFO(Render_Vulkan,
                      "DLSS Frame Generation is available: up to {} generated frames per rendered "
