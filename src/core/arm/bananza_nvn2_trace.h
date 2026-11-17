@@ -14,25 +14,16 @@
 #include <string_view>
 
 #include "common/common_types.h"
+#include "core/arm/nvn2_sdk_layout.h"
 
 namespace Core::BananzaNvn2Trace {
 
 bool CountEnabled();
 bool HleEnabled();
+// EDEN_NX2_NVN_HLE=1: the path runs whatever the title's setting says.
+bool HleForced();
 
-struct SdkLayout {
-    std::array<u8, 32> build_id;
-    size_t names;
-    size_t name_offsets;
-    size_t targets;
-    size_t text_end;
-    size_t entry_count;
-    size_t bootstrap;
-    size_t internal_bootstrap;
-    size_t callback_return{};
-};
-
-const SdkLayout* FindSdk(const std::array<u8, 32>& build_id);
+using SdkLayout = Nvn2::SdkLayout;
 
 class Session {
 public:
@@ -49,7 +40,7 @@ public:
 
 private:
     enum class Kind { Other, Draw, Begin, End, Submit };
-    static constexpr size_t MaxEntries = 726;
+    static constexpr size_t MaxEntries = SdkLayout::MaxEntries;
     struct Entry {
         u64 address{};
         std::string name;

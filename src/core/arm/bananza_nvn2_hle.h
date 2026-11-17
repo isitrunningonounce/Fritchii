@@ -23,6 +23,7 @@
 #include "core/arm/bananza_nvn2_commands.h"
 #include "core/arm/bananza_nvn2_resources.h"
 #include "core/arm/bananza_nvn2_submit_lane.h"
+#include "core/arm/nvn2_sdk_layout.h"
 #include "core/hle/service/nx2_present_pacer.h"
 
 namespace Core {
@@ -279,7 +280,7 @@ private:
 
     struct CallProfile {
         std::mutex mutex;
-        std::array<CallStats, 726> entries;
+        std::array<CallStats, Nvn2::SdkLayout::MaxEntries> entries;
         std::map<u64, ThreadStats> threads;
         SubmitStats submit;
         u64 presents{};

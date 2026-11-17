@@ -25,6 +25,8 @@ add_library(core STATIC
     arm/debug.h
     arm/exclusive_monitor.cpp
     arm/exclusive_monitor.h
+    arm/nvn2_sdk_layout.cpp
+    arm/nvn2_sdk_layout.h
     arm/symbols.cpp
     arm/symbols.h
     constants.cpp

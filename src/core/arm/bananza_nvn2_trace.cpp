@@ -14,36 +14,6 @@
 #include "core/arm/bananza_nvn2_trace.h"
 
 namespace Core::BananzaNvn2Trace {
-namespace {
-
-// The base and 3.2.0 update packages have separate SDK procedure tables.
-constexpr std::array SupportedSdks{
-    SdkLayout{
-        .build_id = {0xB7, 0xFF, 0xF6, 0x14, 0xF2, 0xBC, 0xDD, 0xD3, 0x8E, 0x80,
-                     0xD5, 0x71, 0x61, 0x9C, 0x73, 0xF3, 0x00, 0xF4, 0x8E, 0x1A},
-        .names = 0xB74C26,
-        .name_offsets = 0xB79B90,
-        .targets = 0xD95168,
-        .text_end = 0x776A70,
-        .entry_count = 698,
-        .bootstrap = 0x6129C0,
-        .internal_bootstrap = 0x612A30,
-    },
-    SdkLayout{
-        .build_id = {0x18, 0x26, 0x5D, 0xAE, 0xA2, 0x10, 0x5B, 0x31, 0xF2, 0x53,
-                     0x46, 0xAD, 0xFB, 0xBD, 0x09, 0xB5, 0xED, 0xF1, 0x20, 0x7F},
-        .names = 0xB9A5EA,
-        .name_offsets = 0xB9F94C,
-        .targets = 0xE056E0,
-        .text_end = 0x7B65A0,
-        .entry_count = 726,
-        .bootstrap = 0x632C60,
-        .internal_bootstrap = 0x632CC0,
-        .callback_return = 0x632CCC,
-    },
-};
-
-} // Anonymous namespace
 
 bool CountEnabled() {
     static const bool enabled = [] {
@@ -62,9 +32,12 @@ bool HleEnabled() {
     return enabled;
 }
 
-const SdkLayout* FindSdk(const std::array<u8, 32>& build_id) {
-    const auto it = std::ranges::find(SupportedSdks, build_id, &SdkLayout::build_id);
-    return it == SupportedSdks.end() ? nullptr : &*it;
+bool HleForced() {
+    static const bool forced = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_HLE");
+        return value && std::string_view{value} == "1";
+    }();
+    return forced;
 }
 
 std::unique_ptr<Session> Session::Create(const SdkLayout& layout, std::span<const u8> sdk,
@@ -105,7 +78,7 @@ std::unique_ptr<Session> Session::Create(const SdkLayout& layout, std::span<cons
             reinterpret_cast<const char*>(sdk.data() + layout.names + offset),
             layout.name_offsets - layout.names - offset};
         const size_t length = name_storage.find('\0');
-        if (length == 0 || length == std::string_view::npos || length > 96) {
+        if (length == 0 || length == std::string_view::npos || length > SdkLayout::MaxNameLength) {
             return {};
         }
         const std::string_view name = name_storage.substr(0, length);
