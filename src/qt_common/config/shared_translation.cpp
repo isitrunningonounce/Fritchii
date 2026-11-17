@@ -174,6 +174,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Options lower than 1X can cause artifacts."));
     INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"),
            tr("Bilinear while HDR output is active."));
+    INSERT(Settings, nvn2_api_path, tr("Run the graphics API directly (NVN 2 path)"),
+           tr("Runs a Switch 2 game's graphics API calls in the emulator instead of in the "
+              "game's own graphics library, which is much faster where it works.\nTurn it off "
+              "for a game that draws wrong or does not start with it: the game then uses the "
+              "general path.\nTakes effect when a game starts."));
     INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
               "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "

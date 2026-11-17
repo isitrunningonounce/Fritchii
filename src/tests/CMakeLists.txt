@@ -15,6 +15,7 @@ add_executable(tests
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
     core/nx2_present_pacer.cpp
+    core/nvn2_sdk_layout.cpp
     common/display_hdr.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp

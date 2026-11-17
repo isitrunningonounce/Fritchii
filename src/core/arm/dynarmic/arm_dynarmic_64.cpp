@@ -529,7 +529,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Callbacks
     config.callbacks = std::addressof(*m_cb);
 #if defined(_M_X64) || defined(__x86_64__)
-    if (m_cb->m_process->GetProgramId() == Settings::DonkeyKongBananzaProgramId &&
+    // The SDK is loaded after this, so whether the title has the procedure table is not
+    // known yet: the hook does nothing for a process without one.
+    if (m_cb->m_process->IsSwitch2() &&
         (BananzaNvn2Trace::CountEnabled() || BananzaNvn2Trace::HleEnabled())) {
         config.pre_instruction = InstrumentNvn2;
     }

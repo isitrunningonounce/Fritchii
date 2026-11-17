@@ -390,6 +390,9 @@ struct Values {
     // its output passes the checks.
     SwitchableSetting<bool> game_dlss_network{linkage, false, "game_dlss_network",
                                               Category::Renderer};
+    // The NVN 2 path: a Switch 2 title's graphics API calls are run by the emulator instead of
+    // the title's SDK, where the SDK has the procedure table. Off is the general path.
+    SwitchableSetting<bool> nvn2_api_path{linkage, true, "nvn2_api_path", Category::Renderer};
     SwitchableSetting<int, true> fsr_sharpening_slider{linkage,
 #ifdef __ANDROID__
                                                        0,

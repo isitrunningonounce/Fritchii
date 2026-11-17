@@ -25,6 +25,7 @@
 #include "common/swap.h"
 #include "core/arm/bananza_nvn2_hle.h"
 #include "core/arm/bananza_nvn2_trace.h"
+#include "core/arm/nvn2_sdk_layout.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/lichii_hooks.h"
 #include "core/arm/dynarmic/lichii_zstd_hle.h"
@@ -58,24 +59,39 @@ constexpr u32 PageAlignSize(u32 size) {
     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
 }
 
-void SetUpBananzaNvn2(Core::System& system, Kernel::KProcess& process, const NSOHeader& header,
-                      std::span<const u8> image, VAddr base, bool debugger_enabled) {
-    if (process.GetProgramId() != Settings::DonkeyKongBananzaProgramId) {
+// The NVN 2 path runs for a Switch 2 title whose SDK has the procedure table, unless the
+// title's setting or EDEN_NX2_NVN_HLE=0 turns it off; EDEN_NX2_NVN_HLE=count counts the calls
+// of the title's own SDK instead.
+void SetUpNvn2(Core::System& system, Kernel::KProcess& process, const NSOHeader& header,
+               std::span<const u8> image, VAddr base, bool debugger_enabled) {
+    if (!process.IsSwitch2()) {
         return;
     }
-    const bool hle = Core::BananzaNvn2Trace::HleEnabled();
+    const bool hle = Core::BananzaNvn2Trace::HleEnabled() &&
+                     (Core::BananzaNvn2Trace::HleForced() ||
+                      Settings::values.nvn2_api_path.GetValue());
     if (!hle && !Core::BananzaNvn2Trace::CountEnabled()) {
         return;
     }
 #if defined(_M_X64) || defined(__x86_64__)
-    const auto* layout = Core::BananzaNvn2Trace::FindSdk(header.build_id);
+    const std::string build_id = Common::HexToString(std::span{header.build_id}.first(20));
+    const auto& text = header.segments[0];
+    const auto layout =
+        Core::Nvn2::SdkLayoutFinder{image, static_cast<size_t>(text.location) + text.size}.Find();
     if (!layout) {
-        LOG_WARNING(Loader, "Bananza NVN 2: unsupported SDK build {}. Using the guest SDK.",
-                    Common::HexToString(header.build_id));
+        LOG_INFO(Loader, "NVN 2: no procedure table found in SDK {}. Using the guest SDK.",
+                 build_id);
         return;
     }
+    LOG_INFO(Loader,
+             "NVN 2: SDK {} procedure table: {} entries, names {:#x}, name offsets {:#x}, "
+             "targets {:#x}, text end {:#x}, bootstrap {:#x} and {:#x}, return slot {:#x}",
+             build_id, layout->entry_count, layout->names, layout->name_offsets, layout->targets,
+             layout->text_end, layout->bootstrap, layout->internal_bootstrap,
+             layout->callback_return);
     if (hle && (!layout->callback_return || debugger_enabled)) {
-        LOG_WARNING(Loader, "Bananza NVN 2 HLE requires the update SDK and gdbstub off.");
+        LOG_WARNING(Loader, "NVN 2 HLE requires a return slot in the SDK and gdbstub off. "
+                            "Using the guest SDK.");
         return;
     }
     if (hle && Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
@@ -392,9 +408,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Load codeset for current process
     if (name == "sdk") {
-        SetUpBananzaNvn2(system, process, nso_header,
-                        std::span<const u8>{codeset.memory}.subspan(module_start),
-                        load_base + module_start, system.DebuggerEnabled());
+        SetUpNvn2(system, process, nso_header,
+                  std::span<const u8>{codeset.memory}.subspan(module_start),
+                  load_base + module_start, system.DebuggerEnabled());
         const bool matching_sdk =
             Core::WindowTrace::Enabled() && process.GetProgramId() == Core::WindowTrace::ProgramId &&
             Common::HexToString(std::span{nso_header.build_id}.first(20)) ==

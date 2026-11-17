@@ -3963,7 +3963,7 @@ void Session::ReportCallProfile() {
         return;
     }
     auto& profile = *call_profile;
-    std::array<CallStats, 726> entries;
+    std::array<CallStats, Nvn2::SdkLayout::MaxEntries> entries;
     std::map<u64, ThreadStats> threads;
     u64 presents;
     {
