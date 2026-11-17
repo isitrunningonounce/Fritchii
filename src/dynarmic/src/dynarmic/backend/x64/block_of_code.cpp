@@ -185,6 +185,9 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
     GenRunCode(rcp);
+#ifdef _WIN32
+    ::Common::JitSymbols::AddCodeRange(getCode(), total_code_size);
+#endif
 }
 
 bool BlockOfCode::HasHostFeature(HostFeature feature) const noexcept {

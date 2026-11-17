@@ -1711,9 +1711,9 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
         if (permissive) {
-            // A program that addresses memory through a constant is given a valid pointer there.
-            storage_pointer_types.emplace(MakeCbufKey(index, offset), u8{1});
-            return true;
+            const bool mapped = !archive_query_source ||
+                                archive_query_source->IsCbufStorageBufferPointer(index, offset);
+            return storage_pointer_types.emplace(MakeCbufKey(index, offset), mapped).first->second;
         }
         if (guess) {
             return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
@@ -1728,8 +1728,11 @@ bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, 
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
         if (permissive) {
-            storage_pointer_types.emplace(MakeIndirectCbufKey(index, offset, indirect), u8{1});
-            return true;
+            const bool mapped = !archive_query_source ||
+                                archive_query_source->IsCbufIndirectStorageBufferPointer(
+                                    index, offset, indirect);
+            return storage_pointer_types.emplace(MakeIndirectCbufKey(index, offset, indirect),
+                                                 mapped).first->second;
         }
         if (guess) {
             return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
@@ -1758,7 +1761,10 @@ u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
         }
         // Material constants (texture handles among them) are unknown before the game binds
         // them: zero, recorded (handle reads by location only).
-        it = cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), 0U).first;
+        it = cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset),
+                                 archive_query_source
+                                     ? archive_query_source->ReadCbufValue(cbuf_index, cbuf_offset)
+                                     : 0U).first;
     }
     // The storage pointer probes answer from their own map here, so every read but the texture
     // handle reads (recorded by location) is direct.
@@ -1773,7 +1779,9 @@ Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
     if (it == texture_types.end()) {
         if (permissive) {
             // 98.6% of the game's cached texture queries are plain 2D textures.
-            return texture_types.emplace(handle, Shader::TextureType::Color2D).first->second;
+            const auto type = archive_query_source ? archive_query_source->ReadTextureType(handle)
+                                                   : Shader::TextureType::Color2D;
+            return texture_types.emplace(handle, type).first->second;
         }
         if (guess) {
             return guess->texture_type;
@@ -1787,8 +1795,10 @@ Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
     const auto it{texture_pixel_formats.find(handle)};
     if (it == texture_pixel_formats.end()) {
         if (permissive) {
-            return texture_pixel_formats.emplace(handle, Shader::TexturePixelFormat::A8B8G8R8_UNORM)
-                .first->second;
+            const auto format = archive_query_source
+                                    ? archive_query_source->ReadTexturePixelFormat(handle)
+                                    : Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+            return texture_pixel_formats.emplace(handle, format).first->second;
         }
         if (guess) {
             return guess->pixel_format;
@@ -1820,7 +1830,8 @@ void FileEnvironment::InitializeFromArchive(std::vector<u64> lowered_code,
 }
 
 std::shared_ptr<const LoweredNativeCode> LowerNativeProgramBytes(std::span<const u8> program,
-                                                                 Shader::Stage stage) {
+                                                                 Shader::Stage stage,
+                                                                 u64 native_code_address) {
     // As GenericEnvironment::LowerNativeCode does for a graphics program bound at an address: the
     // 128-byte header, then instructions until the capture completes.
     using Shader::Ampere::Instruction;
@@ -1854,7 +1865,8 @@ std::shared_ptr<const LoweredNativeCode> LowerNativeProgramBytes(std::span<const
         }
     }
     const auto lowered = Shader::Ampere::LowerToMaxwell(
-        native, {.geometry = false, .tensor = true, .native_code_address = 0,
+        native, {.geometry = stage == Shader::Stage::Geometry, .tensor = true,
+                 .native_code_address = native_code_address,
                  .verified_traps = {}, .tessellation_stage = Shader::Ampere::TessellationStage::None});
     if (!lowered) {
         return nullptr;
@@ -1874,7 +1886,6 @@ std::shared_ptr<const LoweredNativeCode> LowerNativeProgramBytes(std::span<const
     }
     lowered_code.push_back(0);
     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
-    (void)stage;
     return result;
 }
 

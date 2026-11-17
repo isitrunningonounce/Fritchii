@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -282,6 +283,10 @@ public:
         return record_serial != submitted_serial;
     }
 
+    [[nodiscard]] u64 RecordingSerial() const noexcept {
+        return record_serial;
+    }
+
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
@@ -394,6 +399,9 @@ public:
     }
 
     std::mutex submit_mutex;
+    // Host time of the last 64 ticks' vkQueueSubmit call and return (timeline trace).
+    std::array<std::atomic<u64>, 64> submit_begin_ns{};
+    std::array<std::atomic<u64>, 64> submit_end_ns{};
 
 private:
     std::chrono::steady_clock::time_point last_flush{};
@@ -609,6 +617,15 @@ private:
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;
+
+public:
+    std::atomic<bool> trace_submit_times{};
+    std::pair<u64, u64> SubmitTimes(u64 tick) const {
+        return {submit_begin_ns[tick % 64].load(std::memory_order_relaxed),
+                submit_end_ns[tick % 64].load(std::memory_order_relaxed)};
+    }
+
+private:
 
     State state;
     u64 recording_epoch = 0;

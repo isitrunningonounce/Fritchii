@@ -23,6 +23,8 @@ class ExclusiveMonitor;
 namespace Dynarmic {
 namespace A64 {
 
+class IREmitter;
+
 using VAddr = std::uint64_t;
 
 using Vector = std::array<std::uint64_t, 2>;
@@ -140,6 +142,9 @@ struct UserConfig {
     std::optional<std::uintptr_t> fastmem_pointer = std::nullopt;
 
     UserCallbacks* callbacks;
+
+    // x64: insert instrumentation before an instruction while still translating it normally.
+    void (*pre_instruction)(UserCallbacks&, IREmitter&, VAddr) = nullptr;
 
     ExclusiveMonitor* global_monitor = nullptr;
 

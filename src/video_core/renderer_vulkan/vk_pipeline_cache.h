@@ -197,6 +197,9 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    const Shader::Profile& ShaderProfile() const { return profile; }
+    const Shader::HostTranslateInfo& ShaderHostInfo() const { return host_info; }
+
     /// Whether the last CurrentGraphicsPipeline returned null because its draw was skipped for an
     /// unbuilt pipeline (asynchronous shaders), not because there is no pipeline to build.
     [[nodiscard]] bool LastLookupSkipped() const noexcept {

@@ -172,6 +172,9 @@ public:
     /// Runs an action on the GPU thread between command lists (returns its sync fence).
     u64 RunOnGpuThread(std::function<void()>&& action);
 
+    /// Run an ordered renderer operation and wake the GPU thread.
+    u64 SubmitRendererWork(std::function<void(VideoCore::RendererBase&)>&& action);
+
     /// Obtains current flush request fence id.
     [[nodiscard]] u64 CurrentSyncRequestFence() const;
 

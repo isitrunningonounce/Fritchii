@@ -7,6 +7,8 @@
 #include <random>
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/arm/bananza_nvn2_hle.h"
+#include "core/arm/bananza_nvn2_trace.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core.h"
@@ -180,6 +182,16 @@ void KProcess::Finalize(KernelCore& kernel) {
         interface.reset();
     }
     m_exclusive_monitor.reset();
+    if (m_bananza_nvn2_hle) {
+        m_bananza_nvn2_hle->Finish();
+        m_bananza_nvn2_hle.reset();
+    }
+    if (m_bananza_nvn2_trace) {
+        if (Core::BananzaNvn2Trace::CountEnabled()) {
+            m_bananza_nvn2_trace->Finish();
+        }
+        m_bananza_nvn2_trace.reset();
+    }
 
     // Perform inherited finalization.
     KSynchronizationObject::Finalize(kernel);
@@ -1274,6 +1286,14 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 
     // We succeeded.
     R_SUCCEED();
+}
+
+void KProcess::SetBananzaNvn2Trace(std::unique_ptr<Core::BananzaNvn2Trace::Session> trace) {
+    m_bananza_nvn2_trace = std::move(trace);
+}
+
+void KProcess::SetBananzaNvn2Hle(std::unique_ptr<Core::BananzaNvn2Hle::Session> hle) {
+    m_bananza_nvn2_hle = std::move(hle);
 }
 
 void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr) {

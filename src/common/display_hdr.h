@@ -65,6 +65,15 @@ public:
         return presenting_hdr.load(std::memory_order_acquire);
     }
 
+    /// Whether the guest's last HDR status query was answered with HDR: its RGB10A2 images hold
+    /// PQ BT.2020 only then.
+    void SetGuestToldHdr(bool hdr) {
+        guest_told_hdr.store(hdr, std::memory_order_release);
+    }
+    [[nodiscard]] bool GuestToldHdr() const {
+        return guest_told_hdr.load(std::memory_order_acquire);
+    }
+
 private:
     void Run(std::stop_token stop);
 
@@ -73,6 +82,7 @@ private:
     std::atomic<u64> generation{};
     std::atomic<void*> window{};
     std::atomic<bool> presenting_hdr{};
+    std::atomic<bool> guest_told_hdr{};
     std::jthread thread;
 };
 

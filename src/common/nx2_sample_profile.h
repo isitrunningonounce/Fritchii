@@ -10,7 +10,9 @@
 /// list where a trailing * matches a prefix; default GPU,GPUBack,VulkanWorker; adding CPUCore_*
 /// samples the guest cores). Sampling starts after EDEN_NX2_SAMPLE_DELAY seconds (default 0)
 /// and stops after EDEN_NX2_SAMPLE_SECONDS (default 20). It turns EDEN_NX2_GPU_PROFILE's zone
-/// timers off so they don't show up in the samples.
+/// timers off so they don't show up in the samples. With EDEN_NX2_JIT_SYMBOLS=1 the file also
+/// holds the JIT's blocks by guest address and, per sample taken in or under JIT code, the
+/// guest's call chain.
 namespace Common::Nx2SampleProfile {
 
 [[nodiscard]] bool Requested();

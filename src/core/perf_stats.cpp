@@ -67,6 +67,17 @@ void PerfStats::BeginSystemFrame() {
     frame_begin = Clock::now();
 }
 
+void PerfStats::AddSystemFrame(std::chrono::nanoseconds frame_time) {
+    std::scoped_lock lock{object_mutex};
+
+    if (current_index < perf_history.size()) {
+        perf_history[current_index++] =
+            std::chrono::duration<double, std::milli>(frame_time).count();
+    }
+    accumulated_frametime += std::chrono::duration_cast<Clock::duration>(frame_time);
+    system_frames += 1;
+}
+
 void PerfStats::EndSystemFrame() {
     std::scoped_lock lock{object_mutex};
 

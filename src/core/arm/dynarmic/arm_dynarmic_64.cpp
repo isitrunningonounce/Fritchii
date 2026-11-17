@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -13,23 +15,70 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
+#include "common/jit_symbols.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/arm/bananza_nvn2_hle.h"
+#include "core/arm/bananza_nvn2_trace.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/jit_block_list.h"
 #include "core/arm/dynarmic/lichii_hooks.h"
 #include "core/arm/dynarmic/lichii_zstd_hle.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#include "dynarmic/frontend/A64/a64_ir_emitter.h"
+#endif
 
 namespace Core {
 
 using namespace Common::Literals;
+
+#if defined(_M_X64) || defined(__x86_64__)
+namespace {
+constexpr u32 Arm64Return = 0xD65F03C0;
+
+void DispatchNvn2FromJit(u64 callback, u64 index, u64 counts) {
+    auto& cpu = *reinterpret_cast<DynarmicCallbacks64*>(callback);
+    cpu.DispatchNvn2FromJit(index, counts & 0xff, counts >> 8);
+}
+
+void CountNvn2Call(u64 callback, u64 index, u64 arg1) {
+    auto& cpu = *reinterpret_cast<DynarmicCallbacks64*>(callback);
+    cpu.m_process->GetBananzaNvn2Trace()->Count(index, cpu.m_nvn2_thread_id, arg1);
+}
+
+void InstrumentNvn2(Dynarmic::A64::UserCallbacks& callbacks, Dynarmic::A64::IREmitter& ir,
+                    u64 pc) {
+    auto& cpu = static_cast<DynarmicCallbacks64&>(callbacks);
+    if (const auto* trace = cpu.m_process->GetBananzaNvn2Trace()) {
+        if (const auto index = trace->Find(pc)) {
+            if (const auto* hle = cpu.m_process->GetBananzaNvn2Hle()) {
+                if (const auto counts = hle->DirectCallArguments(*index)) {
+                    ir.CallHostFunction(DispatchNvn2FromJit, ir.Imm64(reinterpret_cast<u64>(&cpu)),
+                                        ir.Imm64(*index),
+                                        ir.Imm64(counts->first | (counts->second << 8)));
+                }
+                return;
+            }
+            ir.CallHostFunction(CountNvn2Call, ir.Imm64(reinterpret_cast<u64>(&cpu)),
+                                ir.Imm64(*index), ir.GetX(Dynarmic::A64::Reg::R1));
+        }
+    }
+}
+} // Anonymous namespace
+#endif
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -72,6 +121,21 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    if (const auto* hle = m_process->GetBananzaNvn2Hle()) {
+        const auto& procs = *m_process->GetBananzaNvn2Trace();
+        if (hle->IsBootstrap(vaddr) || hle->IsCallbackReturn(vaddr)) {
+            return LichiiHooks::Brk;
+        }
+        if (const auto index = procs.Find(vaddr);
+            index && !hle->UsesGuestStateHelper(*index)) {
+#if defined(_M_X64) || defined(__x86_64__)
+            if (hle->DirectCallArguments(*index)) {
+                return Arm64Return;
+            }
+#endif
+            return LichiiHooks::Brk;
+        }
+    }
     if (instruction == LichiiHooks::Pacibsp) {
         if (ZstdHle::IsHookedEntry(vaddr, m_process->GetProgramId(), m_memory) ||
             ZstdHle::IsHookedStreamEntry(vaddr, m_process->GetProgramId(), m_memory)) {
@@ -151,7 +215,99 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
     m_parent.m_jit->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
 }
 
+void DynarmicCallbacks64::DispatchNvn2FromJit(size_t index, size_t integer_count,
+                                              size_t float_count) {
+    auto& jit = *m_parent.m_jit;
+    auto& hle = *m_process->GetBananzaNvn2Hle();
+    const auto& procs = *m_process->GetBananzaNvn2Trace();
+    const bool profile = hle.ProfilesCalls();
+    const auto start = profile ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    BananzaNvn2Hle::GuestCall call{};
+    for (size_t i = 0; i < integer_count; ++i) {
+        call.x[i] = jit.GetRegister(i);
+    }
+    for (size_t i = 0; i < float_count; ++i) {
+        call.v[i] = jit.GetVector(i)[0];
+    }
+    jit.SetRegister(0, hle.Dispatch(procs, m_memory, index, call));
+    if (profile) {
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        hle.ProfileCall(index, procs.Name(index),
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+                        false, m_nvn2_thread_id);
+    }
+}
+
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (auto* hle = m_process->GetBananzaNvn2Hle();
+        hle && exception == Dynarmic::A64::Exception::Breakpoint) {
+        auto& jit = *m_parent.m_jit;
+        const auto& procs = *m_process->GetBananzaNvn2Trace();
+        const bool profile = hle->ProfilesCalls();
+        const auto start = profile ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+        const auto report = [&](size_t index, bool continuation) {
+            if (profile) {
+                const auto elapsed = std::chrono::steady_clock::now() - start;
+                hle->ProfileCall(index, procs.Name(index),
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+                                 continuation, m_nvn2_thread_id);
+            }
+        };
+        const auto return_to_guest = [&](size_t index, const BananzaNvn2Hle::GuestCall& call,
+                                         u64 link) {
+            std::chrono::steady_clock::time_point deadline{};
+            const u64 result = hle->Dispatch(procs, m_memory, index, call, &deadline);
+            if (hle->ReturnsFloat(index)) {
+                jit.SetVector(0, {result, 0});
+            } else {
+                jit.SetRegister(0, result);
+            }
+            jit.SetRegister(30, link);
+            jit.SetPC(link);
+            // Only a present sets a deadline: no clock read for the other calls.
+            if (deadline.time_since_epoch().count() != 0 &&
+                deadline > std::chrono::steady_clock::now()) {
+                m_present_deadline = deadline;
+                jit.HaltExecution(DeferredThreadSleep);
+            }
+        };
+        if (hle->IsBootstrap(pc)) {
+            const u64 name = jit.GetRegister(0);
+            jit.SetRegister(0, name ? procs.Resolve(m_memory.ReadCString(name, 96)) : 0);
+            jit.SetPC(jit.GetRegister(30));
+            return;
+        }
+        if (hle->IsCallbackReturn(pc)) {
+            if (const auto continuation = hle->EndCallback(m_nvn2_thread_id)) {
+                return_to_guest(continuation->procedure, continuation->call, continuation->link);
+                report(continuation->procedure, true);
+                return;
+            }
+        }
+        if (const auto index = procs.Find(pc);
+            index && !hle->UsesGuestStateHelper(*index)) {
+            SCOPE_EXIT { report(*index, false); };
+            BananzaNvn2Hle::GuestCall call{};
+            for (size_t i = 0; i < call.x.size(); ++i) {
+                call.x[i] = jit.GetRegister(i);
+                call.v[i] = jit.GetVector(i)[0];
+            }
+            const u64 link = jit.GetRegister(30);
+            if (const auto callback =
+                    hle->BeginCallback(m_nvn2_thread_id, *index, call, link)) {
+                for (size_t i = 0; i < callback->args.size(); ++i) {
+                    jit.SetRegister(i, callback->args[i]);
+                }
+                jit.SetRegister(30, hle->CallbackReturn());
+                jit.SetPC(callback->address);
+            } else {
+                return_to_guest(*index, call, link);
+            }
+            return;
+        }
+    }
     if (exception == Dynarmic::A64::Exception::Breakpoint &&
         ZstdHle::GetMode() != ZstdHle::Mode::Off && pc == ZstdHle::Target()) {
         // LICHII_ZSTD_HLE: decoded on the host and back to the caller, or on into the guest
@@ -372,6 +528,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Callbacks
     config.callbacks = std::addressof(*m_cb);
+#if defined(_M_X64) || defined(__x86_64__)
+    if (m_cb->m_process->GetProgramId() == Settings::DonkeyKongBananzaProgramId &&
+        (BananzaNvn2Trace::CountEnabled() || BananzaNvn2Trace::HleEnabled())) {
+        config.pre_instruction = InstrumentNvn2;
+    }
+#endif
 
     // Memory
     if (page_table) {
@@ -391,6 +553,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             std::nullopt;
         config.fastmem_address_space_bits = std::uint32_t(address_space_bits);
         config.silently_mirror_fastmem = false;
+        Common::JitSymbols::SetGuestBase(page_table->fastmem_arena);
 
         config.fastmem_exclusive_access = config.fastmem_pointer != std::nullopt;
         config.recompile_on_exclusive_fastmem_failure = true;
@@ -528,44 +691,66 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
-namespace {
-struct StoredBlock {
-    u64 location;
-    u32 first_instruction;
-    u32 reserved;
-};
-static_assert(sizeof(StoredBlock) == 16);
-
-std::filesystem::path StoredBlocksPath(u64 program_id) {
-    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "lichii_jit" /
-           fmt::format("{:016X}.bin", program_id);
-}
-} // Anonymous namespace
-
 void ArmDynarmic64::PrecompileStoredBlocks() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("LICHII_JIT_PRECOMPILE");
-        return value != nullptr && value[0] == '1';
-    }();
-    const u64 program_id = m_cb->m_process->GetProgramId();
-    if (!enabled || program_id == 0 || program_id != m_system.GetApplicationProcessProgramID()) {
+    // The first core to run a thread does it for all of them; the others wait here.
+    static std::mutex mutex;
+    std::scoped_lock lock{mutex};
+    if (m_blocks_precompiled.load(std::memory_order_acquire)) {
         return;
     }
-    std::ifstream in{StoredBlocksPath(program_id), std::ios::binary};
-    if (!in) {
+    Kernel::KProcess* const process = m_cb->m_process;
+    const u64 program_id = process->GetProgramId();
+    if (program_id == 0 || program_id != m_system.GetApplicationProcessProgramID()) {
+        m_blocks_precompiled.store(true, std::memory_order_release);
         return;
     }
-    const auto begin = std::chrono::steady_clock::now();
-    size_t stored = 0;
-    size_t compiled = 0;
-    StoredBlock block{};
-    while (in.read(reinterpret_cast<char*>(&block), sizeof(block))) {
-        ++stored;
-        compiled += m_jit->PrecompileBlock(block.location, block.first_instruction) ? 1 : 0;
+    std::array<ArmDynarmic64*, Core::Hardware::NUM_CPU_CORES> cores{};
+    for (size_t core = 0; core < cores.size(); ++core) {
+        // The cores of a 64-bit process all have this kind of interface.
+        cores[core] = static_cast<ArmDynarmic64*>(process->GetArmInterface(core));
     }
-    LOG_INFO(Core_ARM, "LICHII_JIT: core {} precompiled {} of {} stored blocks in {:.2f} s",
-             m_core_index, compiled, stored,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    // Read for every game, so its file loses the repeats of earlier runs.
+    JitBlockList& list = JitBlockList::For(program_id);
+    static const char* const setting = std::getenv("LICHII_JIT_PRECOMPILE");
+    const bool enabled = setting != nullptr && setting[0] != '\0'
+                             ? setting[0] == '1'
+                             : program_id == Settings::DonkeyKongBananzaProgramId;
+    if (enabled) {
+        const auto begin = std::chrono::steady_clock::now();
+        std::array<size_t, Core::Hardware::NUM_CPU_CORES> compiled{};
+        const auto compile = [&list, &compiled](ArmDynarmic64& arm, size_t core) {
+            for (const JitBlockList::Block& block : list.ForCore(core)) {
+                compiled[core] +=
+                    arm.m_jit->PrecompileBlock(block.location, block.first_instruction) ? 1 : 0;
+            }
+        };
+        {
+            // No core runs guest code on its JIT before this returns: each waits above.
+            std::vector<std::jthread> helpers;
+            for (size_t core = 0; core < cores.size(); ++core) {
+                if (cores[core] != nullptr && cores[core] != this) {
+                    helpers.emplace_back([&compile, arm = cores[core], core] { compile(*arm, core); });
+                }
+            }
+            compile(*this, m_core_index);
+        }
+        size_t total{};
+        for (const size_t count : compiled) {
+            total += count;
+        }
+        LOG_INFO(Core_ARM,
+                 "LICHII_JIT: precompiled {} blocks on the cores ({} to {} a core) of {} on the "
+                 "list in {:.2f} s",
+                 total, *std::ranges::min_element(compiled), *std::ranges::max_element(compiled),
+                 list.Size(),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    }
+    for (ArmDynarmic64* const arm : cores) {
+        if (arm != nullptr) {
+            arm->m_blocks_precompiled.store(true, std::memory_order_release);
+        }
+    }
+    m_blocks_precompiled.store(true, std::memory_order_release);
 }
 
 void ArmDynarmic64::ReportCompiledBlocks() {
@@ -588,25 +773,20 @@ void ArmDynarmic64::ReportCompiledBlocks() {
     if (blocks.empty() || program_id == 0) {
         return;
     }
-    static std::mutex file_mutex;
-    std::scoped_lock lock{file_mutex};
-    const auto path = StoredBlocksPath(program_id);
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
-    std::ofstream out{path, std::ios::binary | std::ios::app};
-    for (const auto& [location, pc] : blocks) {
-        const StoredBlock block{
-            .location = location,
-            .first_instruction = m_cb->m_memory.Read32(pc),
-            .reserved = 0,
-        };
-        out.write(reinterpret_cast<const char*>(&block), sizeof(block));
+    std::vector<JitBlockList::Block> compiled;
+    compiled.reserve(blocks.size());
+    for (const auto& block : blocks) {
+        compiled.push_back({block.location, m_cb->m_memory.Read32(block.pc),
+                            1U << (block.processor & 31)});
     }
+    JitBlockList::For(program_id).Add(compiled);
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
-    if (!m_blocks_precompiled) {
-        m_blocks_precompiled = true;
+    if (m_cb->m_process->GetBananzaNvn2Trace()) {
+        m_cb->m_nvn2_thread_id = thread->GetThreadId();
+    }
+    if (!m_blocks_precompiled.load(std::memory_order_acquire)) {
         PrecompileStoredBlocks();
     }
     ReportCompiledBlocks();
@@ -615,8 +795,17 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
+    if (m_cb->m_process->GetBananzaNvn2Trace()) {
+        m_cb->m_nvn2_thread_id = thread->GetThreadId();
+    }
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Step());
+}
+
+s64 ArmDynarmic64::TakeDeferredSleepNanoseconds() {
+    const auto deadline = std::exchange(m_cb->m_present_deadline, {});
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
 }
 
 u32 ArmDynarmic64::GetSvcNumber() const {

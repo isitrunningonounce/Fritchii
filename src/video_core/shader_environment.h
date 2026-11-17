@@ -344,6 +344,9 @@ struct GuessMissing {
 
 class FileEnvironment final : public Shader::Environment {
 public:
+    void SetGeometryPassthroughMask(const std::array<u32, 8>& mask) {
+        gp_passthrough_mask = mask;
+    }
     FileEnvironment() = default;
 
     /// Missing reads get these answers instead of an error; the guess must outlive the
@@ -374,6 +377,9 @@ public:
     void InitializeFromArchive(std::vector<u64> lowered_code, const Shader::ProgramHeader& header,
                                Shader::Stage program_stage, u32 bound_buffer,
                                std::span<const u32> bank1_constants);
+    void SetArchiveQuerySource(Shader::Environment& source) noexcept {
+        archive_query_source = &source;
+    }
     /// The mesh registers and pass-through header a mesh program translates with.
     void SetMeshState(const std::array<u32, 3>& registers, const Shader::ProgramHeader& header) {
         mesh_registers = registers;
@@ -482,12 +488,14 @@ private:
     bool permissive{}; ///< InitializeFromArchive: default answers for unknown queries
     u32 viewport_transform_state = 1;
     const GuessMissing* guess{};
+    Shader::Environment* archive_query_source{};
 };
 
 /// The lowering GenericEnvironment::LowerNativeCode does, for a native graphics program held in
 /// memory (128-byte header + code, as the game uploads it): nullptr when it cannot be lowered.
 std::shared_ptr<const LoweredNativeCode> LowerNativeProgramBytes(std::span<const u8> program,
-                                                                 Shader::Stage stage);
+                                                                 Shader::Stage stage,
+                                                                 u64 native_code_address = 0);
 /// The shader cache key of a native program: the hash of its lowered code.
 u64 NativeProgramHash(std::span<const u64> lowered_code);
 

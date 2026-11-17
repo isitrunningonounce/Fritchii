@@ -35,6 +35,8 @@ public:
     using Clock = std::chrono::steady_clock;
 
     void BeginSystemFrame();
+    /// A frame timed by the caller: for a path whose frames overlap on several threads.
+    void AddSystemFrame(std::chrono::nanoseconds frame_time);
     void EndSystemFrame();
     void EndGameFrame();
 

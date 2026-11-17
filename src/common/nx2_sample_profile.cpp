@@ -20,6 +20,7 @@
 #include <tlhelp32.h>
 
 #include "common/fs/path_util.h"
+#include "common/jit_symbols.h"
 #include "common/logging.h"
 #endif
 
@@ -77,9 +78,15 @@ bool Selected(std::string_view name) {
 constexpr std::uint8_t KindSample = 1;
 constexpr std::uint8_t KindThread = 2;
 constexpr std::uint8_t KindModule = 3;
+// With EDEN_NX2_JIT_SYMBOLS=1: a JIT block (host start, host end, name), written at the end.
+constexpr std::uint8_t KindJitBlock = 4;
+// With EDEN_NX2_JIT_SYMBOLS=1: the guest call chain of the sample before it (x30, then the
+// return address of each frame record from x29 up).
+constexpr std::uint8_t KindGuestStack = 5;
 constexpr std::uint8_t KindEnd = 0xff;
 constexpr size_t MaxThreads = 32;
 constexpr size_t MaxDepth = 32;
+constexpr size_t MaxGuestDepth = 20;
 
 struct SampledThread {
     HANDLE handle{};
@@ -124,8 +131,12 @@ void WriteModules(std::ofstream& file) {
 
 /// Unwinds a suspended thread's stack. Allocates nothing: the thread may hold the heap lock.
 size_t WalkUnguarded(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames,
-                     size_t& depth) {
+                     size_t& depth, std::uint64_t& jit_state) {
     while (depth < MaxDepth && context.Rip != 0) {
+        if (jit_state == 0 && JitSymbols::InCode(context.Rip)) {
+            // JIT code keeps the guest state's address in r15.
+            jit_state = context.R15;
+        }
         frames[depth++] = context.Rip;
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -150,16 +161,47 @@ size_t WalkUnguarded(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& fram
 /// A thread stopped in driver or JIT code can leave the unwinder a garbage stack pointer: it then
 /// faults inside ntdll and took the whole emulator down (twice in Ocarina of Time sessions). Keep
 /// the frames found up to the fault instead.
-size_t Walk(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames) {
+size_t Walk(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames,
+            std::uint64_t& jit_state) {
     size_t depth = 0;
 #ifdef _MSC_VER
     __try {
-        WalkUnguarded(context, frames, depth);
+        WalkUnguarded(context, frames, depth, jit_state);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 #else
-    WalkUnguarded(context, frames, depth);
+    WalkUnguarded(context, frames, depth, jit_state);
 #endif
+    return depth;
+}
+
+/// The guest's call chain from the A64 state a JIT frame runs on. Reads through
+/// ReadProcessMemory, which fails on an unmapped address instead of faulting.
+size_t WalkGuest(std::uint64_t jit_state, std::array<std::uint64_t, MaxGuestDepth>& chain) {
+    const std::uintptr_t base = JitSymbols::GuestBase();
+    const HANDLE process = GetCurrentProcess();
+    // x29 and x30: the state starts with the 31 general registers.
+    std::uint64_t registers[2]{};
+    if (base == 0 || jit_state == 0 ||
+        !ReadProcessMemory(process, reinterpret_cast<LPCVOID>(jit_state + 29 * sizeof(std::uint64_t)),
+                           registers, sizeof(registers), nullptr)) {
+        return 0;
+    }
+    size_t depth = 0;
+    chain[depth++] = registers[1];
+    std::uint64_t frame = registers[0];
+    while (depth < MaxGuestDepth && frame != 0 && (frame & 15) == 0 && frame < (1ULL << 48)) {
+        std::uint64_t record[2]{};
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(base + frame), record,
+                               sizeof(record), nullptr)) {
+            break;
+        }
+        chain[depth++] = record[1];
+        if (record[0] <= frame) {
+            break;
+        }
+        frame = record[0];
+    }
     return depth;
 }
 
@@ -194,6 +236,7 @@ void SamplerMain() {
     size_t threads_written = 0;
     std::uint64_t samples = 0;
     std::array<std::uint64_t, MaxDepth> frames{};
+    std::array<std::uint64_t, MaxGuestDepth> chain{};
     for (LARGE_INTEGER now = start; now.QuadPart < end; QueryPerformanceCounter(&now)) {
         const size_t count = num_threads.load(std::memory_order_acquire);
         for (; threads_written < count; ++threads_written) {
@@ -208,7 +251,10 @@ void SamplerMain() {
             }
             alignas(16) CONTEXT context{};
             context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-            const size_t depth = GetThreadContext(thread, &context) ? Walk(context, frames) : 0;
+            std::uint64_t jit_state{};
+            const size_t depth =
+                GetThreadContext(thread, &context) ? Walk(context, frames, jit_state) : 0;
+            const size_t guest_depth = jit_state != 0 ? WalkGuest(jit_state, chain) : 0;
             ResumeThread(thread);
             if (depth == 0) {
                 continue;
@@ -220,6 +266,13 @@ void SamplerMain() {
             Put(file, static_cast<std::uint64_t>(now.QuadPart));
             file.write(reinterpret_cast<const char*>(frames.data()),
                        static_cast<std::streamsize>(depth * sizeof(std::uint64_t)));
+            if (guest_depth != 0) {
+                Put(file, KindGuestStack);
+                Put(file, static_cast<std::uint8_t>(index));
+                Put(file, static_cast<std::uint8_t>(guest_depth));
+                file.write(reinterpret_cast<const char*>(chain.data()),
+                           static_cast<std::streamsize>(guest_depth * sizeof(std::uint64_t)));
+            }
             ++samples;
         }
         if (timer != nullptr) {
@@ -229,6 +282,12 @@ void SamplerMain() {
         } else {
             Sleep(1);
         }
+    }
+    for (const JitSymbols::Block& block : JitSymbols::Snapshot()) {
+        Put(file, KindJitBlock);
+        Put(file, static_cast<std::uint64_t>(block.start));
+        Put(file, static_cast<std::uint64_t>(block.end));
+        PutString(file, block.name);
     }
     Put(file, KindEnd);
     file.close();

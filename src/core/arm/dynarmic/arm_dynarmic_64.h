@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <atomic>
 #include <memory>
 #include "common/container/unordered_map.h"
@@ -62,6 +64,7 @@ public:
     u64 GetCNTPCT() override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
+    void DispatchNvn2FromJit(size_t index, size_t integer_count, size_t float_count);
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
@@ -73,6 +76,8 @@ public:
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
+    u64 m_nvn2_thread_id{};
+    std::chrono::steady_clock::time_point m_present_deadline{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;
@@ -90,6 +95,7 @@ public:
 
     HaltReason RunThread(Kernel::KThread* thread) override;
     HaltReason StepThread(Kernel::KThread* thread) override;
+    s64 TakeDeferredSleepNanoseconds() override;
 
     void GetContext(Kernel::Svc::ThreadContext& ctx) const override;
     void SetContext(const Kernel::Svc::ThreadContext& ctx) override;
@@ -115,13 +121,15 @@ private:
     friend class DynarmicCallbacks64;
 
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
-    /// Lichii: compiles the blocks an earlier run stored (LICHII_JIT_PRECOMPILE=1), and every
-    /// 10 s logs what the JITs compiled and stores the new blocks (lichii_jit_blocks.bin).
+    /// Lichii: compiles the blocks earlier runs stored (JitBlockList; on for Bananza,
+    /// LICHII_JIT_PRECOMPILE=1 for any game, =0 for none): every core's JIT at once, when the
+    /// first core runs a thread. Every 10 s logs what the JITs compiled and stores the new
+    /// blocks.
     void PrecompileStoredBlocks();
     void ReportCompiledBlocks();
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
-    bool m_blocks_precompiled{};
+    std::atomic<bool> m_blocks_precompiled{};
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
 

@@ -371,6 +371,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkQueueBindSparse vkQueueBindSparse{};
     PFN_vkQueueSubmit vkQueueSubmit{};
     PFN_vkQueueSubmit2 vkQueueSubmit2{};
+    PFN_vkResetDescriptorPool vkResetDescriptorPool{};
     PFN_vkResetFences vkResetFences{};
     PFN_vkResetQueryPool vkResetQueryPool{};
     PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{};
@@ -855,7 +856,7 @@ public:
         return is_coherent;
     }
 
-    void Flush() const;
+    void Flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
 
     void Invalidate() const;
 
@@ -985,6 +986,8 @@ class DescriptorPool : public Handle<VkDescriptorPool, VkDevice, DeviceDispatch>
 
 public:
     DescriptorSets Allocate(const VkDescriptorSetAllocateInfo& ai) const;
+    VkDescriptorSet AllocateOne(VkDescriptorSetLayout layout) const;
+    void Reset() const;
 
     /// Set object name.
     void SetObjectNameEXT(const char* name) const;

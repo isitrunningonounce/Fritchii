@@ -6,6 +6,20 @@
 
 add_library(core STATIC
     arm/arm_interface.cpp
+    arm/bananza_nvn2_chunk_pool.h
+    arm/bananza_nvn2_commands.cpp
+    arm/bananza_nvn2_commands.h
+    arm/bananza_nvn2_device.h
+    arm/bananza_nvn2_hle.cpp
+    arm/bananza_nvn2_hle.h
+    arm/bananza_nvn2_op_bytes.h
+    arm/bananza_nvn2_submit_lane.h
+    arm/bananza_nvn2_resources.cpp
+    arm/bananza_nvn2_resources.h
+    arm/bananza_nvn2_texture.cpp
+    arm/bananza_nvn2_texture.h
+    arm/bananza_nvn2_trace.cpp
+    arm/bananza_nvn2_trace.h
     arm/arm_interface.h
     arm/debug.cpp
     arm/debug.h
@@ -1223,6 +1237,8 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/dynarmic_cp15.h
         arm/dynarmic/dynarmic_exclusive_monitor.cpp
         arm/dynarmic/dynarmic_exclusive_monitor.h
+        arm/dynarmic/jit_block_list.cpp
+        arm/dynarmic/jit_block_list.h
         hle/service/jit/jit_code_memory.cpp
         hle/service/jit/jit_code_memory.h
         hle/service/jit/jit_context.cpp

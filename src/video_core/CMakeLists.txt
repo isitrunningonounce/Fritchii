@@ -203,6 +203,21 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_statistics.h
     renderer_vulkan/renderer_vulkan.h
     renderer_vulkan/renderer_vulkan.cpp
+    renderer_vulkan/vk_bananza_nvn2_async_builder.h
+    renderer_vulkan/vk_bananza_nvn2_replay.cpp
+    renderer_vulkan/vk_bananza_nvn2_replay.h
+    renderer_vulkan/vk_bananza_nvn2_compute_list.cpp
+    renderer_vulkan/vk_bananza_nvn2_compute_list.h
+    renderer_vulkan/vk_bananza_nvn2_kept_storage.h
+    renderer_vulkan/vk_bananza_nvn2_recorded_bindings.h
+    renderer_vulkan/vk_bananza_nvn2_pipeline_list.cpp
+    renderer_vulkan/vk_bananza_nvn2_pipeline_list.h
+    renderer_vulkan/vk_bananza_nvn2_pipeline_state.h
+    renderer_vulkan/vk_bananza_nvn2_run_stats.h
+    renderer_vulkan/vk_bananza_nvn2_texture_fill.cpp
+    renderer_vulkan/vk_bananza_nvn2_texture_fill.h
+    renderer_vulkan/vk_bananza_nvn2_shaders.cpp
+    renderer_vulkan/vk_bananza_nvn2_shaders.h
     renderer_vulkan/vk_blit_screen.cpp
     renderer_vulkan/vk_blit_screen.h
     renderer_vulkan/vk_buffer_cache_base.cpp

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -18,6 +20,12 @@ struct Range {
 
 std::mutex mutex;
 std::map<std::uintptr_t, Range> ranges;
+
+constexpr std::size_t MaxCodeRanges = 64;
+std::array<std::atomic<std::uintptr_t>, MaxCodeRanges> code_starts;
+std::array<std::atomic<std::uintptr_t>, MaxCodeRanges> code_ends;
+std::atomic<std::size_t> num_code_ranges{};
+std::atomic<std::uintptr_t> guest_base{};
 
 } // Anonymous namespace
 
@@ -63,6 +71,50 @@ std::optional<std::string> Lookup(const void* address) {
         return std::nullopt;
     }
     return it->second.name;
+}
+
+std::vector<Block> Snapshot() {
+    std::vector<Block> blocks;
+    std::scoped_lock lock{mutex};
+    blocks.reserve(ranges.size());
+    for (const auto& [start, range] : ranges) {
+        blocks.push_back({start, range.end, range.name});
+    }
+    return blocks;
+}
+
+void AddCodeRange(const void* start, std::size_t size) {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    const std::size_t index = num_code_ranges.load(std::memory_order_relaxed);
+    if (index == MaxCodeRanges) {
+        return;
+    }
+    const auto first = reinterpret_cast<std::uintptr_t>(start);
+    code_starts[index].store(first, std::memory_order_relaxed);
+    code_ends[index].store(first + size, std::memory_order_relaxed);
+    num_code_ranges.store(index + 1, std::memory_order_release);
+}
+
+void SetGuestBase(const void* base) {
+    guest_base.store(reinterpret_cast<std::uintptr_t>(base), std::memory_order_relaxed);
+}
+
+bool InCode(std::uintptr_t address) {
+    const std::size_t count = num_code_ranges.load(std::memory_order_acquire);
+    for (std::size_t index = 0; index < count; ++index) {
+        if (address >= code_starts[index].load(std::memory_order_relaxed) &&
+            address < code_ends[index].load(std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uintptr_t GuestBase() {
+    return guest_base.load(std::memory_order_relaxed);
 }
 
 } // namespace Common::JitSymbols

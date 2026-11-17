@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -43,19 +44,23 @@ namespace {
 std::atomic<std::uint64_t> compiled_blocks{};
 std::atomic<std::uint64_t> compile_nanoseconds{};
 std::mutex new_blocks_mutex;
-std::vector<std::pair<std::uint64_t, std::uint64_t>> new_blocks;
-std::unordered_set<std::uint64_t> seen_blocks;
+std::vector<NewBlock> new_blocks;
+// For each block, the processors whose JIT compiled it, one bit each.
+std::unordered_map<std::uint64_t, std::uint32_t> seen_blocks;
 
-void NoteCompiled(IR::LocationDescriptor descriptor, std::uint64_t pc,
+void NoteCompiled(IR::LocationDescriptor descriptor, std::uint64_t pc, std::uint32_t processor,
                   std::chrono::steady_clock::duration elapsed) {
     compiled_blocks.fetch_add(1, std::memory_order_relaxed);
     compile_nanoseconds.fetch_add(
         static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
         std::memory_order_relaxed);
+    const std::uint32_t bit = 1U << (processor & 31);
     std::scoped_lock lock{new_blocks_mutex};
-    if (seen_blocks.insert(descriptor.Value()).second) {
-        new_blocks.emplace_back(descriptor.Value(), pc);
+    std::uint32_t& processors = seen_blocks[descriptor.Value()];
+    if ((processors & bit) == 0) {
+        processors |= bit;
+        new_blocks.push_back({descriptor.Value(), pc, processor});
     }
 }
 // LICHII_JIT_MAP=<file>: one line per emitted block, "host_start host_size guest_pc guest_insns"
@@ -86,7 +91,7 @@ CompileStats TakeCompileStats() {
     };
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> TakeNewBlocks() {
+std::vector<NewBlock> TakeNewBlocks() {
     std::scoped_lock lock{new_blocks_mutex};
     return std::exchange(new_blocks, {});
 }
@@ -319,13 +324,21 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        A64::PreInstructionHook pre_instruction;
+        if (conf.pre_instruction) {
+            pre_instruction = [this](A64::IREmitter& ir, u64 pc) {
+                conf.pre_instruction(*conf.callbacks, ir, pc);
+            };
+        }
+        A64::Translate(ir_block, arch_descriptor, get_code,
+                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct}, pre_instruction);
         Optimization::Optimize(ir_block, conf, polyfill_options);
         const auto emitted = emitter.Emit(ir_block);
         const CodePtr entrypoint = emitted.entrypoint;
         NoteJitMap(entrypoint, emitted.size, arch_descriptor.PC(), ir_block.CycleCount());
         if (!precompiling) {
-            NoteCompiled(descriptor, arch_descriptor.PC(), std::chrono::steady_clock::now() - begin);
+            NoteCompiled(descriptor, arch_descriptor.PC(), conf.processor_id,
+                         std::chrono::steady_clock::now() - begin);
         }
         return entrypoint;
     }

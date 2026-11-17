@@ -81,7 +81,13 @@ constexpr bool IsWithin2G(uintptr_t ref, uintptr_t target) {
 
 void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    ctx.reg_alloc.HostCall(code, nullptr, args[1], args[2], args[3]);
+    const auto argument = [](Argument& arg) -> std::optional<Argument::copyable_reference> {
+        if (arg.IsVoid()) {
+            return std::nullopt;
+        }
+        return std::ref(arg);
+    };
+    ctx.reg_alloc.HostCall(code, nullptr, argument(args[1]), argument(args[2]), argument(args[3]));
     auto target = args[0].GetImmediateU64();
     if (IsWithin2G(uintptr_t(code.getCurr()), target)) {
         auto const f = std::bit_cast<void(*)(void)>(target);

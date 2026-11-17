@@ -367,7 +367,13 @@ int main(int argc, char* argv[]) {
 
     MainWindow main_window{has_broken_vulkan};
     // After settings have been loaded by GMainWindow, apply the filter
-    main_window.show();
+    // The window starts maximized whatever size it was closed with (owner, 2026-11-16); a
+    // game started full screen from the command line stays full screen.
+    if (main_window.isFullScreen()) {
+        main_window.show();
+    } else {
+        main_window.showMaximized();
+    }
 
     app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
     return app.exec();

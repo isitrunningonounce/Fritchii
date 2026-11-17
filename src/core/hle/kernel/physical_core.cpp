@@ -19,6 +19,7 @@
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
+#include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
@@ -217,6 +218,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         const bool prefetch_abort = !step_completed && True(hr & Core::HaltReason::PrefetchAbort);
         const bool breakpoint = !step_completed && True(hr & Core::HaltReason::InstructionBreakpoint);
         const bool data_abort = !step_completed && True(hr & Core::HaltReason::DataAbort);
+        const bool deferred_sleep = True(hr & Core::HaltReason::DeferredThreadSleep);
         const bool interrupt = !step_completed && True(hr & Core::HaltReason::BreakLoop);
 
         // Since scheduling may occur here, we cannot use any cached
@@ -249,6 +251,14 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             }
             thread->RequestSuspend(kernel, SuspendType::Debug);
             return;
+        }
+
+        if (deferred_sleep) {
+            const s64 wait = interface->TakeDeferredSleepNanoseconds();
+            if (wait > 0 && !step_completed) {
+                static_cast<void>(thread->Sleep(kernel, kernel.HardwareTimer().GetTick() + wait + 2));
+                return;
+            }
         }
 
         // Handle system calls.

@@ -138,7 +138,7 @@ public:
     }
 };
 
-class A64FastmemTestEnv final : public Dynarmic::A64::UserCallbacks {
+class A64FastmemTestEnv : public Dynarmic::A64::UserCallbacks {
 public:
     u64 ticks_left = 0;
     char* backing_memory = nullptr;
